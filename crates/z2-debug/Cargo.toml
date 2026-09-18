@@ -1,0 +1,32 @@
+[package]
+name = "z2-debug"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs debug overlay: egui panels over read-only snapshots"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_debug"
+path = "src/lib.rs"
+
+[dependencies]
+# The ONLY new external dependency (MIT OR Apache-2.0, pure Rust,
+# wasm32-compatible with default features — verified by
+# `cargo build -p z2-debug --target wasm32-unknown-unknown`).
+egui = "0.36"
+# Read-only reuse (workspace path deps, not new external deps):
+# RAM accessors + GameFacts (z2-core, `interp` off to keep the
+# overlay light: `Ram`, `facts` and `player` hitbox builders are ungated).
+z2-core = { path = "../z2-core", default-features = false }
+# Frame type + indexed diff (z2-ppu has zero dependencies).
+z2-ppu = { path = "../z2-ppu" }
+
+[dev-dependencies]
+# Reuse probes only (integration tests run on the host): z2-verify lockstep
+# Divergence/StubPort, the .fm2 parser and the Snapshot codec. NOT a lib
+# dependency — depending on z2-verify here would drag `tetanes-core` into
+# both frontends' wasm builds. The overlay instead accepts plain data
+# (`&[u8]` tracks, `DivergenceReport`) with `from_*` adapters; the tests
+# prove the adapters agree with the real types.
+z2-verify = { path = "../z2-verify" }

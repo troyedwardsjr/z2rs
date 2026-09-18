@@ -1,0 +1,4 @@
+# `cargo xtask` alias. Runs the workspace `xtask` binary so
+# `cargo xtask ledger --rebuild` works from the repo root.
+[alias]
+xtask = "run -p xtask --"

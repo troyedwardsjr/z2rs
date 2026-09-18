@@ -1,0 +1,228 @@
+# z2-web static site
+
+This is the browser frontend for z2rs. It is plain static files: `index.html`, `app.js` (canvas loop, input, IndexedDB saves) and `worklet.js` (audio ring buffer), on top of the `z2-web` wasm module in `../src/`. There is no npm, no bundler and no framework. The only build tools are the Rust toolchain and `wasm-pack`.
+
+## Build
+
+```sh
+# from the repository root:
+wasm-pack build crates/z2-web --target web --out-dir crates/z2-web/site/pkg
+
+# with HD graphics packs and/or online co-op (bigger bundles):
+wasm-pack build crates/z2-web --target web --out-dir crates/z2-web/site/pkg -- --features hd
+wasm-pack build crates/z2-web --target web --out-dir crates/z2-web/site/pkg -- --features netplay
+wasm-pack build crates/z2-web --target web --out-dir crates/z2-web/site/pkg -- --all-features
+```
+
+`make run-web` and `make run-web-net` wrap the default and netplay builds and serve the site.
+
+### Cargo features and bundle size
+
+Widescreen and local co-op are in the default bundle. They are pure `z2-ppu` / `z2-core` code and cost nothing extra. Only HD packs and online co-op pull in new dependencies, so each of those is a feature and the default build stays small.
+
+| feature | adds | `z2_web_bg.wasm` (wasm-pack release + `wasm-opt`) |
+|---|---|---|
+| (default) | nothing | 294 580 B |
+| `hd` | `z2-render` (`png` decoder, serde, serde_json) | 573 764 B (+279 184) |
+| `net` | `z2-net` protocol core (no dependencies) | ~295 KB (a few KB over default) |
+| `netplay` | `net` + `matchbox_socket` WebRTC (web-sys/js-sys) | 573 632 B (+279 052) |
+| `--all-features` | all of the above | 793 959 B (+499 379) |
+
+`net` alone is the lockstep protocol without a transport. You can test it on the host over loopback and it builds cleanly for wasm, but a browser session needs `netplay`. Every exported method exists in every build. A bundle without a feature answers `hd_supported()` / `net_supported()` with `false` and refuses the operation with a message, so `app.js` needs no build-time branching and the page falls back to a disabled panel.
+
+`wasm-pack` is the only supported build path. It generates `site/pkg/z2_web.js` and `site/pkg/z2_web_bg.wasm`, which `app.js` imports. Without it you can still check that the crate builds for wasm:
+
+```sh
+cargo build -p z2-web --target wasm32-unknown-unknown
+```
+
+That build must pass. `z2-core` (`Game`), `z2-assets` (ROM check and extractor), `z2-ppu` (palette) and `z2-apu` (synth) all build for wasm32 by construction. `z2-verify`, which contains the tetanes oracle, is deliberately not a dependency, so the browser bundle carries no reference emulator. The `.fm2` and input-log parsers and the snapshot codec in `src/movie.rs` and `src/snapshot.rs` are wasm-safe ports and wrappers. Their module docs explain how they map to the `z2-verify` versions.
+
+## Serve
+
+Any static file server works, with two requirements.
+
+First, `.wasm` must be served as `application/wasm`. Otherwise `WebAssembly.instantiateStreaming` fails and `app.js` reports the bundle as missing. For example:
+
+- `python3 -m http.server` (3.8 and later map `.wasm` correctly)
+- nginx: `types { application/wasm wasm; }`
+- Apache: `AddType application/wasm .wasm`
+
+Second, do not put the page behind `Cross-Origin-Opener-Policy` or `Cross-Origin-Embedder-Policy` headers. The module uses no threads, no `SharedArrayBuffer` and no atomics, only plain wasm and JS glue, so those headers gain you nothing here.
+
+```sh
+cd crates/z2-web/site && python3 -m http.server 8080
+# open http://localhost:8080/
+```
+
+## Manual check
+
+Two targets need a real movie and a real browser to check: the tab should play the warp-glitch movie to the end at 60 fps, and the first frame should appear less than 3 s after the ROM loads.
+
+1. Serve the site as above, open the page and drop your Zelda II (USA) `.nes` on it. The ROM hash is checked in the tab (body CRC32 `BA322865`), and a rejected file shows the reason.
+2. Read the `first frame ... ms after ROM load` line in Status (the target is under 3000 ms) and the fps counter (about 60).
+3. Load a `.fm2`, or an extracted `Input Log.txt`, under "Movie (QA replay)". The loop replays it hands-free and Status shows `REPLAY i/n`. The tab does not accept a binary `.bk2` (a ZIP). Drop the extracted `Input Log.txt` instead, which goes through the same parser contract as `z2-verify`.
+4. From devtools, try `z2.facts()` (valid JSON), `z2.step(600)`, a `z2.snapshot()` save and restore round trip, and `z2.screenshot()` (a PNG data URL). See "window.z2" below.
+
+## Input map
+
+Pad byte bits 0..7 are A, B, Select, Start, Up, Down, Left, Right.
+
+| NES button | Player 1 | Player 2 (co-op) | Gamepad (standard) |
+|---|---|---|---|
+| A | Z | G | button 1 (right) |
+| B | X | F | button 0 (bottom) |
+| Select | Shift | R | button 8 |
+| Start | Enter | T | button 9 |
+| D-pad | arrows | W/A/S/D | d-pad 12 to 15 / left stick |
+
+The keys match the desktop app (`KeyBindings::default` in `crates/z2-native/src/config.rs` binds `KeyZ` to bit 0), so the two frontends share one layout and a desktop host can play with a web guest. Player 2's keys are the same set the desktop app's `keys_p2` default uses.
+
+Keyboard and gamepad input are OR-ed together every frame (`pollInput` in `app.js`). `WebEmu::pack_buttons` packs the byte with the same bit layout as `z2_core::game` and the lockstep oracle. With local co-op on, the first connected gamepad is player 1 and the second is player 2. The pads are taken in index order from `navigator.getGamepads()`. That array is sparse: a disconnected slot is `null` and the indices are not compacted.
+
+## Widescreen, HD packs and co-op
+
+### Widescreen
+
+Use the Screen select (`off`, 16:10 or 16:9), or `?widescreen=16:9` in the URL. `?wide=` also works, and a bare number up to 16 sets the margin in tiles per side. The canvas is resized from `WebEmu::frame_width()` and `frame_height()`. The 256x240 NES frame itself is untouched.
+
+The margins are scenery only. They hold no sprites, so enemies still appear at the original screen edge, and dialogue boxes and the pause pane do not extend into them.
+
+The "fill left edge" checkbox (`?clip=0` turns it off) paints the 8 columns the ROM blanks with `PPUMASK $18`. "Fill right edge" (`?rclip=0`) paints the 8 columns the overworld hides behind a column of opaque black sprites at x 248. If you leave either one unpainted, you get a black bar between the play field and that margin. Both are on by default in the page, even though `Margins::fill_left_clip` and `fill_right_clip` default to off in the engine.
+
+### HD graphics packs
+
+HD packs need a bundle built with `--features hd`. The Pack folder picker takes the directory that contains `pack.json`. Make one with `cargo xtask hdpack template --out DIR --scale 2`, which must write outside the repository. The picked files go into wasm as raw bytes. `HdPack::from_files` strips the picker's directory prefix and decodes the PNG sheets in Rust, so nothing is uploaded and JS never touches image data.
+
+The Scale select (`?scale=2`) is the output multiplier, 1 to 4. Loading a pack adopts the pack's own scale unless you picked one, and a pack whose scale does not divide your choice wins. A pack that fails to load is reported in the panel and changes nothing: the tab keeps playing with the art it already had.
+
+Scale has a cost. 2x at 256 wide is about 0.56 ms per frame. 4x widescreen is about 1.9 ms per frame plus roughly 1 MiB of decoded sheet per CHR page. That is why the default is scale 1 with no pack, and why the panel warns from 3x up.
+
+### Zoom
+
+The `-` and `+` buttons (`?zoom=3`) change the on-screen size only: CSS pixels per NES pixel, 1 to 4. Zoom is deliberately separate from the HD scale, so a 4x pack gives you a sharper picture at the same physical size instead of one four times bigger.
+
+### Local co-op
+
+Tick the "local co-op" checkbox or use `?coop=1`. Player 2 is a second Link that exists in side-view areas only.
+
+### Online co-op
+
+Online co-op needs a bundle built with the `netplay` feature (`make run-web-net`) and a running signalling server (`make signal`). Enter the signal URL and a room name, then press Host (player 1) or Join (player 2).
+
+While connecting, the status line walks through numbered stages and shows how long each has taken:
+
+1. `1/4 connecting to the signal server`
+2. `2/4 in the room, waiting for the other player`
+3. `3/4 other player found, establishing the peer link`
+4. `4/4 connected, starting the session`
+
+After that it shows `running`. The game keeps running while it connects, because the session restarts both peers from power-on when it starts. Leave cancels at any stage. Joining the room has a 10 s deadline and establishing the peer link has a 15 s one. A missed deadline, an unreachable server or a full room ends the attempt with a reason that says what to check, and Host and Join work again afterwards. Waiting for the other player never times out. Once the session runs, the status line shows the role, session state, frame, how far ahead the peer is, the effective delay, a stall notice, and the close reason when the session ends.
+
+The ICE field lists the STUN/TURN servers: space-separated `stun:` / `turn:` URLs, with `username=... credential=...` for TURN. It starts at the default Google STUN pair, which works on the same machine, on a LAN and on most home internet connections. `none` (or an empty field) uses no ICE servers. That is fine and fastest on one machine or a LAN, but it does not work across the internet. Players behind strict NATs (symmetric or carrier-grade NAT, blocked UDP) need a TURN server on both sides. The symptom is stage 3/4 timing out.
+
+On an `https` page the signal URL must be `wss://`. A browser blocks `ws://` from an `https` page with an opaque failure, so put `z2-signal` behind a TLS reverse proxy. The page tells you this itself, so you do not have to work it out from a generic transport error.
+
+Save states, movies, pause, the co-op toggle and the pack picker are disabled while a session is live. Widescreen, scale and zoom are not, because they only affect presentation and the two peers may differ.
+
+## window.z2 automation API
+
+`app.js` publishes `window.z2` once the wasm module loads:
+
+| member | shape | backed by |
+|---|---|---|
+| `facts()` | → JSON string (`GameFacts`) | `z2_core::facts` via live RAM |
+| `state()` | → JSON `{version, romLoaded, crc32, sha1, sections, frame, lastInput, movieKind, movieLen, movieCursor, audioQueued}` | tab state |
+| `input(mask, frames)` | hold pad byte `mask` for `frames` frames → frames stepped | `Game::step` |
+| `step(n)` | advance `n` frames; consumes the armed movie track if any, else neutral input → frames stepped | movie track / `Game::step` |
+| `snapshot()` | → `Uint8Array` (`Z2WEB01`) | `src/snapshot.rs` |
+| `restore(bytes)` | accept `Z2WEB01` or `Z2SNAP01` corpus blob → status JSON | `src/snapshot.rs` |
+| `loadMovie(text)` | parse `.fm2` / `Input Log.txt`, arm track → report JSON | `src/movie.rs` |
+| `screenshot()` | → PNG data URL of the current frame | RGBA blit + canvas |
+| `version` | crate version string | `CARGO_PKG_VERSION` |
+
+A wasm `Result::Err` surfaces as a thrown JS exception, so test scripts fail loudly. `restore` does not rewind the engine frame counter, because the core exposes no state import. This is the same limitation `xtask verify --dut game --snapshot` has. Memory images restore exactly.
+
+The number of members is part of the contract. `site/smoke.mjs` asserts that `window.z2` has exactly these nine members plus `ext`, and a tenth top-level member fails the smoke test. New controls go under `ext`. If you change the stable set, update the table above and the list in `smoke.mjs` together.
+
+### `window.z2.ext` (unstable)
+
+The nine members above are the stable contract. Every control added for widescreen, HD packs, co-op and netplay lives under `z2.ext`, which is not part of that contract and may change shape:
+
+| member | shape |
+|---|---|
+| `ext.setWide(preset)` | `"off"` \| `"16:10"` \| `"16:9"` \| `"N"` → tiles per side; resizes the canvas and the Screen select |
+| `ext.wideTiles()` | → margin tiles per side (0 = off) |
+| `ext.frameSize()` | → `{width, height, logicalWidth, logicalHeight, scale}`; `width == logicalWidth * scale` |
+| `ext.setFillLeftClip(on)` | paint the window's blanked left 8 columns (widescreen only) |
+| `ext.setZoom(n)` | on-screen CSS pixels per NES pixel, 1 to 4 |
+| `ext.hd.supported()` | → whether this bundle has HD-pack support |
+| `ext.hd.loadPack(files)` | `[{name, bytes}]` (paths as the picker reports them) → pack info, or throws |
+| `ext.hd.clearPack()` / `ext.hd.packInfo()` | drop the pack / → pack JSON or `"null"` |
+| `ext.hd.setScale(n)` / `ext.hd.scale()` | output multiplier 1 to 4 / → the one in force |
+| `ext.audio()` | → `{state, underruns, queued, peak}`: `AudioContext` state (`off` before Enable audio) and the worklet's last report: samples it holds, times it ran dry, loudest output sample in the last ~0.25 s (`peak > 0` means sound is really coming out) |
+| `ext.coopEnable(on)` / `ext.coopEnabled()` | local two-player co-op |
+| `ext.coopStatus()` | → JSON `CoopStatus` (or `null` when co-op is off) |
+| `ext.coopHash()` | → 16 hex chars of co-op state |
+| `ext.stepCoop(p1, p2, n)` | step `n` frames with both pads |
+| `ext.net.supported()` | → whether this bundle has the WebRTC transport |
+| `ext.net.connect(signal, room, host, delay, ice)` | start a session; `ice` defaults to the page's default ICE setting |
+| `ext.net.status()` / `ext.net.poll(dtMs)` | → session status JSON (`poll` also repaints the status line). `link` is the connect stage (`signalling` / `waiting` / `linking` / `connected` / `ended`, `null` without a session), `linkMs` how long it has lasted, `elapsedMs` the session clock |
+| `ext.net.disconnect()` | leave the session |
+| `ext.net.stateHash()` | → 16 hex chars: the value the desync detector compares (`hash_state(&[ram, wram, oam, coop_hash])`). Throws in a bundle without the `net` feature |
+| `ext.net.manual(on)` / `ext.net.isManual()` | test scripts only: stop the rAF loop pumping the session, so a script can supply frame-exact pads |
+| `ext.net.step(pad, max)` | test scripts only, under `manual(true)`: lockstep latches a local pad and steps up to `max` confirmed frames → frames stepped; rollback runs `max` session ticks (add the pad, run every save/load/advance request) → frames simulated, replays included. A null `pad` samples the live keyboard/gamepad through the same `pollInput()` the rAF loop uses |
+| `ext.net.setMode(mode, maxPrediction)` / `ext.net.mode()` | protocol for the next session: `"rollback"` (default) or `"lockstep"`, and the rollback prediction window (default 8, at most 12); keeps the panel's Mode select in step → `{mode, maxPrediction, defaultMaxPrediction, maxAllowed}` |
+| `ext.net.simulate({latencyMs, jitterMs, lossPct})` | test hook, off by default and never used by normal play: delay every packet this page sends by `latencyMs` plus a random `0..=jitterMs` of session time and drop `lossPct` % of unreliable packets, inside the page's transport wrapper. Applies to the live session too; `simulate({})` turns it off → the applied setting |
+| `ext.net.confirmedHashes()` | rollback: → JSON `[[frame, "hash"], ...]` for every 15th saved state that no rollback can still change (`hash_state(&[ram, wram, oam, coop_hash])`); `[]` otherwise |
+| `ext.perf.rollback({iterations, depths})` | times one emulated frame, one save, one load and a worst-case rollback tick per depth with `performance.now()` → `{iterations, frame, save, load, tick: {depth: stats}}`, each `{mean, p95, max}` in ms. Leaves the game where it was; refused during a session |
+| `ext.trapsetId()` | → 16 hex chars identifying the ported-routine set |
+
+`site/smoke.mjs` checks the nine stable members and `ext` separately, so a change to `ext` never counts as a break of the stable contract.
+
+The three `ext.net` entries marked "test scripts only" exist for `site/netplay-e2e.mjs`. No UI control sets them and nothing in the page turns `manual` on by itself. For a person playing, the only difference they make is one extra boolean check in the rAF loop. They exist because a lockstep proof needs frame-exact pads and the protocol's own hash, and you cannot read either of those off a screenshot.
+
+In rollback mode `net.status()` adds `mode`, `rttMs`, `rollbacks`, `rollbackFrames`, `maxRollbackDepth`, `predictionDepth`, `maxPredictionDepth`, `maxPrediction`, `confirmedFrame`, `finalFrame`, `stalledTicks`, `skippedTicks` (ticks spent honouring a wait recommendation), `waitRecommendations`, `interrupted`, `lastLocalFrame` / `lastLocalPad` (the newest simulated frame and this peer's pad on it), `simulate`, `simDropped` and `simDelayed`. Lockstep adds `mode` and `rttMs`. `state` uses the lockstep names in both modes. In rollback, `stalled` means no packets from the peer for 500 ms.
+
+`net.status()` also carries `hashesOk`: how many state-hash comparisons matched the peer's. It is 0 in every build when there is no session. It is also what gives "no desync" its meaning, because a session that never compared a hash cannot have detected a desync.
+
+## URL parameters
+
+| parameter | effect |
+|---|---|
+| `?widescreen=` (or `?wide=`) | `off` \| `16:10` \| `16:9` \| `1` to `16` tiles per side |
+| `?clip=0` | stop painting the window's blanked left 8 columns |
+| `?rclip=0` | stop painting the window's masked right 8 columns |
+| `?scale=` | HD output multiplier 1 to 4 (above 1 needs an `hd` bundle) |
+| `?zoom=` | on-screen CSS pixels per NES pixel, 1 to 4 |
+| `?coop=1` | start with local two-player co-op on |
+| `?net=` | `rollback` (default) \| `lockstep` for the netplay Mode select |
+| `?signal=`, `?room=`, `?ice=`, `?delay=` | prefill the netplay panel (nothing connects by itself) |
+
+A bad value is appended to the Status box and otherwise ignored. It is never fatal, so a stale bookmark still loads a playable page.
+
+## Saves
+
+`snapshot()` blobs (`Z2WEB01`: magic, version, frame, ram, wram and a CRC32) and raw 8 KiB SRAM images live in IndexedDB (the `z2rs-web` database, `slots` store, keys `<slot>:snapshot` and `<slot>:sram`) through the Save and Load buttons. You can also export them as `.z2web` files. Import accepts both `Z2WEB01` and `Z2SNAP01` corpus snapshots, through the ram/wram import path.
+
+No ROM bytes are ever stored. After a page reload you drop the ROM again.
+
+## Tests
+
+The tests are driven by Playwright and share the static server in `qa-server.mjs`, which serves `.wasm` with the correct MIME type and maps `/` to `index.html`. They use the same exit codes: 0 for a pass, 1 for an assertion failure, and 2 when the environment is missing something, with a clear message on stderr. That way CI stays green without a ROM or a browser. Playwright is a dev and test dependency only (`make netplay-e2e-setup`). The site itself imports nothing from `node_modules`.
+
+`node site/smoke.mjs` loads the page and drops the ROM from `Z2_ROM`. It asserts that frames advance, that `window.z2.facts()` is valid JSON, that the nine-member stable contract holds, and that the `ext` surface (widescreen, co-op, HD, netplay) answers. It needs the `pkg/` build and `Z2_ROM`.
+
+`node site/netplay-e2e.mjs` (or `make netplay-e2e`) opens two browser windows on two origins and plays a real online co-op session against a real `z2-signal`. It first clicks Host and Join on the page as a person would (no manual mode, default ICE). Both windows must be running within 10 s, the stages must show, the games must keep stepping while connecting, and Leave must cancel. If `target/release/examples/net_peer` is built, it also connects a browser to a native peer. Then it asserts that a key held in one window moves the matching player in the other window's state, and that both windows end on the same frame with the same lockstep hash. It needs a `pkg/` built with `--features netplay`, `Z2_ROM`, a `.fm2` input track and `target/release/z2-signal`. It selects lockstep in the panel.
+
+`node site/netplay-e2e-rollback.mjs` (or `make netplay-e2e-rollback`) is the rollback proof over a simulated bad link (`ext.net.simulate`). It covers wasm costs, a live-page rollback connect, more than zero rollbacks in both windows, the local pad reaching the local simulation after exactly `input_delay` frames, input crossing both ways, and matching confirmed-frame hashes with zero desyncs. It has the same requirements as `netplay-e2e`.
+
+`node site/netplay-play.mjs` (or `make netplay-play`) is not a test. It opens two visible windows that are already in a rollback session so you can play by hand. `netplay-lib.mjs` holds the helpers these scripts share.
+
+## Known gaps
+
+- Audio: the game's own sound engine runs on the interpreter. Its APU register writes are drained into the `z2-apu` synth every frame, which produces 44.1 kHz PCM for the worklet ring buffer. The desktop app plays sound through the same path. You can press Enable audio at any time. Browsers only start an `AudioContext` from a click, and samples produced before that are dropped, not queued. `z2.ext.audio()` returns the worklet's last report `{state, underruns, queued, peak}`, and `smoke.mjs` asserts `peak > 0` with the real ROM. The worklet has no clock-drift correction, so over a long session its queue may creep up to the 2 s cap.
+- A snapshot restore does not rewind the synth. A note held at the moment of the restore can linger until the game writes the channel again.
+- `restore` rewinds memory but not the step counter, because the core has no state import yet.
+- A whole-ZIP `.bk2` would need deflate in the tab. Extract `Input Log.txt` first.
+- The zero-copy `frame_ptr`/`frame_len` blit is exposed, but `app.js` uses the copying `frame_rgba()` path because it is robust across `wasm-pack` targets.

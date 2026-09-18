@@ -1,0 +1,24 @@
+[package]
+name = "z2-signal"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs netplay signalling server: matchbox FullMesh, two peers per room"
+publish = false
+
+[lib]
+name = "z2_signal"
+path = "src/lib.rs"
+
+[[bin]]
+name = "z2-signal"
+path = "src/main.rs"
+
+# Native-only tooling; never a dependency of a library crate (z2-net uses it only
+# as a dev-dependency for its localhost integration test).
+[dependencies]
+# WebRTC signalling server library (MIT OR Apache-2.0); pulls axum/hyper/tokio.
+matchbox_signaling = "0.14.0"
+# Async runtime required by matchbox_signaling's axum server (MIT).
+tokio = { version = "1", features = ["rt-multi-thread"] }
+# Only for HTTP status responses when refusing a peer (MIT); already in the tree via matchbox_signaling.
+axum = { version = "0.8", default-features = false }

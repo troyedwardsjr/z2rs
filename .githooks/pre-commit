@@ -1,0 +1,85 @@
+#!/usr/bin/env bash
+# Pre-commit hook: refuse ROM-derived / machine artifacts.
+#
+# Blocks staged files that are:
+#   1. *.nes ROM images (any location),
+#   2. assets.bin bundles (built from the user's ROM via z2-assets),
+#   3. *.fm2 / *.bk2 movies outside corpus/ (corpus/ is out of tree,
+#      so any in-tree movie is a mistake),
+#   4. any blob whose SHA1 matches a known ROM image,
+#   5. HD-pack output: TEMPLATE-ROM-DERIVED.txt / hdpack-seen.json markers,
+#      anything under hdpacks/, hdpack-templates/ or *.hdpack/, a pack.json
+#      carrying the z2rs-hdpack format tag, and any PNG carrying the
+#      z2rs-template tEXt chunk (template sheets rendered from CHR).
+#
+# Install: git config core.hooksPath .githooks
+set -euo pipefail
+
+# Known ROM SHAs: header-stripped body, then the headered reference file.
+BLOCKED_SHAS="11333adb723a5975e0ecca3aee8f4747aa8d2d26 08fa60f23e477752fdd850b1fd4171c6ca025127"
+
+sha1_of_staged() {
+    # Print the SHA1 of the staged blob for $1, or nothing if unavailable.
+    if command -v shasum >/dev/null 2>&1; then
+        git show ":$1" 2>/dev/null | shasum -a 1 | awk '{print $1}'
+    elif command -v sha1sum >/dev/null 2>&1; then
+        git show ":$1" 2>/dev/null | sha1sum | awk '{print $1}'
+    fi
+}
+
+fail=0
+block() {
+    echo "pre-commit: blocked: $1" >&2
+    fail=1
+}
+
+while IFS= read -r f; do
+    [ -z "$f" ] && continue
+    case "$f" in
+        *.nes)
+            block "$f (*.nes ROM files are never committed; supply the ROM via \$Z2_ROM)"
+            ;;
+    esac
+    if [ "$(basename "$f")" = "assets.bin" ]; then
+        block "$f (assets.bin is built from \$Z2_ROM via z2-assets; see LEGAL.md)"
+    fi
+    case "$f" in
+        *.fm2 | *.bk2)
+            case "$f" in
+                corpus/*) ;;
+                *) block "$f (movie files live in the out-of-tree corpus/ directory)" ;;
+            esac
+            ;;
+    esac
+    if sha="$(sha1_of_staged "$f")" && [ -n "$sha" ]; then
+        case " $BLOCKED_SHAS " in
+            *" $sha "*)
+                block "$f (staged content matches known ROM image SHA1 $sha)"
+                ;;
+        esac
+    fi
+    case "$f" in
+        hdpacks/* | */hdpacks/* | *hdpack-templates/* | *.hdpack/* | *TEMPLATE-ROM-DERIVED.txt | *hdpack-seen.json)
+            block "$f (HD-pack output is CHR-derived or belongs outside the repo; see LEGAL.md)"
+            ;;
+        *pack.json)
+            # grep -c reads the whole blob, so the producer never gets SIGPIPE under pipefail.
+            n="$(git show ":$f" 2>/dev/null | LC_ALL=C grep -c "z2rs-hdpack" || true)"
+            if [ "${n:-0}" != 0 ]; then
+                block "$f (HD packs live outside the repository; see LEGAL.md)"
+            fi
+            ;;
+        *.png | *.PNG)
+            n="$(git show ":$f" 2>/dev/null | LC_ALL=C grep -ac "z2rs-template" || true)"
+            if [ "${n:-0}" != 0 ]; then
+                block "$f (PNG carries the z2rs-template marker: rendered from ROM CHR, never commit)"
+            fi
+            ;;
+    esac
+done < <(git diff --cached --name-only --diff-filter=ACMR)
+
+if [ "$fail" -ne 0 ]; then
+    echo "pre-commit: commit refused (ROM guard). See LEGAL.md." >&2
+    exit 1
+fi
+exit 0

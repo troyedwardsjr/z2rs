@@ -1,0 +1,11 @@
+[package]
+name = "z2-ppu"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs software PPU model"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_ppu"
+path = "src/lib.rs"

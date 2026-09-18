@@ -1,0 +1,18 @@
+[package]
+name = "xtask"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs developer task runner with ledger subcommands"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[[bin]]
+name = "xtask"
+path = "src/main.rs"
+
+[dependencies]
+z2-assets = { path = "../../crates/z2-assets" }
+z2-verify = { path = "../../crates/z2-verify" }
+z2-core = { path = "../../crates/z2-core" }
+z2-ppu = { path = "../../crates/z2-ppu" }
+z2-render = { path = "../../crates/z2-render" }

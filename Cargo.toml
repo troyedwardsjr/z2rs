@@ -1,0 +1,31 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/z2-core",
+    "crates/z2-ppu",
+    "crates/z2-apu",
+    "crates/z2-assets",
+    "crates/z2-verify",
+    "crates/z2-native",
+    "crates/z2-web",
+    "crates/z2-net",
+    "crates/z2-debug",
+    "crates/z2-render",
+    "tools/xtask",
+    "tools/z2-signal",
+]
+# Vendored third-party sources are not workspace members (not linted or
+# formatted as ours).
+exclude = ["vendor"]
+
+# matchbox_socket 0.14.0 (MIT OR Apache-2.0) with three small patches, each
+# marked `z2rs patch` in the source:
+#   * browser: ICE gathering waits at most 1 s before the offer/answer is
+#     sent, then trickles the rest (upstream waits for gathering to complete,
+#     which one unresponsive STUN server stretches to ~40 s);
+#   * browser + native: an empty ICE URL list means no ICE servers;
+#   * the default signaller builder is exported so z2-net can observe
+#     signalling progress (connecting / waiting for peer / negotiating).
+# Drop the patch once upstream ships equivalent behaviour.
+[patch.crates-io]
+matchbox_socket = { path = "vendor/matchbox_socket" }

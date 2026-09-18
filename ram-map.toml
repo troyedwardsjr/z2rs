@@ -1,0 +1,619 @@
+# ram-map.toml — curated Zelda II (NES) CPU-RAM map for code generation.
+#
+# Ownership: coordinated. Do not edit without coordinating with the maintainer.
+# Build input for `crates/z2-core/build.rs`, which generates typed accessors
+# (`Ram::link_hp`, `Ram::set_link_hp`, `Ram::enemy(slot).x`, ...) into
+# `$OUT_DIR/ram_gen.rs`.
+#
+# Sources:
+#   * Data Crystal, "Zelda II: The Adventure of Link / RAM map"
+#     (datacrystal.tcrf.net, page rev. 2025-01-31).
+#   * `third_party/z2disassembly/ram-map.txt` — an
+#     address-annotated listing (`ADDR ; comment`, hex, `,X`/`,Y` suffixes
+#     for indexed tables), plus formal ca65 symbols in
+#     `third_party/z2disassembly/src/variables.asm`.
+#
+# Each block carries `label` (the listing term it cites) and `verified`
+# (true once `tests/ram_map.rs` greps that term at that address in the
+# listing). Entries still marked `verified = false` are Data Crystal- or
+# note-sourced and MUST be confirmed against a future annotated listing.
+#
+# Schema (strict subset of TOML — the std-only parser in build.rs supports
+# exactly this; keep values simple: no `#` or `"` inside strings):
+#   [[entry]]  addr=0xNNNN width=1|2 endian="le"|"be"(default "le")
+#              name="snake_case" doc="..." label="listing term"
+#              source="..." verified=true|false
+#   [[array]]  slot_of="enemy"|"projectile"|"none" name="..."
+#              base=0xNNNN count=N width=1 doc="..." label="..." source="..."
+#              verified=true|false
+#   * `slot_of="enemy"|"projectile"` arrays must be named `<slot>_<field>`
+#     (e.g. `enemy_hp`) and share one `count` per slot kind (6).
+#   * `slot_of="none"` arrays generate indexed `name(i)` / `set_name(i, v)`.
+#   * Addresses are NES CPU-RAM ($0000-$07FF). No two blocks may overlap
+#     (build.rs rejects overlaps).
+
+# ---------------------------------------------------------------- frame/link
+
+[[entry]]
+addr = 0x0012
+width = 1
+name = "frame_counter"
+doc = "Frame counter, incremented by the NMI handler every vblank. Headless timers key off this."
+label = "Frame Counter"
+source = "Data Crystal ($0012) + listing (12 Frame Counter, ascending)"
+verified = true
+
+[[entry]]
+addr = 0x0029
+width = 1
+name = "link_y"
+doc = "Link Y position, side view."
+label = "Link's Y Position"
+source = "Data Crystal ($0029) + listing (29 Link Y)"
+verified = true
+
+[[entry]]
+addr = 0x003B
+width = 1
+name = "link_page"
+doc = "Link current map page, side view (Data Crystal); the listing reads the same byte as the X-position high byte ($004D low)."
+label = "link Pagepos"
+source = "Data Crystal ($003B map page) + listing (3B link Pagepos / X high)"
+verified = true
+
+[[entry]]
+addr = 0x004D
+width = 1
+name = "link_x"
+doc = "Link X position LSB, side view."
+label = "Link's X Position"
+source = "Data Crystal ($004D) + listing (4D Link X low)"
+verified = true
+
+[[entry]]
+addr = 0x0070
+width = 1
+name = "link_x_speed"
+doc = "Link X speed (listing: hspeed, horizontal velocity)."
+label = "Link's X Velocity"
+source = "Data Crystal ($0070) + listing (70 hspeed / X Velocity)"
+verified = true
+
+[[entry]]
+addr = 0x0080
+width = 1
+name = "link_sprite"
+doc = "Link animation-frame and sprite index: 0-3 walking, 4 standing wind-up, 5 standing stab, 6 crouch, 7 crouch stab, 8 up stab, 9 down stab. The listing notes it can force an attack."
+label = "Current Animation Frame"
+source = "Data Crystal ($0080) + listing (80 Current Animation Frame for Link)"
+verified = true
+
+[[entry]]
+addr = 0x009F
+width = 1
+name = "link_facing"
+doc = "Facing and last-direction-pressed, side scroll: 1 right, 2 left. Data Crystal reads this byte as Link's facing direction."
+label = "Direction arrow pressed"
+source = "Data Crystal ($009F facing) + listing (9F Direction arrow pressed)"
+verified = true
+
+# ---------------------------------------------------------------- input $F5-F8
+
+[[entry]]
+addr = 0x00F5
+width = 1
+name = "input_p1_pressed"
+doc = "Controller 1 buttons pressed this frame (edge-triggered). Formal ca65 symbol joy1_pressed in variables.asm."
+label = "joy1_pressed"
+source = "Data Crystal ($00F5) + variables.asm (joy1_pressed = $F5)"
+verified = true
+
+[[entry]]
+addr = 0x00F6
+width = 1
+name = "input_p2_pressed"
+doc = "Controller 2 buttons pressed this frame (edge-triggered). Formal ca65 symbol joy2_pressed in variables.asm."
+label = "joy2_pressed"
+source = "Data Crystal ($00F6) + variables.asm (joy2_pressed = $F6)"
+verified = true
+
+[[entry]]
+addr = 0x00F7
+width = 1
+name = "input_p1_held"
+doc = "Controller 1 buttons held (level-triggered). Standard NES bit order: A B Select Start Up Down Left Right. Formal ca65 symbol joy1_held in variables.asm."
+label = "joy1_held"
+source = "Data Crystal ($00F7) + variables.asm (joy1_held = $F7)"
+verified = true
+
+[[entry]]
+addr = 0x00F8
+width = 1
+name = "input_p2_held"
+doc = "Controller 2 buttons held (level-triggered). Formal ca65 symbol joy2_held in variables.asm."
+label = "joy2_held"
+source = "Data Crystal ($00F8) + variables.asm (joy2_held = $F8)"
+verified = true
+
+# ---------------------------------------------------------------- subpixel/timers/rng
+
+[[entry]]
+addr = 0x0100
+width = 1
+name = "nmi_state"
+doc = "NMI handler behavior flags: bit7 do-gameplay vs sound-only, bit6 in-game vs title handling. Listing is silent here; MUST confirm against an annotated listing."
+label = "NmiState"
+source = "Data Crystal ($0100 NMI handler behavior); listing silent"
+verified = false
+
+[[entry]]
+addr = 0x03D6
+width = 1
+name = "link_x_sub"
+doc = "Link X subpixel. The listing line for $3D6 is bare; MUST confirm against an annotated listing."
+label = "LinkXSub"
+source = "Data Crystal ($03D6 Player X subpixel); listing line bare"
+verified = false
+
+[[entry]]
+addr = 0x0500
+width = 1
+name = "invuln_stun"
+doc = "Invincibility-after-stun counter; nonzero counts down to vulnerable."
+label = "Invincibility after stun"
+source = "Data Crystal ($0500) + listing (500 Invincibility after stun counter)"
+verified = true
+
+[[entry]]
+addr = 0x0518
+width = 1
+name = "invuln_blink"
+doc = "Invulnerable timeout: 01-02 blinking, 03+ not blinking."
+label = "Invulnerable Timeout"
+source = "Data Crystal ($0518) + listing (518 Invulnerable Timeout / immune timer)"
+verified = true
+
+[[entry]]
+addr = 0x051B
+width = 1
+name = "rng"
+doc = "Randomizer table base (indexed by X in the listing); sampled by encounter and drop rolls."
+label = "Randomizer"
+source = "RAM notes ($51B RNG) + listing (51B,X Randomizer)"
+verified = true
+
+[[entry]]
+addr = 0x0524
+width = 1
+name = "menu_state"
+doc = "Menu control and state machine byte (mode machine member). Overworld: 1 pauses, 3 unpauses."
+label = "menu control"
+source = "Data Crystal ($0524) + listing (524 menu control / Routine Index)"
+verified = true
+
+[[entry]]
+addr = 0x0561
+width = 1
+name = "scene_index"
+doc = "Current scene/map index, side view (listing: scene layout index, Area Code; layout only, not location)."
+label = "scene layout index"
+source = "Data Crystal ($0561) + listing (561 scene layout index)"
+verified = true
+
+[[entry]]
+addr = 0x057D
+width = 1
+name = "link_y_speed"
+doc = "Link Y speed (listing: vspeed, vertical velocity, negative is up)."
+label = "vspeed"
+source = "Data Crystal ($057D) + listing (57D vspeed)"
+verified = true
+
+[[entry]]
+addr = 0x05DF
+width = 1
+name = "kills_easy"
+doc = "Count of easy monsters killed toward the next item drop."
+label = "count of easy monster killed"
+source = "Data Crystal ($05DF) + listing (5DF easy kills)"
+verified = true
+
+[[entry]]
+addr = 0x05E0
+width = 1
+name = "kills_hard"
+doc = "Count of hard monsters killed toward the next item drop."
+label = "count of hard monster killed"
+source = "Data Crystal ($05E0) + listing (5E0 hard kills)"
+verified = true
+
+# ---------------------------------------------------------------- world/mode/area
+
+[[entry]]
+addr = 0x0700
+width = 1
+name = "lives"
+doc = "Current number of lives."
+label = "Current number of lives"
+source = "Data Crystal ($0700) + listing (700 lives)"
+verified = true
+
+[[entry]]
+addr = 0x0706
+width = 1
+name = "overworld_index"
+doc = "Overworld index: 0 West, 1 Death Mountain and Maze Island, 2 East."
+label = "overworld index"
+source = "Data Crystal ($0706) + listing (706 overworld index)"
+verified = true
+
+[[entry]]
+addr = 0x0707
+width = 1
+name = "world"
+doc = "World/area type: 0 overworld and others, 1 West towns, 2 East towns, 3 palaces 1/2/5, 4 palaces 3/4/6, 5 Great Palace and ending, 6 Zelda-awakens scene."
+label = "world"
+source = "Data Crystal ($0707 World) + listing (707 world)"
+verified = true
+
+[[entry]]
+addr = 0x0736
+width = 1
+name = "game_mode"
+doc = "Game mode / current state. Write 0 with scene regs set to load a scene; 2 with $73/$74 set to refresh the screen at a position; 6 or 0 to enter the overworld map."
+label = "Game Mode"
+source = "Data Crystal ($0736) + listing (736 Game Mode)"
+verified = true
+
+[[entry]]
+addr = 0x0748
+width = 1
+name = "area_index"
+doc = "True area location index; briefly holds the overworld location index during side-scroll transitions."
+label = "area location index"
+source = "Data Crystal ($0748) + listing (748 area location index)"
+verified = true
+
+[[entry]]
+addr = 0x075A
+width = 1
+name = "encounter_type"
+doc = "Side-scroll encounter type: 0 fairy or fixed overworld encounter, 1 small enemy, 2 big enemy. The listing $75A line is bare; MUST confirm against an annotated listing."
+label = "EncounterType"
+source = "Data Crystal ($075A encounter type); listing line bare"
+verified = false
+
+[[entry]]
+addr = 0x076C
+width = 1
+name = "game_state"
+doc = "Game state; writing it begins a special routine: 0 restart from Zelda's castle with 3 lives, 1 no routine (in game), 2 die, 3 wake Zelda, 4 roll credits, 6 lives screen then restart."
+label = "special routine"
+source = "Data Crystal ($076C game state) + listing (76C begin a special routine)"
+verified = true
+
+# ---------------------------------------------------------------- save-data block
+
+[[entry]]
+addr = 0x0770
+width = 2
+endian = "be"
+name = "exp_next"
+doc = "Experience needed for next level, big-endian: MSB $0770, LSB $0771."
+label = "Exp needed for Next Level"
+source = "Data Crystal ($0770-$0771) + listing (770/771 Exp needed)"
+verified = true
+
+[[entry]]
+addr = 0x0773
+width = 1
+name = "link_mp"
+doc = "Current magic left in meter."
+label = "Current Magic left in meter"
+source = "Data Crystal ($0773) + listing (773 Current Magic)"
+verified = true
+
+[[entry]]
+addr = 0x0774
+width = 1
+name = "link_hp"
+doc = "Current life left in meter."
+label = "Current Life left in meter"
+source = "Data Crystal ($0774) + listing (774 Current Life)"
+verified = true
+
+[[entry]]
+addr = 0x0775
+width = 2
+endian = "be"
+name = "exp"
+doc = "Experience points, big-endian: MSB $0775 (x256), LSB $0776 (x1)."
+label = "Current Experience"
+source = "Data Crystal ($0775-$0776) + listing (775/776 Experience)"
+verified = true
+
+[[entry]]
+addr = 0x0777
+width = 1
+name = "attack_level"
+doc = "Attack power level (1-8)."
+label = "Attack Level"
+source = "Data Crystal ($0777) + listing (777 Attack Level)"
+verified = true
+
+[[entry]]
+addr = 0x0778
+width = 1
+name = "magic_level"
+doc = "Magic power level (1-8)."
+label = "MagicLevel"
+source = "Data Crystal ($0778) + listing (778 Magic Level)"
+verified = true
+
+[[entry]]
+addr = 0x0779
+width = 1
+name = "life_level"
+doc = "Life power level (1-8)."
+label = "Life Level"
+source = "Data Crystal ($0779) + listing (779 Life Level)"
+verified = true
+
+[[entry]]
+addr = 0x0783
+width = 1
+name = "magic_containers"
+doc = "Current number of magic containers."
+label = "Current number of Magic Containers"
+source = "Data Crystal ($0783) + listing (783 Magic Containers)"
+verified = true
+
+[[entry]]
+addr = 0x0784
+width = 1
+name = "heart_containers"
+doc = "Current number of heart containers."
+label = "Current number of Heart Containers"
+source = "Data Crystal ($0784) + listing (784 Heart Containers)"
+verified = true
+
+[[entry]]
+addr = 0x0793
+width = 1
+name = "keys"
+doc = "Current number of keys (00-09)."
+label = "Current number of Keys"
+source = "Data Crystal ($0793) + listing (793 Keys)"
+verified = true
+
+[[entry]]
+addr = 0x0794
+width = 1
+name = "crystals"
+doc = "Number of crystals left for the Great Palace."
+label = "Number of Crystals left"
+source = "Data Crystal ($0794) + listing (794 Crystals left)"
+verified = true
+
+[[entry]]
+addr = 0x0796
+width = 1
+name = "thrust_flags"
+doc = "Sword technique flags: $10 downward thrust, $04 upward thrust, $14 both."
+label = "Down/Up Techs"
+source = "Data Crystal ($0796 thrust) + listing (796 Down/Up Techs)"
+verified = true
+
+[[entry]]
+addr = 0x079F
+width = 1
+name = "deaths"
+doc = "Death and continue counter (max 255); the listing reads it as continues used."
+label = "Number of Continues"
+source = "Data Crystal ($079F deaths) + listing (79F Continues used)"
+verified = true
+
+[[entry]]
+addr = 0x008D
+width = 1
+name = "projectile_flag"
+doc = "Projectile flag: 00 inactive, 01 active, F2-FF disintegrating."
+label = "Projectile Flag"
+source = "Data Crystal ($008D) + listing (8D Projectile Flag)"
+verified = true
+
+# ---------------------------------------------------------------- enemy slots (6)
+# Both sources number the occupants from the low address upward
+# ($002A holds the first-listed slot). Slot s here addresses base+s;
+# see the generated `Ram::enemy(s)` docs.
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_y"
+base = 0x002A
+count = 6
+width = 1
+doc = "Enemy slot Y position, 6 slots ($002A-$002F)."
+label = "Enemy Y Position"
+source = "Data Crystal ($002A-$002F) + listing (2A,X Enemy Y)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_page"
+base = 0x003C
+count = 6
+width = 1
+doc = "Enemy slot X high byte (map page), 6 slots ($003C-$0041)."
+label = "Enemy X Position"
+source = "Data Crystal ($003C-$0041 page) + listing (3C,X Enemy X high)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_x"
+base = 0x004E
+count = 6
+width = 1
+doc = "Enemy slot X position LSB, 6 slots ($004E-$0053)."
+label = "Enemy X Position"
+source = "Data Crystal ($004E-$0053) + listing (4E,X Enemy X low)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_facing"
+base = 0x0060
+count = 6
+width = 1
+doc = "Enemy slot facing direction, 6 slots ($0060-$0065)."
+label = "Enemy facing direction"
+source = "Data Crystal ($0060-$0065) + listing (60,X Enemy facing)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_speed"
+base = 0x0071
+count = 6
+width = 1
+doc = "Enemy slot X velocity, 6 slots ($0071-$0076)."
+label = "Enemy X Velocity"
+source = "Data Crystal ($0071-$0076 speed) + listing (71,X Enemy X Velocity)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_id"
+base = 0x00A1
+count = 6
+width = 1
+doc = "Enemy slot ID and type code, 6 slots ($00A1-$00A6)."
+label = "Enemy Code"
+source = "Data Crystal ($00A1-$00A6 ID) + listing (A1,X Enemy Code)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_exists"
+base = 0x00B6
+count = 6
+width = 1
+doc = "Enemy slot generation and exists flag, 6 slots ($00B6-$00BB). Data Crystal: 0 no, 1 yes, 2 kill and give exp."
+label = "Generated Enemy Slot"
+source = "Data Crystal ($00B6-$00BB exists) + listing (B6,X Generated Enemy Slot)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_hp"
+base = 0x00C2
+count = 6
+width = 1
+doc = "Enemy slot current HP, 6 slots ($00C2-$00C7)."
+label = "Enemy Current HP"
+source = "Data Crystal ($00C2-$00C7 HP) + listing (C2,X Enemy Current HP)"
+verified = true
+
+[[array]]
+slot_of = "enemy"
+name = "enemy_stun"
+base = 0x040E
+count = 6
+width = 1
+doc = "Enemy slot hit-state and stun-delay-when-hit timer, 6 slots ($040E-$0413). 0 means not in hit state; nonzero causes flashing."
+label = "Enemy Hit State"
+source = "Data Crystal ($040E-$0413 stun) + listing (40E,X Enemy Hit State)"
+verified = true
+
+# ---------------------------------------------------------------- projectile slots (6)
+
+[[array]]
+slot_of = "projectile"
+name = "projectile_y"
+base = 0x0030
+count = 6
+width = 1
+doc = "Projectile slot Y, 6 slots ($0030-$0035)."
+label = "Projectile Y Position"
+source = "Data Crystal ($0030-$0035) + listing (30,X Projectile Y)"
+verified = true
+
+[[array]]
+slot_of = "projectile"
+name = "projectile_page"
+base = 0x0042
+count = 6
+width = 1
+doc = "Projectile slot X high byte, 6 slots ($0042-$0047)."
+label = "Projectile X Position"
+source = "Data Crystal ($0042-$0047) + listing (42,X Projectile X high)"
+verified = true
+
+[[array]]
+slot_of = "projectile"
+name = "projectile_x"
+base = 0x0054
+count = 6
+width = 1
+doc = "Projectile slot X, 6 slots ($0054-$0059)."
+label = "Projectile X Position"
+source = "Data Crystal ($0054-$0059) + listing (54,X Projectile X low)"
+verified = true
+
+[[array]]
+slot_of = "projectile"
+name = "projectile_facing"
+base = 0x0066
+count = 6
+width = 1
+doc = "Projectile slot facing direction, 6 slots ($0066-$006B)."
+label = "Projectile facing direction"
+source = "Data Crystal ($0066-$006B) + listing (66,X Projectile facing)"
+verified = true
+
+[[array]]
+slot_of = "projectile"
+name = "projectile_speed"
+base = 0x0077
+count = 6
+width = 1
+doc = "Projectile slot X velocity, 6 slots ($0077-$007C)."
+label = "Projectile X Velocity"
+source = "Data Crystal ($0077-$007C) + listing (77,X Projectile X Velocity)"
+verified = true
+
+[[array]]
+slot_of = "projectile"
+name = "projectile_id"
+base = 0x0087
+count = 6
+width = 1
+doc = "Projectile slot ID and type, 6 slots ($0087-$008C)."
+label = "Projectile Type"
+source = "Data Crystal ($0087-$008C) + listing (87,X Projectile Type)"
+verified = true
+
+# ---------------------------------------------------------------- spells + items (indexed)
+
+[[array]]
+slot_of = "none"
+name = "spell"
+base = 0x077B
+count = 8
+width = 1
+doc = "Spell possession flags, index 0-7: shield, jump, life, fairy, fire, reflect, spell, thunder ($077B-$0782). Nonzero means learned."
+label = "Shield spell"
+source = "Data Crystal ($077B-$0782) + listing (77B Have Shield spell)"
+verified = true
+
+[[array]]
+slot_of = "none"
+name = "item"
+base = 0x0785
+count = 8
+width = 1
+doc = "Item possession flags, index 0-7: candle, glove, raft, boots, flute, cross, hammer, magic key ($0785-$078C). Nonzero means owned."
+label = "Have Candle"
+source = "Data Crystal ($0785-$078C) + listing (785 Have Candle)"
+verified = true

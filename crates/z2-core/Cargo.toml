@@ -1,0 +1,31 @@
+[package]
+name = "z2-core"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs core engine: CPU-adjacent logic, RAM-map accessors, game facts"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_core"
+path = "src/lib.rs"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+z2-ppu = { path = "../z2-ppu" }
+
+[dev-dependencies]
+# ROM-gated co-op and widescreen tests replay corpus .bk2 movies (z2-verify
+# does not depend on z2-core, so there is no cycle).
+z2-verify = { path = "../z2-verify" }
+
+[features]
+# `interp` gates the embedded 2A03 interpreter (`cpu`), the trap
+# table (`traps`) and the execution half of `game` (`step`/`call_asm`/NMI).
+# It is on by default so `cargo test -p z2-core` exercises the interpreter;
+# release builds that have fully ported the engine compile it out with
+# `cargo build --no-default-features` (the RAM mirror, `Ram` accessors,
+# `GameFacts` and the `Game` state struct stay available).
+default = ["interp"]
+interp = []

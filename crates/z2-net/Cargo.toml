@@ -1,0 +1,47 @@
+[package]
+name = "z2-net"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs co-op netplay: transport-agnostic deterministic lockstep and rollback sessions (+ optional matchbox WebRTC transport)"
+
+[lib]
+name = "z2_net"
+path = "src/lib.rs"
+
+# The protocol core (default features) has NO dependencies: std only, host + wasm32.
+[features]
+default = []
+# WebRTC transport adapter over matchbox. Native: the message loop runs on a
+# dedicated std::thread under futures' block_on. wasm32: spawn_local.
+matchbox = [
+    "dep:matchbox_socket",
+    "dep:futures",
+    "dep:wasm-bindgen-futures",
+    "dep:js-sys",
+]
+
+[dependencies]
+# WebRTC data channels + signalling client for native and browser (MIT OR Apache-2.0).
+# On native it pulls webrtc-rs and `ring` 0.17 (Apache-2.0 AND ISC; builds C/asm via
+# `cc`, so the native `matchbox` build needs a C compiler; wasm32 needs none).
+matchbox_socket = { version = "0.14.0", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dependencies]
+# Minimal executor driving matchbox's Send message-loop future on a thread (MIT OR Apache-2.0).
+futures = { version = "0.3", default-features = false, features = ["executor"], optional = true }
+
+[target.'cfg(target_arch = "wasm32")'.dependencies]
+# spawn_local for matchbox's !Send wasm message-loop future (MIT OR Apache-2.0).
+wasm-bindgen-futures = { version = "0.4", optional = true }
+# Wall clock for the connect deadlines (MIT OR Apache-2.0); already in the tree.
+js-sys = { version = "0.3", optional = true }
+
+[target.'cfg(not(target_arch = "wasm32"))'.dev-dependencies]
+# In-process room-of-2 signalling server for the localhost matchbox integration test.
+z2-signal = { path = "../../tools/z2-signal" }
+# Runtime hosting that server inside the test (MIT); already in the tree via z2-signal.
+tokio = { version = "1", features = ["rt-multi-thread"] }
+
+[[example]]
+name = "net_peer"
+required-features = ["matchbox"]

@@ -1,0 +1,10 @@
+{
+  "name": "z2rs-qa",
+  "private": true,
+  "version": "0.0.0",
+  "description": "Dev/test tooling ONLY (Playwright browser automation for crates/z2-web/site/*.mjs). The site itself has no npm dependency: index.html, app.js and worklet.js import nothing from node_modules, and `make run-web` never reads this file. Bootstrap with `make netplay-e2e-setup`.",
+  "license": "SEE LEGAL.md",
+  "devDependencies": {
+    "playwright": "1.56.1"
+  }
+}

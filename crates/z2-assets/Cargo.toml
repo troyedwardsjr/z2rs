@@ -1,0 +1,11 @@
+[package]
+name = "z2-assets"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs asset extractor: ROM -> assets.bin (ROM hash gate in src/rom.rs)"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_assets"
+path = "src/lib.rs"

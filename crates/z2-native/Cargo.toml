@@ -1,0 +1,47 @@
+[package]
+name = "z2-native"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs native desktop frontend"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_native"
+path = "src/lib.rs"
+
+[features]
+# WebRTC netplay transport (matchbox). On by default so `--coop-host/--coop-join`
+# work out of the box; it pulls webrtc-rs and `ring` (Apache-2.0 AND ISC, builds
+# C/asm via `cc`), so containers without a C toolchain should use
+# `--no-default-features` — everything except the online transport still works
+# (local co-op, widescreen, movies, headless).
+default = ["netplay"]
+netplay = ["z2-net/matchbox"]
+
+[dependencies]
+z2-apu = { path = "../z2-apu" }
+z2-assets = { path = "../z2-assets" }
+z2-core = { path = "../z2-core" }
+# Lockstep protocol core: no dependencies unless the `matchbox` feature is on.
+z2-net = { path = "../z2-net" }
+z2-ppu = { path = "../z2-ppu" }
+# HD graphics packs + the shared present/compose path (widescreen, scaling).
+z2-render = { path = "../z2-render" }
+z2-verify = { path = "../z2-verify" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+winit = { version = "0.30", features = ["rwh_06"] }
+pixels = "0.15"
+cpal = "0.15"
+gilrs = "0.11"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSRunLoop"] }
+objc2-game-controller = { version = "0.3", features = ["GCController", "GCExtendedGamepad", "GCControllerElement", "GCControllerButtonInput", "GCControllerDirectionPad", "GCControllerAxisInput", "GCPhysicalInputProfile"] }
+
+[dev-dependencies]
+# In-process signalling server for the localhost desktop rollback end-to-end test.
+z2-signal = { path = "../../tools/z2-signal" }
+# Runtime hosting that server inside the test; already in the tree via z2-signal.
+tokio = { version = "1", features = ["rt-multi-thread"] }

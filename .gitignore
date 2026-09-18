@@ -1,0 +1,42 @@
+# Build output
+/target/
+
+# Local ROM copies are NEVER committed. Supply the ROM via the Z2_ROM
+# environment variable pointing at your own dump. See LEGAL.md.
+*.nes
+/rom/
+
+# Generated asset bundle (built from the user's ROM via z2-assets).
+assets.bin
+
+# Input movies live in the out-of-tree corpus/ directory.
+# Any in-tree movie file is a mistake.
+*.fm2
+*.bk2
+
+# Playwright and its browser downloads are DEV/TEST tooling only (site/smoke.mjs,
+# site/netplay-e2e.mjs — see `make netplay-e2e-setup`). The static site itself
+# still has no npm dependency; package.json/package-lock.json are committed so
+# the bootstrap is reproducible, node_modules/ never is.
+/node_modules/
+
+# wasm-pack output. It also drops its own `*` .gitignore in there, but say so
+# here too: the bundle is a build artifact and is rebuilt by `make run-web`.
+/crates/z2-web/site/pkg/
+
+# Editor / OS noise
+.DS_Store
+*.swp
+*~
+.idea/
+.vscode/
+
+# HD-pack output (LEGAL.md §1): template sheets are rendered from the ROM's
+# CHR data, and packs live outside the repository. Tooling refuses to write
+# here; these patterns catch copies and --force-in-repo leftovers.
+/hdpacks/
+*.hdpack/
+hdpack-templates/
+.z2rs-data/
+**/TEMPLATE-ROM-DERIVED.txt
+**/hdpack-seen.json

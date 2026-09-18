@@ -1,0 +1,20 @@
+[package]
+name = "z2-verify"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs lockstep verification oracle and movie tooling"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_verify"
+path = "src/lib.rs"
+
+[dependencies]
+# Lockstep oracle backend. MIT OR Apache-2.0.
+tetanes-core = "0.15"
+# Pinned-ROM hash gate: the oracle only loads ROMs that verify.
+z2-assets = { path = "../z2-assets" }
+# Raw-deflate for .bk2 entries (pure-Rust backend: wasm32-safe, no C).
+# MIT OR Apache-2.0.
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }

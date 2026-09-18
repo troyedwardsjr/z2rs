@@ -1,0 +1,11 @@
+[package]
+name = "z2-apu"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs APU synth: port of the bank 6 sound engine"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_apu"
+path = "src/lib.rs"

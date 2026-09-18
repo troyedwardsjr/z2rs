@@ -1,0 +1,174 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>z2rs — Zelda II reconstruction (web)</title>
+<link rel="icon" href="data:," />
+<style>
+  :root { color-scheme: dark; }
+  body { background: #101014; color: #e8e8ec; font: 14px/1.45 system-ui, sans-serif; margin: 0 auto; max-width: 900px; padding: 16px; }
+  h1 { font-size: 20px; margin: 0 0 4px; }
+  p.sub { color: #a8a8b4; margin: 0 0 12px; }
+  /* The canvas is runtime-sized (widescreen and HD scale both change it), so
+     the stage is a wrapping flex row: side by side when there is room, stacked
+     on a phone. `min-width: 0` lets the panel shrink instead of overflowing. */
+  #stage { display: flex; gap: 16px; flex-wrap: wrap; align-items: flex-start; }
+  #stage > .panel { flex: 1 1 260px; min-width: 0; }
+  /* app.js sets --css-w to the NES-pixel width times an integer zoom; the
+     backing store may be larger (HD pack), hence `height: auto` and
+     `aspect-ratio` so the picture never stretches. `max-width: 100%` wins over
+     the width, so a 432-px-wide frame still fits a 360-px phone. */
+  #screen {
+    image-rendering: pixelated;
+    display: block;
+    /* Keep the picture at the size the zoom asked for; when it no longer fits
+       beside the key panel, `max-width: 100%` caps it and the panel wraps
+       underneath instead of the canvas being squeezed. */
+    flex: 0 0 auto;
+    width: var(--css-w, 512px);
+    max-width: 100%;
+    height: auto;
+    background: #000;
+    border: 1px solid #333;
+  }
+  #drop { border: 2px dashed #555; border-radius: 8px; padding: 18px; text-align: center; color: #bdbdc8; margin: 12px 0; }
+  #drop.over { border-color: #7cf; background: #182028; }
+  fieldset { border: 1px solid #333; border-radius: 8px; margin: 12px 0; min-width: 0; }
+  fieldset.unsupported { opacity: 0.55; }
+  legend { padding: 0 6px; color: #bdbdc8; }
+  button, select, input { font: inherit; margin: 2px; max-width: 100%; }
+  button { background: #23232c; color: #eee; border: 1px solid #444; border-radius: 6px; padding: 4px 10px; cursor: pointer; }
+  button:disabled { opacity: 0.45; cursor: default; }
+  label { display: inline-block; }
+  #status { white-space: pre-wrap; overflow-wrap: anywhere; background: #0a0a0e; border: 1px solid #2c2c34; border-radius: 8px; padding: 8px; min-height: 3em; }
+  code, kbd { background: #1d1d24; border-radius: 4px; padding: 0 4px; }
+  table.keys { border-collapse: collapse; }
+  table.keys td, table.keys th { border: 1px solid #333; padding: 2px 6px; }
+  .warn { color: #ffcf7a; }
+  .err { color: #ff9b8f; }
+  /* Phone: one column, and let the key table scroll rather than widen it. */
+  @media (max-width: 560px) {
+    body { padding: 10px; }
+    #stage { gap: 10px; }
+    .scroller { overflow-x: auto; }
+  }
+</style>
+</head>
+<body>
+<h1>z2rs — Zelda II reconstruction (web frontend)</h1>
+<p class="sub">Drop your own Zelda II (USA) <code>.nes</code> dump below. The ROM is hash-gated
+in-tab (body CRC32 <code>BA322865</code>) and never uploaded anywhere.</p>
+
+<div id="stage">
+  <canvas id="screen" width="256" height="240"></canvas>
+  <div class="panel">
+    <div class="scroller">
+      <table class="keys">
+        <tr><th>NES</th><th>Player 1</th><th>Player 2 (co-op)</th><th>Gamepad</th></tr>
+        <tr><td>D-pad</td><td><kbd>←↑↓→</kbd></td><td><kbd>W</kbd><kbd>A</kbd><kbd>S</kbd><kbd>D</kbd></td><td>D-pad / left stick</td></tr>
+        <tr><td>A</td><td><kbd>Z</kbd></td><td><kbd>G</kbd></td><td>button 1</td></tr>
+        <tr><td>B</td><td><kbd>X</kbd></td><td><kbd>F</kbd></td><td>button 0</td></tr>
+        <tr><td>Start</td><td><kbd>Enter</kbd></td><td><kbd>T</kbd></td><td>button 9</td></tr>
+        <tr><td>Select</td><td><kbd>Shift</kbd></td><td><kbd>R</kbd></td><td>button 8</td></tr>
+      </table>
+    </div>
+    <p><button id="audioBtn" disabled>Enable audio</button>
+       <button id="pauseBtn" disabled>Pause</button>
+       <button id="zoomOut" title="Smaller picture">−</button>
+       <button id="zoomIn" title="Bigger picture">+</button></p>
+    <p>
+      <label>Screen
+        <select id="wideSel">
+          <option value="off">Standard (256×240)</option>
+          <option value="16:10">Wide 16:10 (384×240)</option>
+          <option value="16:9">Wide 16:9 (432×240)</option>
+        </select>
+      </label>
+      <label><input type="checkbox" id="clipChk" checked /> fill left edge</label>
+      <label><input type="checkbox" id="rclipChk" checked /> fill right edge</label>
+    </p>
+    <p><label><input type="checkbox" id="coopChk" /> local co-op (2 players)</label></p>
+    <p class="sub" id="wideNote">Widescreen margins are scenery only: enemies and
+      projectiles still appear at the original screen edge, and dialogue boxes do
+      not extend into them. Player 2 exists in side-view areas only.</p>
+  </div>
+</div>
+
+<div id="drop">Drop <code>.nes</code> ROM here, or <input type="file" id="romFile" accept=".nes,.bin" /></div>
+
+<fieldset id="hdBox">
+  <legend>HD graphics pack</legend>
+  <label>Pack folder <input type="file" id="hdDir" webkitdirectory directory multiple /></label>
+  <label>Scale
+    <select id="hdScale">
+      <option value="1" selected>1× (256 wide)</option>
+      <option value="2">2×</option>
+      <option value="3">3×</option>
+      <option value="4">4×</option>
+    </select>
+  </label>
+  <button id="hdClear" disabled>Use original art</button>
+  <div id="hdStatus" class="sub">no pack: original art at 1×.</div>
+  <p class="sub">Pick the folder that contains <code>pack.json</code> (make one with
+    <code>cargo xtask hdpack template --out DIR --scale 2</code>). The PNG sheets are decoded
+    in wasm — nothing is uploaded. Large scales cost frame time and memory: 2× at 256 wide is
+    about 0.56 ms per frame, 4× widescreen about 1.9 ms plus ~1 MiB of decoded sheet per CHR
+    page. A pack that fails to load is reported here and the game keeps playing with the
+    original art.</p>
+</fieldset>
+
+<fieldset>
+  <legend>Movie (QA replay)</legend>
+  <input type="file" id="movieFile" accept=".fm2,.txt" />
+  <button id="movieRewind" disabled>Rewind movie</button>
+  <span id="movieInfo"></span>
+</fieldset>
+
+<fieldset>
+  <legend>Saves (IndexedDB + files)</legend>
+  <select id="slotSel">
+    <option value="slot0">slot0</option>
+    <option value="slot1">slot1</option>
+    <option value="slot2">slot2</option>
+  </select>
+  <button id="snapSave" disabled>Save snapshot</button>
+  <button id="snapLoad" disabled>Load snapshot</button>
+  <button id="sramSave" disabled>Save SRAM</button>
+  <button id="sramLoad" disabled>Load SRAM</button>
+  <button id="snapExport" disabled>Export snapshot ⭳</button>
+  <input type="file" id="snapImport" accept=".z2web,.bin" />
+</fieldset>
+
+<fieldset id="netBox">
+  <legend>Online co-op (2 players)</legend>
+  <label title="Rollback applies your input at once and corrects the other player's when it arrives. Lockstep waits for both. Both players must pick the same mode.">Mode
+    <select id="netMode">
+      <option value="rollback" selected>rollback</option>
+      <option value="lockstep">lockstep</option>
+    </select>
+  </label>
+  <label>Signal <input id="netSignal" size="26" value="ws://localhost:3536" /></label>
+  <label>Room <input id="netRoom" size="12" placeholder="letters-digits" /></label>
+  <label>Delay
+    <select id="netDelay">
+      <option>0</option><option>1</option><option selected>2</option>
+      <option>3</option><option>4</option><option>6</option><option>8</option>
+    </select>
+  </label>
+  <label title="STUN/TURN servers, space-separated. Empty or 'none' = same machine or LAN only (fastest). TURN needs username=... credential=... (see README)">ICE
+    <input id="netIce" size="40" placeholder="none (same machine / LAN only)" /></label>
+  <button id="netHost" disabled>Host (P1)</button>
+  <button id="netJoin" disabled>Join (P2)</button>
+  <button id="netLeave" disabled>Leave</button>
+  <div id="netStatus" class="sub">netplay: checking support…</div>
+</fieldset>
+
+<fieldset>
+  <legend>Status</legend>
+  <div id="status">Loading wasm…</div>
+</fieldset>
+
+<script type="module" src="./app.js"></script>
+</body>
+</html>
