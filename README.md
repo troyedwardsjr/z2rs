@@ -1,5 +1,9 @@
 # z2rs
 
+### Read the release announcment: [Moddable Zelda 2 PC / Web port with Online Multiplayer Co-op and Widescreen Released](https://x.com/troygentic/status/2101572848506573135)
+### Join our Discord: [![Discord](https://img.shields.io/discord/1426351656144212102?color=7289DA&logo=discord&logoColor=white)](https://discord.gg/buZrPenm6K)
+
+
 z2rs is a clean-room-style reconstruction of Zelda II: The Adventure of Link (NES) in Rust. It runs as a desktop app and in the browser (WebAssembly), and it is checked frame by frame against the original ROM running in a reference emulator.
 
 You bring your own ROM. Nothing from the original game is distributed here. [PROVENANCE.md](PROVENANCE.md) records what reference material the project worked from and where every file in this repository came from, and [LEGAL.md](LEGAL.md) has the rules contributors follow.
