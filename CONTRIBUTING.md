@@ -17,6 +17,8 @@ Keep every crate building for the host and for `wasm32-unknown-unknown`. A libra
 
 `cargo fmt --check`, `cargo clippy`, `cargo test` without a ROM, and the `z2-web` wasm build must all pass.
 
+If you add a data file, a table of constants or a new reference source, record where it came from in [PROVENANCE.md](PROVENANCE.md) in the same pull request.
+
 ## Tests that need a ROM, movies or snapshots
 
 These tests skip themselves when their input is missing. They ask a helper for the path and return early when there is none, so `cargo test --workspace` passes with or without a ROM.

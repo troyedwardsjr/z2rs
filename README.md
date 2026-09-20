@@ -1,8 +1,8 @@
 # z2rs
 
-z2rs is a clean-room reconstruction of Zelda II: The Adventure of Link (NES) in Rust. It runs as a desktop app and in the browser (WebAssembly), and it is checked frame by frame against the original ROM running in a reference emulator.
+z2rs is a clean-room-style reconstruction of Zelda II: The Adventure of Link (NES) in Rust. It runs as a desktop app and in the browser (WebAssembly), and it is checked frame by frame against the original ROM running in a reference emulator.
 
-You bring your own ROM. Nothing from the original game is distributed here. See [LEGAL.md](LEGAL.md).
+You bring your own ROM. Nothing from the original game is distributed here. [PROVENANCE.md](PROVENANCE.md) records what reference material the project worked from and where every file in this repository came from, and [LEGAL.md](LEGAL.md) has the rules contributors follow.
 
 On top of the original game, z2rs adds a few optional extras:
 
