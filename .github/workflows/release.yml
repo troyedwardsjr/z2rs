@@ -1,0 +1,136 @@
+name: release
+
+# Builds the desktop app for each supported platform and attaches the archives
+# to a GitHub release. Pushing a tag such as `v0.1.0` publishes the release.
+# Running the workflow by hand builds the same archives and leaves them as
+# workflow artifacts, which is the way to check a build before tagging.
+
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: macos-13
+            target: x86_64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+    steps:
+      - uses: actions/checkout@v4
+
+      # winit, cpal and gilrs link X11, ALSA and udev on Linux.
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            pkg-config libasound2-dev libudev-dev libx11-dev \
+            libxkbcommon-dev libwayland-dev
+
+      - name: Install the Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --target ${{ matrix.target }} -p z2-native -p z2-signal
+
+      # The archive holds the game, the signalling server used for online
+      # co-op, and the documents a first run needs. No ROM, ever.
+      - name: Package (Unix)
+        if: runner.os != 'Windows'
+        shell: bash
+        run: |
+          name="z2rs-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          [ "$GITHUB_REF_TYPE" = tag ] || name="z2rs-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/z2-native" "$name/z2rs"
+          cp "target/${{ matrix.target }}/release/z2-signal" "$name/z2-signal"
+          cp README.md LICENSE LEGAL.md "$name/"
+          tar czf "$name.tar.gz" "$name"
+          echo "ARCHIVE=$name.tar.gz" >> "$GITHUB_ENV"
+
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          name="z2rs-${GITHUB_REF_NAME#v}-${{ matrix.target }}"
+          [ "$GITHUB_REF_TYPE" = tag ] || name="z2rs-${{ matrix.target }}"
+          mkdir "$name"
+          cp "target/${{ matrix.target }}/release/z2-native.exe" "$name/z2rs.exe"
+          cp "target/${{ matrix.target }}/release/z2-signal.exe" "$name/z2-signal.exe"
+          cp README.md LICENSE LEGAL.md "$name/"
+          7z a "$name.zip" "$name" > /dev/null
+          echo "ARCHIVE=$name.zip" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.target }}
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
+  release:
+    name: publish
+    needs: build
+    if: github.ref_type == 'tag'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        run: |
+          cd dist
+          sha256sum *.tar.gz *.zip > SHA256SUMS
+          cat SHA256SUMS
+
+      # The binaries are unsigned, so the release notes say what each system
+      # does about that before it will run them.
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          cat > notes.md <<'EOF'
+          Desktop builds of z2rs. Download the archive for your system, unpack it,
+          and run `z2rs` with your own Zelda II (USA) ROM:
+
+              ./z2rs --rom /path/to/zelda2.nes
+
+          No ROM is included and none is uploaded anywhere. `z2-signal` in the
+          same archive is the signalling server for online co-op, and you only
+          need it if you host a session yourself.
+
+          These builds are not code signed. macOS needs right click and Open the
+          first time, Windows SmartScreen needs More info and Run anyway, and on
+          Linux the file may need `chmod +x`.
+
+          `SHA256SUMS` lists the checksum of every archive.
+          EOF
+          gh release create "$GITHUB_REF_NAME" \
+            --title "z2rs $GITHUB_REF_NAME" \
+            --notes-file notes.md \
+            dist/*
