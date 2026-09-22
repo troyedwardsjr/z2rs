@@ -29,12 +29,14 @@ jobs:
             target: x86_64-unknown-linux-gnu
           - os: macos-latest
             target: aarch64-apple-darwin
-          - os: macos-13
+          # Intel macOS cross-builds on the Apple Silicon runner: the macos-13
+          # Intel runner is retired and its jobs never pick up a machine.
+          - os: macos-latest
             target: x86_64-apple-darwin
           - os: windows-latest
             target: x86_64-pc-windows-msvc
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # winit, cpal and gilrs link X11, ALSA and udev on Linux.
       - name: Install Linux build dependencies
@@ -83,7 +85,7 @@ jobs:
           7z a "$name.zip" "$name" > /dev/null
           echo "ARCHIVE=$name.zip" >> "$GITHUB_ENV"
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: ${{ matrix.target }}
           path: ${{ env.ARCHIVE }}
@@ -95,9 +97,9 @@ jobs:
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
