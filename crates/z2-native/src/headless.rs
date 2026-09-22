@@ -1,7 +1,7 @@
 //! Headless automation CLI surface.
 //!
 //! `z2-native --headless [--snapshot S] [--movie M] [--frames N]
-//! [--dump facts.json] [--dump-frame out.png]`
+//! [--dump facts.json] [--dump-frame out.png] [--dump-at LIST,PREFIX]`
 //!
 //! Scope: this file owns the **CLI surface** —
 //! argument parsing, exit codes and the windowless run used on CI.
@@ -55,6 +55,11 @@ pub struct HeadlessArgs {
     /// Where to write the final framebuffer PNG (indexed frame through
     /// the display-only NES palette, `std`-only encoder below).
     pub dump_frame: Option<String>,
+    /// Raw `--dump-at` value, `FRAMES,PREFIX` (e.g. `450,472,palace`):
+    /// after stepping each listed 1-based frame, write `<prefix>N.png`
+    /// (same encoder as [`Self::dump_frame`]). Parsed by
+    /// [`parse_dump_at`] once the run starts.
+    pub dump_at: Option<String>,
     /// ROM path. Explicit `--rom` wins; else `$Z2_ROM`; with neither, the
     /// run uses the synthetic no-cartridge `Game`.
     pub rom: Option<String>,
@@ -132,6 +137,8 @@ usage: z2-native --headless [--snapshot S] [--movie M] [--frames N] [--dump fact
   --frames N      frames to emulate (default 0: smoke when no --movie, whole track with --movie)
   --dump PATH     write GameFacts JSON of the final state here
   --dump-frame P  write final framebuffer PNG here (display palette, std-only encoder)
+  --dump-at L,P   after each 1-based frame in LIST write PREFIX N .png
+                  (`450,472,palace` writes palace450.png + palace472.png)
   --widescreen P  widescreen margins: off | 16:10 | 16:9 | N tiles per side (0-16)
   --dump-wide P   write the composed widescreen PNG here (needs a ROM for CHR;
                   implies --widescreen 16:9 when that flag is absent)
@@ -193,6 +200,7 @@ pub fn parse_headless_args(argv: &[String]) -> Result<ParseOutcome, String> {
             }
             "--dump" => args.dump_facts = Some(value_of(&mut it, "--dump")?),
             "--dump-frame" => args.dump_frame = Some(value_of(&mut it, "--dump-frame")?),
+            "--dump-at" => args.dump_at = Some(value_of(&mut it, "--dump-at")?),
             "--rom" => args.rom = Some(value_of(&mut it, "--rom")?),
             "--widescreen" => {
                 let raw = value_of(&mut it, "--widescreen")?;
@@ -245,6 +253,85 @@ where
         .ok_or_else(|| format!("{flag} expects a value\n{HEADLESS_USAGE}"))
 }
 
+/// Parse a [`HeadlessArgs::dump_at`] value: every comma item but the last
+/// is a 1-based frame number, the last is the file-name prefix.
+pub fn parse_dump_at(raw: &str) -> Result<(Vec<usize>, String), String> {
+    let Some((frames_raw, prefix)) = raw.rsplit_once(',') else {
+        return Err(format!(
+            "--dump-at expects FRAMES,PREFIX (e.g. 450,472,palace), got '{raw}'"
+        ));
+    };
+    if prefix.is_empty() || frames_raw.is_empty() {
+        return Err(format!(
+            "--dump-at expects FRAMES,PREFIX (e.g. 450,472,palace), got '{raw}'"
+        ));
+    }
+    let mut frames = Vec::new();
+    for item in frames_raw.split(',') {
+        let n: usize = item
+            .parse()
+            .map_err(|_| format!("--dump-at: bad frame '{item}' in '{raw}'"))?;
+        if n == 0 {
+            return Err(format!(
+                "--dump-at: frame numbers are 1-based, got '{item}' in '{raw}'"
+            ));
+        }
+        frames.push(n);
+    }
+    Ok((frames, prefix.to_string()))
+}
+
+/// Per-frame PNG snapshots requested by `--dump-at`.
+///
+/// Owned by the stepping loop of [`run_headless`]; [`Self::observe`] runs
+/// once per stepped frame and writes nothing unless the frame is a target
+/// (the encoder is the same std-only 256x240 one as `--dump-frame`).
+struct FrameDumps {
+    targets: Vec<usize>,
+    prefix: String,
+    written: Vec<String>,
+}
+
+impl FrameDumps {
+    /// No-dump instance (steps pass straight through `observe`).
+    fn inactive() -> Self {
+        Self {
+            targets: Vec::new(),
+            prefix: String::new(),
+            written: Vec::new(),
+        }
+    }
+
+    /// Parsed from the raw `--dump-at` value; `None` is [`Self::inactive`].
+    fn parse(raw: Option<&String>) -> Result<Self, HeadlessError> {
+        match raw {
+            None => Ok(Self::inactive()),
+            Some(raw) => {
+                parse_dump_at(raw)
+                    .map_err(HeadlessError::Usage)
+                    .map(|(targets, prefix)| Self {
+                        targets,
+                        prefix,
+                        written: Vec::new(),
+                    })
+            }
+        }
+    }
+
+    /// After `count` frames stepped (1-based), write the PNG if `count` is
+    /// a target.
+    fn observe(&mut self, count: usize, emu: &mut crate::app::Emu) -> Result<(), HeadlessError> {
+        if !self.targets.contains(&count) {
+            return Ok(());
+        }
+        let path = format!("{}{count}.png", self.prefix);
+        let png = encode_frame_png(emu.game.frame_indexed());
+        std::fs::write(&path, png).map_err(HeadlessError::Io)?;
+        self.written.push(path);
+        Ok(())
+    }
+}
+
 /// Windowless run report.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HeadlessReport {
@@ -254,6 +341,8 @@ pub struct HeadlessReport {
     pub facts_path: Option<String>,
     /// Frame dump written, if requested.
     pub frame_path: Option<String>,
+    /// Multi-frame dumps written by `--dump-at`, in write order.
+    pub dump_at_paths: Vec<String>,
     /// Widescreen PNG written, if requested.
     pub wide_path: Option<String>,
     /// Co-op status JSON written, if requested.
@@ -298,12 +387,6 @@ impl fmt::Display for HeadlessError {
 
 impl std::error::Error for HeadlessError {}
 
-/// Chunk size for stepping long blank tails (avoids materialising a huge
-/// input vector for large `--frames`; stepping in chunks is observationally
-/// identical — one [`crate::app::step_frames`] call per chunk, no audio
-/// sink headless).
-const BLANK_CHUNK: usize = 4096;
-
 /// Run windowless. No window, no GPU, no audio device: safe on display-less
 /// CI. No ROM, no oracle needed — the synthetic (no-cartridge) `Game`.
 ///
@@ -312,7 +395,9 @@ const BLANK_CHUNK: usize = 4096;
 ///   (`0x00`) input or of the `--movie` track through the SAME shared
 ///   primitive as the windowed loop ([`crate::app::step_frames`]).
 /// * `--dump` writes the final-state [`GameFacts`] JSON; `--dump-frame`
-///   writes the final indexed framebuffer as PNG (display palette).
+///   writes the final indexed framebuffer as PNG (display palette);
+///   `--dump-at L,P` writes `<P>N.png` after each listed 1-based frame N
+///   while the run steps.
 pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError> {
     // -- initial RAM (INTERIM 2048-byte image, as before) -------------------
     let snapshot_ram: Option<[u8; Ram::LEN]> = match &args.snapshot {
@@ -391,22 +476,24 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
     emu.game.coop_reset_area();
     // -- step through the shared primitive (never duplicated here) ---------
     let want = usize::try_from(args.frames).unwrap_or(usize::MAX);
+    let mut dumps = FrameDumps::parse(args.dump_at.as_ref())?;
     let mut stepped: usize = 0;
     if track.is_empty() {
-        stepped += step_blank(&mut emu, want, args);
+        stepped += step_blank(&mut emu, want, args, &mut dumps)?;
     } else if want == 0 {
         // `--movie` with `--frames 0` (or default): the whole track.
-        stepped += step_track(&mut emu, &track, args);
+        stepped += step_track(&mut emu, &track, args, &mut dumps)?;
     } else {
         let head = want.min(track.len());
-        stepped += step_track(&mut emu, &track[..head], args);
-        stepped += step_blank(&mut emu, want - head, args);
+        stepped += step_track(&mut emu, &track[..head], args, &mut dumps)?;
+        stepped += step_blank(&mut emu, want - head, args, &mut dumps)?;
     }
     // -- dumps of the final state ------------------------------------------
     let mut report = HeadlessReport {
         frames_run: stepped as u64,
         facts_path: None,
         frame_path: None,
+        dump_at_paths: Vec::new(),
         wide_path: None,
         coop_path: None,
         present_path: None,
@@ -492,6 +579,7 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
         std::fs::write(path, json).map_err(HeadlessError::Io)?;
         report.coop_path = Some(path.clone());
     }
+    report.dump_at_paths = std::mem::take(&mut dumps.written);
     // Interpreter health (see Game::exec_errors): nonzero faults mean the
     // run wedged somewhere — the frame dumps above are frozen states.
     match emu.game.last_exec_error {
@@ -505,30 +593,47 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
     Ok(report)
 }
 
-/// Step `n` blank (`0x00`) frames in bounded chunks. Returns frames stepped.
-fn step_blank(emu: &mut crate::app::Emu, n: usize, args: &HeadlessArgs) -> usize {
-    let blank = [0u8; BLANK_CHUNK];
-    let mut left = n;
+/// Step `n` blank (`0x00`) frames. Returns frames stepped.
+fn step_blank(
+    emu: &mut crate::app::Emu,
+    n: usize,
+    args: &HeadlessArgs,
+    dumps: &mut FrameDumps,
+) -> Result<usize, HeadlessError> {
     let mut done = 0;
-    while left > 0 {
-        let take = left.min(BLANK_CHUNK);
-        done += step_track(emu, &blank[..take], args);
-        left -= take;
+    for _ in 0..n {
+        step_one_frame(emu, 0, args);
+        done += 1;
+        dumps.observe(done, emu)?;
     }
-    done
+    Ok(done)
 }
 
-/// Step a pad-1 track, pairing it with the scripted pad 2 under `--coop`.
-///
-/// Without `--coop` this is exactly `app::step_frames` (`Game::step`), so the
-/// default headless path stays byte-identical to the verification path.
-fn step_track(emu: &mut crate::app::Emu, pads: &[u8], args: &HeadlessArgs) -> usize {
+/// Step exactly one frame with the scripted pad-2 policy.
+fn step_one_frame(emu: &mut crate::app::Emu, pad: u8, args: &HeadlessArgs) -> usize {
     if args.coop {
-        let pairs: Vec<(u8, u8)> = pads.iter().map(|&p| (p, args.pad2_for(p))).collect();
-        crate::app::step_frames2(emu, &pairs, None)
+        // Deliberately `step2` only under `--coop`: the single-pad path must
+        // not touch pad 2 even by writing a zero.
+        crate::app::step_frames2(emu, &[(pad, args.pad2_for(pad))], None)
     } else {
-        crate::app::step_frames(emu, pads, None)
+        crate::app::step_frames(emu, &[pad], None)
     }
+}
+
+/// Step a pad-1 track. Returns frames stepped.
+fn step_track(
+    emu: &mut crate::app::Emu,
+    pads: &[u8],
+    args: &HeadlessArgs,
+    dumps: &mut FrameDumps,
+) -> Result<usize, HeadlessError> {
+    let mut done = 0;
+    for &p in pads {
+        step_one_frame(emu, p, args);
+        done += 1;
+        dumps.observe(done, emu)?;
+    }
+    Ok(done)
 }
 
 /// Encode the indexed framebuffer as a true-colour PNG (std-only).
@@ -580,6 +685,9 @@ pub fn run_argv(argv: &[String]) -> i32 {
                     println!("headless ok: facts -> {p}");
                 }
                 if let Some(p) = &report.frame_path {
+                    println!("headless ok: frame -> {p}");
+                }
+                for p in &report.dump_at_paths {
                     println!("headless ok: frame -> {p}");
                 }
                 0
@@ -652,6 +760,8 @@ mod tests {
             "facts.json",
             "--dump-frame",
             "out.png",
+            "--dump-at",
+            "450,472,palace",
         ]))
         .expect("parses");
         assert_eq!(
@@ -663,10 +773,44 @@ mod tests {
                 frames: 600,
                 dump_facts: Some("facts.json".into()),
                 dump_frame: Some("out.png".into()),
+                dump_at: Some("450,472,palace".into()),
                 rom: None,
                 ..Default::default()
             })
         );
+    }
+
+    #[test]
+    fn parses_dump_at_values_and_rejects_bad_ones() {
+        let out = parse_headless_args(&argv(&["z2-native", "--headless", "--dump-at", "2,pal"]))
+            .expect("parses");
+        let ParseOutcome::Run(a) = out else {
+            panic!("expected a run");
+        };
+        assert_eq!(
+            parse_dump_at(a.dump_at.as_deref().expect("set")),
+            Ok((vec![2], "pal".into()))
+        );
+        assert_eq!(
+            parse_dump_at("450,472,palace"),
+            Ok((vec![450, 472], "palace".into()))
+        );
+        // Bad values are usage errors at run time (`FrameDumps::parse`),
+        // not argument-parse time — mirror `--snapshot`'s late validation.
+        for bad in ["palace", ",palace", "0,palace", "10,two,palace", "1,"] {
+            assert!(
+                matches!(
+                    run_headless(&HeadlessArgs {
+                        dump_at: Some(bad.into()),
+                        ..Default::default()
+                    }),
+                    Err(HeadlessError::Usage(_))
+                ),
+                "must reject --dump-at '{bad}'"
+            );
+        }
+        assert!(parse_dump_at("all frames").is_err());
+        assert!(parse_dump_at("1,").is_err());
     }
 
     #[test]
@@ -879,6 +1023,40 @@ mod tests {
         assert_eq!(&bytes[12..16], b"IHDR", "first chunk is IHDR");
         assert_eq!(u32::from_be_bytes(bytes[16..20].try_into().unwrap()), 256);
         assert_eq!(u32::from_be_bytes(bytes[20..24].try_into().unwrap()), 240);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// `--dump-at` writes one PNG per listed 1-based frame while the run
+    /// steps, and `--dump-frame` (final frame) still works independently.
+    #[test]
+    fn dump_at_writes_pngs_at_each_frame() {
+        let dir = scratch("dumpat");
+        let final_png = dir.join("final.png");
+        let prefix = dir.join("pal").to_string_lossy().into_owned();
+        let report = run_headless(&HeadlessArgs {
+            frames: 3,
+            dump_at: Some(format!("2,3,{prefix}")),
+            dump_frame: Some(final_png.to_string_lossy().into_owned()),
+            ..Default::default()
+        })
+        .expect("dump-at runs ungated");
+        assert_eq!(report.frames_run, 3);
+        assert_eq!(report.dump_at_paths.len(), 2, "{report:?}");
+        for n in [2, 3usize] {
+            let bytes =
+                std::fs::read(dir.join(format!("pal{n}.png"))).expect("per-frame png written");
+            assert_eq!(
+                &bytes[0..8],
+                &[137, 80, 78, 71, 13, 10, 26, 10],
+                "PNG magic in {n}"
+            );
+        }
+        let bytes = std::fs::read(&final_png).expect("final png written");
+        assert_eq!(
+            &bytes[0..8],
+            &[137, 80, 78, 71, 13, 10, 26, 10],
+            "PNG magic"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

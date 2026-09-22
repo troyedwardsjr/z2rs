@@ -91,11 +91,17 @@ pub struct KeyBindings {
 
 impl Default for KeyBindings {
     fn default() -> Self {
-        // Layout: Z=A, X=B, Enter=Start, ShiftRight=Select,
+        // Layout: Z=A, X=B, Enter=Start, either Shift=Select,
         // arrows=dpad. Mirrors the README quick-start.
+        //
+        // Both Shift keys are bound because Select is how the game casts a
+        // spell: binding only the right one made magic look broken to anyone
+        // who reached for the Shift under their left hand, which is the one
+        // next to the arrow keys on no keyboard at all.
         let pairs = [
             ("KeyZ", 0u8),       // A
             ("KeyX", 1u8),       // B
+            ("ShiftLeft", 2u8),  // Select
             ("ShiftRight", 2u8), // Select
             ("Enter", 3u8),      // Start
             ("ArrowUp", 4u8),
@@ -468,6 +474,15 @@ impl NativeConfig {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn either_shift_is_select() {
+        // Select is the cast button, so a Select that only answers to one of
+        // the two Shift keys reads as "magic is broken".
+        let c = NativeConfig::default();
+        assert_eq!(c.keys.bit_for("ShiftLeft"), Some(2));
+        assert_eq!(c.keys.bit_for("ShiftRight"), Some(2));
+    }
 
     #[test]
     fn defaults_are_sane() {

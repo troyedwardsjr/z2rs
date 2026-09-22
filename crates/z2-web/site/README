@@ -78,7 +78,21 @@ Pad byte bits 0..7 are A, B, Select, Start, Up, Down, Left, Right.
 
 The keys match the desktop app (`KeyBindings::default` in `crates/z2-native/src/config.rs` binds `KeyZ` to bit 0), so the two frontends share one layout and a desktop host can play with a web guest. Player 2's keys are the same set the desktop app's `keys_p2` default uses.
 
-Keyboard and gamepad input are OR-ed together every frame (`pollInput` in `app.js`). `WebEmu::pack_buttons` packs the byte with the same bit layout as `z2_core::game` and the lockstep oracle. With local co-op on, the first connected gamepad is player 1 and the second is player 2. The pads are taken in index order from `navigator.getGamepads()`. That array is sparse: a disconnected slot is `null` and the indices are not compacted.
+On a touch screen, player 1 gets an on-screen controller: a d-pad, Select,
+Start, B and A floating over the bottom of the viewport. It appears by itself
+where touch is the main pointer (`(pointer: coarse)` matches), the Touch pad
+button shows and hides it anywhere, and `?touch=1` or `?touch=0` forces it
+either way.
+
+Fingers are tracked one by one and hit-tested again as they move, so a thumb
+can roll from B onto A, or slide around the d-pad, without lifting. The d-pad
+reads eight directions and has a small dead zone at the centre, and a finger
+that started on it keeps steering after it drifts off the disc. Lifting the
+first finger also starts the sound, because a phone has no obvious moment to
+press Enable audio. On a touch device the canvas is capped at the viewport
+height and letterboxed, so a phone held sideways shows the whole picture.
+
+Keyboard, gamepad and the on-screen controller are OR-ed together every frame (`pollInput` in `app.js`). `WebEmu::pack_buttons` packs the byte with the same bit layout as `z2_core::game` and the lockstep oracle. With local co-op on, the first connected gamepad is player 1 and the second is player 2. The pads are taken in index order from `navigator.getGamepads()`. That array is sparse: a disconnected slot is `null` and the indices are not compacted.
 
 ## Widescreen, HD packs and co-op
 
@@ -176,6 +190,8 @@ The nine members above are the stable contract. Every control added for widescre
 | `ext.net.simulate({latencyMs, jitterMs, lossPct})` | test hook, off by default and never used by normal play: delay every packet this page sends by `latencyMs` plus a random `0..=jitterMs` of session time and drop `lossPct` % of unreliable packets, inside the page's transport wrapper. Applies to the live session too; `simulate({})` turns it off → the applied setting |
 | `ext.net.confirmedHashes()` | rollback: → JSON `[[frame, "hash"], ...]` for every 15th saved state that no rollback can still change (`hash_state(&[ram, wram, oam, coop_hash])`); `[]` otherwise |
 | `ext.perf.rollback({iterations, depths})` | times one emulated frame, one save, one load and a worst-case rollback tick per depth with `performance.now()` → `{iterations, frame, save, load, tick: {depth: stats}}`, each `{mean, p95, max}` in ms. Leaves the game where it was; refused during a session |
+| `ext.touch.show(on)` / `ext.touch.shown()` | show or hide the on-screen controller → whether it is showing |
+| `ext.touch.mask()` | → the pad byte the on-screen controller contributes right now |
 | `ext.trapsetId()` | → 16 hex chars identifying the ported-routine set |
 
 `site/smoke.mjs` checks the nine stable members and `ext` separately, so a change to `ext` never counts as a break of the stable contract.
@@ -196,10 +212,33 @@ In rollback mode `net.status()` adds `mode`, `rttMs`, `rollbacks`, `rollbackFram
 | `?scale=` | HD output multiplier 1 to 4 (above 1 needs an `hd` bundle) |
 | `?zoom=` | on-screen CSS pixels per NES pixel, 1 to 4 |
 | `?coop=1` | start with local two-player co-op on |
+| `?touch=1` / `?touch=0` | force the on-screen controller on or off (the default is on where touch is the main pointer) |
 | `?net=` | `rollback` (default) \| `lockstep` for the netplay Mode select |
 | `?signal=`, `?room=`, `?ice=`, `?delay=` | prefill the netplay panel (nothing connects by itself) |
 
 A bad value is appended to the Status box and otherwise ignored. It is never fatal, so a stale bookmark still loads a playable page.
+
+## Host configuration (`#z2-config`)
+
+A page may carry an optional `<script id="z2-config" type="application/json">`
+element, which `app.js` reads at boot. The vanilla page in this directory has
+none, and without it `app.js` loads `./pkg/z2_web.js` and waits for a dropped
+ROM.
+
+| field | effect |
+|---|---|
+| `wasm.js`, `wasm.wasm` | URLs of the glue module and the binary. `app.js` `import()`s the module and passes the binary URL to its `init` |
+| `rom.url` | fetch the ROM from here at boot and start playing. The page then says nothing about ROMs: the intro line and the drop box are hidden once the game runs, and come back only if the download fails or needs a key. `?rom=drop` skips the download and plays a dropped dump instead |
+| `rom.keyRequired` | informational. A `401` from `rom.url` shows the Access key box, and the key is sent as `x-z2-rom-key` and kept in `localStorage` under `z2rs-rom-key` |
+| `notes` | lines appended to Status at boot |
+
+## Pausing
+
+Pause is the player's. The page also pauses by itself when the tab is hidden,
+though never during a netplay session, and it undoes that pause by itself when
+the tab comes back, without trying to catch up on the time away. A page that
+loaded in a background tab, or a phone that was locked for a moment, comes back
+running. A pause the player asked for stays until the player ends it.
 
 ## Saves
 
@@ -218,6 +257,8 @@ The tests are driven by Playwright and share the static server in `qa-server.mjs
 `node site/netplay-e2e-rollback.mjs` (or `make netplay-e2e-rollback`) is the rollback proof over a simulated bad link (`ext.net.simulate`). It covers wasm costs, a live-page rollback connect, more than zero rollbacks in both windows, the local pad reaching the local simulation after exactly `input_delay` frames, input crossing both ways, and matching confirmed-frame hashes with zero desyncs. It has the same requirements as `netplay-e2e`.
 
 `node site/netplay-play.mjs` (or `make netplay-play`) is not a test. It opens two visible windows that are already in a rollback session so you can play by hand. `netplay-lib.mjs` holds the helpers these scripts share.
+
+`node site/article-shots.mjs` is not a test either. It screenshots the real page (16:9, local co-op, the online co-op panel) for articles and documentation, into `$Z2_SHOTS_OUT`, which must be outside the repository.
 
 ## Known gaps
 

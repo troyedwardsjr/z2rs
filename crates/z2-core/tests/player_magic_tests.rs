@@ -90,7 +90,10 @@ fn meter_exp_ticks_match_d3e9() {
     assert_eq!(exp_trickle(0, 0, 0, 20), (0, 10, 0, 10));
     assert_eq!(exp_trickle(0, 0xFF, 0, 10), (1, 9, 0, 0));
     assert_eq!(exp_loss_tick(1, 0, 2), (0, 0xFF, 1));
-    assert_eq!(exp_loss_tick(0, 0, 2), (0, 0, 2));
+    // `DEC $05E8` ($D47C) precedes the zero-exp check ($D47F): with no exp
+    // left the pending count still drains, it just moves nothing.
+    assert_eq!(exp_loss_tick(0, 0, 2), (0, 0, 1));
+    assert_eq!(exp_loss_tick(0, 0, 0), (0, 0, 0));
 }
 
 #[test]
@@ -125,14 +128,21 @@ fn pickups_containers_items() {
         item_pickup(0x08, 4, false),
         Pickup::Key { unlock_boss: false }
     );
-    assert!(matches!(
+    // Containers stage `code << 4` ($E0 magic / $F0 life) as the refill.
+    assert_eq!(
         item_pickup(0x0E, 4, false),
-        Pickup::Container { magic: true, .. }
-    ));
-    assert!(matches!(
+        Pickup::Container {
+            magic: true,
+            pending: 0xE0
+        }
+    );
+    assert_eq!(
         item_pickup(0x0F, 4, false),
-        Pickup::Container { magic: false, .. }
-    ));
+        Pickup::Container {
+            magic: false,
+            pending: 0xF0
+        }
+    );
     assert_eq!(item_pickup(0x12, 4, false), Pickup::Doll);
     assert_eq!(
         item_pickup(0x13, 4, false),
@@ -141,16 +151,11 @@ fn pickups_containers_items() {
             bit: 0x20
         }
     );
-    // Red jar scales with containers (ctr << 4).
-    assert_eq!(
-        item_pickup(0x11, 4, false),
-        Pickup::Jar {
-            magic_add: 0,
-            life_add: 0x40
-        }
-    );
-    let (nc, kasuto, pend) = container_pickup(6, 2, true);
-    assert_eq!((nc, kasuto, pend), (7, true, 0x20));
+    // Both jars refill magic ($070C): blue a flat $10, red containers << 4.
+    assert_eq!(item_pickup(0x10, 4, false), Pickup::Jar { magic_add: 0x10 });
+    assert_eq!(item_pickup(0x11, 4, false), Pickup::Jar { magic_add: 0x40 });
+    let (nc, kasuto, pend) = container_pickup(6, 0x0E, true);
+    assert_eq!((nc, kasuto, pend), (7, true, 0xE0));
     let p = item_passive([1, 0, 1, 1, 1, 1, 1, 1]);
     assert!(p.candle_lit && p.raft_float && p.boots_stride && p.magic_key);
     assert!(!p.glove_break);

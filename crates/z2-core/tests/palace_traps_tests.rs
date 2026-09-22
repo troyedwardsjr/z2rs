@@ -106,6 +106,45 @@ fn item_grant_shim_sets_flag_row_and_keys() {
 }
 
 #[test]
+fn item_grant_shim_applies_containers_jars_and_doll() {
+    let mut game = Game::new();
+    game.ram[0x0010] = 0;
+    // Magic container ($0E): count up, refill $E0 staged at $070C, and the
+    // Kasuto bit once the seventh one lands ($E7CD-$E7E8).
+    game.ram[0x0783] = 6;
+    game.ram[0x00AF] = 0x0E;
+    pc_item_grant(&mut game);
+    assert_eq!(game.ram[0x0783], 7, "magic containers");
+    assert_eq!(game.ram[0x070C], 0xE0, "magic refill staged");
+    assert_eq!(game.ram[0x079D] & 0x08, 0x08, "seven-containers bit");
+    // Heart container ($0F): the life side of the same pair.
+    game.ram[0x0784] = 4;
+    game.ram[0x00AF] = 0x0F;
+    pc_item_grant(&mut game);
+    assert_eq!(game.ram[0x0784], 5, "heart containers");
+    assert_eq!(game.ram[0x070D], 0xF0, "life refill staged");
+    // Jars: both codes add to the MAGIC refill ($E863-$E86C); the red one
+    // scales with the magic containers (7 << 4 = $70).
+    game.ram[0x070C] = 0x00;
+    game.ram[0x00AF] = 0x10;
+    pc_item_grant(&mut game);
+    assert_eq!(game.ram[0x070C], 0x10, "blue jar = flat $10 of magic");
+    game.ram[0x070C] = 0x00;
+    game.ram[0x00AF] = 0x11;
+    pc_item_grant(&mut game);
+    assert_eq!(game.ram[0x070C], 0x70, "red jar = containers << 4, magic");
+    assert_eq!(game.ram[0x070D], 0xF0, "and no jar touches the life refill");
+    // Doll and the flag-only pickups.
+    game.ram[0x0700] = 2;
+    game.ram[0x00AF] = 0x12;
+    pc_item_grant(&mut game);
+    assert_eq!(game.ram[0x0700], 3, "doll = extra life");
+    game.ram[0x00AF] = 0x13;
+    pc_item_grant(&mut game);
+    assert_eq!(game.ram[0x079C] & 0x20, 0x20, "lost child flag");
+}
+
+#[test]
 fn crystal_shims_place_fly_and_refill() {
     let mut game = Game::new();
     game.ram[0x0010] = 0;

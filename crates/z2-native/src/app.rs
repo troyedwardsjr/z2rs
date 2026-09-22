@@ -59,6 +59,15 @@ pub const HOTKEY_SAVE: &str = "F5";
 /// Hotkeys (also listed in the window title help line).
 pub const HOTKEY_LOAD: &str = "F7";
 
+/// Numbered save-state slots: digits 1-9 / 0 select, `F6` cycles.
+pub const SAVESTATE_SLOTS: u8 = 10;
+
+/// Next save-state slot in the cycle (`9` wraps to `0`).
+#[must_use]
+pub fn next_savestate_slot(slot: u8) -> u8 {
+    (slot + 1) % SAVESTATE_SLOTS
+}
+
 /// Fixed-timestep accumulator (pure — no threads, no window).
 #[derive(Debug, Clone)]
 pub struct FrameTimer {
@@ -857,13 +866,19 @@ pub fn suspicious_slots(sram: &[u8]) -> Vec<u8> {
 // ---------------------------------------------------------------------------
 
 /// Window title line: FPS + underrun meter + state flags.
-pub fn title_text(fps: f64, underruns: u64, paused: bool, fast_forward: bool) -> String {
+///
+/// A nonzero `slot` is announced as `[SLOT n]` so the selected save target
+/// is always visible; slot `0` shows nothing (the historical default).
+pub fn title_text(fps: f64, underruns: u64, paused: bool, fast_forward: bool, slot: u8) -> String {
     let mut s = format!("z2rs — {fps:.1} fps, underruns {underruns}");
     if paused {
         s.push_str(" [PAUSED — press P]");
     }
     if fast_forward {
         s.push_str(" [FF]");
+    }
+    if slot != 0 {
+        s.push_str(&format!(" [SLOT {slot}]"));
     }
     s
 }
@@ -890,9 +905,10 @@ pub fn window_title(
     paused: bool,
     fast_forward: bool,
     has_rom: bool,
+    slot: u8,
 ) -> String {
     if has_rom {
-        title_text(fps, underruns, paused, fast_forward)
+        title_text(fps, underruns, paused, fast_forward, slot)
     } else {
         NO_ROM_TITLE.to_string()
     }
@@ -935,6 +951,8 @@ pub struct WindowUiState {
     pub paused: bool,
     /// The window has gained focus at least once since launch.
     pub ever_focused: bool,
+    /// Selected save-state slot (`0` = the historical default).
+    pub savestate_slot: u8,
 }
 
 impl WindowUiState {
@@ -947,13 +965,21 @@ impl WindowUiState {
             has_rom,
             paused: false,
             ever_focused: false,
+            savestate_slot: 0,
         }
     }
 
     /// Current window title for this state.
     #[must_use]
     pub fn title(&self, fps: f64, underruns: u64, fast_forward: bool) -> String {
-        window_title(fps, underruns, self.paused, fast_forward, self.has_rom)
+        window_title(
+            fps,
+            underruns,
+            self.paused,
+            fast_forward,
+            self.has_rom,
+            self.savestate_slot,
+        )
     }
 
     /// Focus transition. Auto-pause on focus loss applies only after the
@@ -1383,7 +1409,7 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
   --headless ...   windowless CI surface (see --headless --help).
 keys P1: Z=A X=B Enter=Start RightShift=Select arrows=dpad
 keys P2: G=A F=B T=Start R=Select W/A/S/D=dpad (local co-op only; see keys_p2)
-Tab=fast-forward F5=save F7=load P=pause .=step Esc=quit; drop a .nes ROM/movie \
+Tab=fast-forward F5=save F7=load F6/digits=slot (1-9,0; shown in title) P=pause .=step Esc=quit; drop a .nes ROM/movie \
 file onto the window. Save states, movies, pause and fast-forward are disabled \
 during netplay.";
 
@@ -1802,6 +1828,8 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         has_rom: bool,
         ever_focused: bool,
         fast_forward: bool,
+        /// Selected save-state slot (digits pick, `F6` cycles; shown in title).
+        savestate_slot: u8,
         frame_step: bool,
         /// Last observed `Game::exec_errors` (wedge guard in step_emulator).
         exec_errors_seen: u64,
@@ -2450,6 +2478,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
             Some(match code {
                 KeyCode::KeyZ => "KeyZ",
                 KeyCode::KeyX => "KeyX",
+                KeyCode::ShiftLeft => "ShiftLeft",
                 KeyCode::ShiftRight => "ShiftRight",
                 KeyCode::Enter => "Enter",
                 KeyCode::ArrowUp => "ArrowUp",
@@ -2541,6 +2570,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                     self.paused,
                     self.fast_forward,
                     self.has_rom,
+                    self.savestate_slot,
                 ),
                 audio_suffix(
                     self.device_rate,
@@ -2654,6 +2684,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                         has_rom: self.has_rom,
                         paused: self.paused,
                         ever_focused: self.ever_focused,
+                        savestate_slot: self.savestate_slot,
                     };
                     // Auto-pause is ignored during netplay: a paused peer
                     // stalls the other one, so an unfocused window keeps
@@ -2707,6 +2738,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                                     has_rom: self.has_rom,
                                     paused: self.paused,
                                     ever_focused: self.ever_focused,
+                                    savestate_slot: self.savestate_slot,
                                 };
                                 ui.on_rom_loaded();
                                 self.has_rom = ui.has_rom;
@@ -2822,6 +2854,36 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                                 KC::Period if self.paused && !self.net_active() => {
                                     self.frame_step = true;
                                 }
+                                KC::Digit1
+                                | KC::Digit2
+                                | KC::Digit3
+                                | KC::Digit4
+                                | KC::Digit5
+                                | KC::Digit6
+                                | KC::Digit7
+                                | KC::Digit8
+                                | KC::Digit9
+                                | KC::Digit0 => {
+                                    // Slot selection is only a label change, so
+                                    // it stays live during netplay (silent; the
+                                    // title shows ` [SLOT n]` when nonzero).
+                                    self.savestate_slot = match code {
+                                        KC::Digit0 => 0,
+                                        KC::Digit1 => 1,
+                                        KC::Digit2 => 2,
+                                        KC::Digit3 => 3,
+                                        KC::Digit4 => 4,
+                                        KC::Digit5 => 5,
+                                        KC::Digit6 => 6,
+                                        KC::Digit7 => 7,
+                                        KC::Digit8 => 8,
+                                        _ => 9,
+                                    };
+                                }
+                                KC::F6 => {
+                                    // Cycle the slot (silent; title updates).
+                                    self.savestate_slot = next_savestate_slot(self.savestate_slot);
+                                }
                                 KC::F5 | KC::F7 => {
                                     // Rewinding one peer desyncs both: there is
                                     // no rollback in this protocol.
@@ -2830,14 +2892,19 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                                     {
                                         eprintln!("{why}");
                                     } else if code == KC::F5 {
-                                        match save_savestate(&self.emu.game, &self.data_dir, 0) {
+                                        let slot = self.savestate_slot;
+                                        match save_savestate(&self.emu.game, &self.data_dir, slot) {
                                             Ok(p) => eprintln!("saved {}", p.display()),
                                             Err(e) => eprintln!("save failed: {e}"),
                                         }
                                     } else {
-                                        match load_savestate(&mut self.emu.game, &self.data_dir, 0)
-                                        {
-                                            Ok(()) => eprintln!("loaded savestate0"),
+                                        let slot = self.savestate_slot;
+                                        match load_savestate(
+                                            &mut self.emu.game,
+                                            &self.data_dir,
+                                            slot,
+                                        ) {
+                                            Ok(()) => eprintln!("loaded savestate{slot}"),
                                             Err(e) => eprintln!("load failed: {e}"),
                                         }
                                     }
@@ -3063,6 +3130,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         has_rom: initial.has_rom,
         ever_focused: false,
         fast_forward: false,
+        savestate_slot: 0,
         frame_step: false,
         exec_errors_seen: 0,
         fps_acc: 0,
@@ -3204,6 +3272,34 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_roundtrip_through_nonzero_slot() {
+        let mut emu = new_emu(44100);
+        step_frames(&mut emu, &[0x01, 0x02], None);
+        let dir = std::env::temp_dir().join(format!("z2snap3-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let path = save_savestate(&emu.game, &dir, 3).expect("save");
+        assert_eq!(path, savestate_path(&dir, 3));
+        assert_eq!(
+            path.file_name().and_then(|n| n.to_str()),
+            Some("savestate3.z2snap")
+        );
+        // Mutate, then restore through the same slot.
+        emu.game.ram[0] ^= 0xFF;
+        load_savestate(&mut emu.game, &dir, 3).expect("load");
+        let snap = snapshot_from_game(&emu.game, Vec::new()).expect("snap");
+        let back = z2_verify::snapshot::Snapshot::decode(&snap.encode().unwrap()).unwrap();
+        assert_eq!(snap, back);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn next_savestate_slot_cycles() {
+        assert_eq!(next_savestate_slot(0), 1);
+        assert_eq!(next_savestate_slot(8), 9);
+        assert_eq!(next_savestate_slot(9), 0);
+    }
+
+    #[test]
     fn sram_save_load_roundtrips_the_raw_window() {
         let mut emu = new_emu(44100);
         emu.game.wram[0x0000] = 0x42;
@@ -3270,15 +3366,30 @@ mod tests {
             "z2rs — no ROM: drop a .nes file or restart with --rom PATH"
         );
         // No-ROM state shows the message instead of the meter line …
-        let t = window_title(60.0, 0, false, false, false);
+        let t = window_title(60.0, 0, false, false, false, 0);
         assert_eq!(t, NO_ROM_TITLE);
         // … while ROM state shows the normal meter line.
-        let t = window_title(60.0, 3, false, false, true);
+        let t = window_title(60.0, 3, false, false, true, 0);
         assert!(t.starts_with("z2rs — "), "normal title: {t}");
         assert!(!t.contains("no ROM"), "normal title: {t}");
+        assert!(!t.contains("[SLOT"), "slot 0 stays silent: {t}");
         // Paused ROM state keeps its hint.
-        let t = window_title(60.0, 0, true, false, true);
+        let t = window_title(60.0, 0, true, false, true, 0);
         assert!(t.contains("[PAUSED"), "paused title: {t}");
+    }
+
+    #[test]
+    fn title_announces_nonzero_savestate_slot() {
+        let t = window_title(60.0, 0, false, false, true, 3);
+        assert!(t.contains("[SLOT 3]"), "slot title: {t}");
+        // No-ROM windows never announce a slot (the message is authoritative).
+        let t = window_title(60.0, 0, false, false, false, 3);
+        assert_eq!(t, NO_ROM_TITLE);
+        // The pure meter function mirrors the same contract.
+        let t = title_text(60.0, 0, false, false, 9);
+        assert!(t.contains("[SLOT 9]"), "meter title: {t}");
+        let t = title_text(60.0, 0, false, false, 0);
+        assert!(!t.contains("[SLOT"), "slot 0 meter: {t}");
     }
 
     #[test]

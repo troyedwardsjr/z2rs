@@ -44,10 +44,12 @@
 //!   `$FF`, the routine falls through and casts with the meter set to `$00`
 //!   instead of failing (intended fail = keep meter, no cast).
 //! * Exp drip (`$D44B-$D474`): pending exp below 10 drains 1/frame, else 10;
-//!   exp-loss (`$05E8`, Moa drain) ticks 1/frame only while total exp is
-//!   nonzero, so a zero-exp drain never fires the meter sound.
-//! * Container pickup (`$E7CD`): `INC $0775,x` with `X = $0E/$0F` bumps the
-//!   *exp-high* byte as a side effect of the container-indexed addressing.
+//!   exp-loss (`$05E8`, Moa drain) decrements the pending count every frame
+//!   but only moves exp while the total is nonzero, so a zero-exp drain
+//!   burns its units silently.
+//! * Jars (`$E847-$E86C`): the red jar is a *magic* refill like the blue
+//!   one (`$070C += $05E2,y`), only bigger — nothing in `bank7_get_item`
+//!   ever adds to the life meter.
 //!
 //! # Gaps (honest)
 //!
@@ -134,6 +136,8 @@ pub const ADDR_EXP_LOSS: u16 = 0x05E8;
 pub const ADDR_KEYS: u16 = 0x0793;
 /// Seven-containers flag (`$79D`, bit3 Kasuto).
 pub const ADDR_SEVEN_FLAG: u16 = 0x079D;
+/// Seven-magic-containers bit in [`ADDR_SEVEN_FLAG`] (`$E7DE`: `ORA #$08`).
+pub const SEVEN_CONTAINERS_BIT: u8 = 0x08;
 /// Spell-lock (`$DE`: 1 = Spell-spell active, blocks movement).
 pub const ADDR_SPELL_LOCK: u16 = 0x00DE;
 /// Big-door counter (`$763`: `$10` = already used).
@@ -462,11 +466,17 @@ pub const fn exp_trickle(exp_hi: u8, exp_lo: u8, pend_hi: u8, pend_lo: u8) -> (u
     (eh, el, ph, pl)
 }
 
-/// Exp-loss tick (`$D477-$D4A1`): `$05E8` nonzero + total exp nonzero drains
-/// 1 exp/frame. Returns `(exp_hi, exp_lo, loss)`.
+/// Exp-loss tick (`$D477-$D4A1`): `$05E8` nonzero drains 1 exp/frame while
+/// total exp is nonzero. `DEC $05E8` (`$D47C`) runs *before* the zero-exp
+/// check (`$D47F`), so a drain against zero exp still burns a pending unit
+/// (it just moves no exp and fires no meter sound).
+/// Returns `(exp_hi, exp_lo, loss)`.
 pub const fn exp_loss_tick(exp_hi: u8, exp_lo: u8, loss: u8) -> (u8, u8, u8) {
-    if loss == 0 || (exp_hi == 0 && exp_lo == 0) {
+    if loss == 0 {
         return (exp_hi, exp_lo, loss);
+    }
+    if exp_hi == 0 && exp_lo == 0 {
+        return (exp_hi, exp_lo, loss.wrapping_sub(1));
     }
     let (el, b) = exp_lo.overflowing_sub(1);
     let eh = if b { exp_hi.wrapping_sub(1) } else { exp_hi };
@@ -522,7 +532,7 @@ pub const fn level_ready(exp: u16, next: u16) -> bool {
 /// from the chart for the new level. Returns `(new_level, new_next)`.
 pub fn level_up_choice(stat: usize, level: u8) -> (u8, u16) {
     let nl = (level + 1).min(8);
-    (nl, next_level_for(stat, nl.min(7)))
+    (nl, next_level_for(stat, nl))
 }
 
 // ---------------------------------------------------------------------------
@@ -589,8 +599,8 @@ pub enum Pickup {
     Key { unlock_boss: bool },
     /// Container (`INC $0775,x` w/ `$0E/$0F` side effect; pending refill).
     Container { magic: bool, pending: u8 },
-    /// Jar: pending magic/life refill (`$070C += …`).
-    Jar { magic_add: u8, life_add: u8 },
+    /// Jar: pending magic refill (`$070C += $05E2,y`, `$E863-$E86C`).
+    Jar { magic_add: u8 },
     /// Doll: extra life (`INC $0700`).
     Doll,
     /// No-op / flag-only pickups (child/trophy/medicine bits).
@@ -611,15 +621,10 @@ pub const fn item_pickup(code: u8, magic_containers: u8, boss_lock: bool) -> Pic
         Pickup::Key {
             unlock_boss: boss_lock,
         }
-    } else if code == ITEM_CODE_MAG_CTR {
+    } else if code == ITEM_CODE_MAG_CTR || code == ITEM_CODE_HEART_CTR {
         Pickup::Container {
-            magic: true,
-            pending: 0,
-        }
-    } else if code == ITEM_CODE_HEART_CTR {
-        Pickup::Container {
-            magic: false,
-            pending: 0,
+            magic: code == ITEM_CODE_MAG_CTR,
+            pending: code << 4,
         }
     } else if code == 0x12 {
         Pickup::Doll
@@ -639,34 +644,34 @@ pub const fn item_pickup(code: u8, magic_containers: u8, boss_lock: bool) -> Pic
             bit: 0x40,
         }
     } else {
-        // Jars `$10/$11`: blue restores `$10` magic-ish, red scales with
-        // containers (`$05E3 = ctr << 4`, `$E854-$E86B`).
-        let scaled = magic_containers << 4;
+        // Jars `$10`/`$11` (`$E847-$E86C`): the routine stages both refill
+        // sizes -- blue `$05E2 = $10`, red `$05E3 = containers << 4` -- and
+        // then adds `$05E2,y` (`y = code - $10`) to `$070C`. Both jars
+        // therefore refill the MAGIC meter; no jar code adds life.
         if code == 0x10 {
-            Pickup::Jar {
-                magic_add: 0x10,
-                life_add: 0,
-            }
+            Pickup::Jar { magic_add: 0x10 }
         } else {
             Pickup::Jar {
-                magic_add: 0,
-                life_add: scaled,
+                magic_add: magic_containers << 4,
             }
         }
     }
 }
 
-/// Container pickup bookkeeping (`$E7C3-$E7ED`): `INC` containers (cap 8 —
-/// the listing has no explicit cap; hardware wraps, caller clamps), the
-/// `$0775,x` exp-high side effect, the 7-magic Kasuto bit (`$079D |= 8`),
-/// and pending refill `(level+1?) << 4` into `$06FE,x`.
+/// Container pickup bookkeeping (`$E7C3-$E7ED`): `INC $0775,x` with
+/// `X` = the item code bumps the container count (`$0E` → `$0783` magic,
+/// `$0F` → `$0784` life; cap 8 — the listing has no explicit cap, hardware
+/// wraps, the caller clamps), the 7-magic Kasuto bit (`$079D |= 8`), and
+/// the pending refill `code << 4` (`$E7E3-$E7E8`: `TYA` then four `ASL`,
+/// so `$E0`/`$F0`) into `$06FE,x` (`$070C`/`$070D`).
 ///
+/// `code` is the `$AF,x & $7F` item code; `magic` is `code == $0E`.
 /// Returns `(containers, kasuto_bit, pending)`.
-pub const fn container_pickup(containers: u8, level: u8, magic: bool) -> (u8, bool, u8) {
+pub const fn container_pickup(containers: u8, code: u8, magic: bool) -> (u8, bool, u8) {
     let bumped = containers.saturating_add(1);
     let nc = if bumped > 8 { 8 } else { bumped };
     let kasuto = magic && nc >= 7;
-    (nc, kasuto, level << 4)
+    (nc, kasuto, code << 4)
 }
 
 /// Item passives (explicit predicates; ROM tile/flag sources cited).
@@ -845,6 +850,9 @@ mod tests {
             (0x00, 0x01, 0x00, 0x04)
         );
         assert_eq!(exp_loss_tick(0x01, 0x00, 0x03), (0x00, 0xFF, 0x02));
+        // `DEC $05E8` runs before the zero-exp check, so the pending count
+        // still drains when there is no exp left to lose.
+        assert_eq!(exp_loss_tick(0x00, 0x00, 0x03), (0x00, 0x00, 0x02));
     }
 
     #[test]
@@ -856,6 +864,8 @@ mod tests {
         assert!(!level_ready(0x012B, 0x012C));
         assert_eq!(level_up_choice(STAT_ATTACK, 1), (2, next_level_for(0, 2)));
         assert_eq!(next_level_for(0, 8), 0xFFFF);
+        // Level 8 is the cap row: no further threshold.
+        assert_eq!(level_up_choice(STAT_MAGIC, 7), (8, 0xFFFF));
     }
 
     #[test]
@@ -869,12 +879,16 @@ mod tests {
             item_pickup(0x0E, 4, false),
             Pickup::Container {
                 magic: true,
-                pending: 0
+                pending: 0xE0
             }
         );
         assert_eq!(item_pickup(0x12, 4, false), Pickup::Doll);
-        let (nc, kasuto, _) = container_pickup(6, 3, true);
-        assert_eq!((nc, kasuto), (7, true));
+        // Both jars top up the magic meter (`$070C`), the red one by
+        // `containers << 4`.
+        assert_eq!(item_pickup(0x10, 4, false), Pickup::Jar { magic_add: 0x10 });
+        assert_eq!(item_pickup(0x11, 4, false), Pickup::Jar { magic_add: 0x40 });
+        let (nc, kasuto, pending) = container_pickup(6, ITEM_CODE_MAG_CTR, true);
+        assert_eq!((nc, kasuto, pending), (7, true, 0xE0));
         let p = item_passive([1, 1, 0, 0, 0, 1, 0, 1]);
         assert!(p.candle_lit && p.glove_break && p.cross_sight && p.magic_key);
         assert!(!p.raft_float);

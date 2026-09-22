@@ -5,10 +5,10 @@
 //! the PPU model is under test). Sampling = every corpus snapshot plus every
 //! 600th movie frame ([`z2_ppu::GOLDEN_EVERY_NTH_MOVIE_FRAME`]).
 //!
-//! This suite is not wired to the oracle and the interpreter yet, so the
-//! end-to-end test below is ROM-gated *and* oracle-gated: without `Z2_ROM`,
-//! or without `z2-verify::oracle`, it skips gracefully with the same
-//! `let Some(..) else { return }` pattern used in
+//! The oracle and the interpreter have
+//! not landed yet, so the end-to-end test below is ROM-gated *and*
+//! oracle-gated: without `Z2_ROM`, or without `z2-verify::oracle`, it skips
+//! gracefully with the same `let Some(..) else { return }` pattern used in
 //! `z2-assets/tests/roundtrip.rs`. The pure harness tests (sampling +
 //! stub-oracle verification) run everywhere.
 //!

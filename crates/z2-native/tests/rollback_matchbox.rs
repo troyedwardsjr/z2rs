@@ -104,13 +104,34 @@ impl Peer {
     }
 }
 
+/// Run `body` on a thread with an explicit stack. An `Emu` is 83 KiB and an
+/// unoptimized build moves it by value through `run_pair`, `Peer::tick` and
+/// the constructors behind `session_emu`; measured on a debug build, that
+/// needs more than the 2 MiB a test thread gets. A panic in `body` fails the
+/// test with its own message.
+fn tall_stack(body: impl FnOnce() + Send + 'static) {
+    let name = std::thread::current().name().unwrap_or("test").to_string();
+    let worker = std::thread::Builder::new()
+        .name(name)
+        .stack_size(64 * 1024 * 1024)
+        .spawn(body)
+        .expect("spawn tall-stack test thread");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn desktop_rollback_pair_over_localhost_matchbox() {
     let test = "desktop_rollback_pair_over_localhost_matchbox";
     let Some(raw) = common::rom_bytes(test) else {
         return;
     };
-    let body = z2_assets::rom::strip_ines_header(&raw).to_vec();
+    tall_stack(move || run_pair(&raw));
+}
+
+fn run_pair(raw: &[u8]) {
+    let body = z2_assets::rom::strip_ines_header(raw).to_vec();
     let frames: u32 = if cfg!(debug_assertions) { 120 } else { 600 };
     let feats = Features {
         coop: true,

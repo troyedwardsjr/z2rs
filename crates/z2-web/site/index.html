@@ -34,6 +34,8 @@
   }
   #drop { border: 2px dashed #555; border-radius: 8px; padding: 18px; text-align: center; color: #bdbdc8; margin: 12px 0; }
   #drop.over { border-color: #7cf; background: #182028; }
+  #drop p { margin: 8px 0 0; }
+  #drop p[hidden] { display: none; }
   fieldset { border: 1px solid #333; border-radius: 8px; margin: 12px 0; min-width: 0; }
   fieldset.unsupported { opacity: 0.55; }
   legend { padding: 0 6px; color: #bdbdc8; }
@@ -47,6 +49,61 @@
   table.keys td, table.keys th { border: 1px solid #333; padding: 2px 6px; }
   .warn { color: #ffcf7a; }
   .err { color: #ff9b8f; }
+  /* On-screen controller for touch devices (app.js "touch gamepad"). It floats
+     over the bottom of the viewport so it stays under the thumbs while the page
+     scrolls; only the controls take touches, the gap between them does not. */
+  #touchpad {
+    position: fixed; left: 0; right: 0; bottom: 0; z-index: 20;
+    display: flex; justify-content: space-between; align-items: flex-end;
+    padding: 0 max(14px, env(safe-area-inset-right)) calc(14px + env(safe-area-inset-bottom)) max(14px, env(safe-area-inset-left));
+    pointer-events: none;
+    -webkit-user-select: none; user-select: none; -webkit-touch-callout: none;
+  }
+  #touchpad[hidden] { display: none; }
+  #touchpad .tp-dpad, #touchpad button { pointer-events: auto; touch-action: none; }
+  #touchpad .tp-dpad {
+    position: relative; width: 148px; height: 148px; border-radius: 50%;
+    background: rgba(36, 36, 48, 0.55); border: 1px solid rgba(255, 255, 255, 0.22);
+  }
+  #touchpad .tp-dpad i {
+    position: absolute; width: 44px; height: 44px; border-radius: 9px;
+    background: rgba(255, 255, 255, 0.16); pointer-events: none;
+  }
+  #touchpad .tp-dpad i.u { left: 52px; top: 8px; }
+  #touchpad .tp-dpad i.d { left: 52px; bottom: 8px; }
+  #touchpad .tp-dpad i.l { left: 8px; top: 52px; }
+  #touchpad .tp-dpad i.r { right: 8px; top: 52px; }
+  #touchpad .tp-dpad.up i.u, #touchpad .tp-dpad.down i.d,
+  #touchpad .tp-dpad.left i.l, #touchpad .tp-dpad.right i.r { background: rgba(124, 204, 255, 0.75); }
+  #touchpad button {
+    margin: 0; padding: 0; font: 600 15px system-ui, sans-serif; color: rgba(255, 255, 255, 0.9);
+    background: rgba(36, 36, 48, 0.55); border: 1px solid rgba(255, 255, 255, 0.22);
+  }
+  #touchpad button.on { background: rgba(124, 204, 255, 0.6); }
+  #touchpad .tp-mid { display: flex; gap: 10px; margin-bottom: 4px; }
+  #touchpad .tp-mid button { width: 62px; height: 30px; border-radius: 15px; font-size: 11px; letter-spacing: 0.04em; }
+  #touchpad .tp-ab { position: relative; width: 150px; height: 124px; }
+  #touchpad .tp-ab button { position: absolute; width: 68px; height: 68px; border-radius: 50%; }
+  #touchpad .tp-ab .b { left: 0; bottom: 0; }
+  #touchpad .tp-ab .a { right: 0; top: 0; }
+  /* Room to scroll the rest of the page out from under the controller. A spacer
+     rather than a class on the body element: a hosting framework may own the
+     body, and nothing here may touch what it renders. */
+  #touchSpacer { height: 190px; }
+  #touchSpacer[hidden] { display: none; }
+  /* A phone held sideways is shorter than the picture: fit the canvas to the
+     viewport height and letterbox it instead of stretching it. */
+  @media (pointer: coarse) {
+    #screen { max-height: 100dvh; object-fit: contain; }
+  }
+  /* Links out of the page (article, Discord, source). Wraps to one per line
+     on a narrow screen rather than overflowing. */
+  #links {
+    display: flex; flex-wrap: wrap; gap: 6px 18px;
+    border-top: 1px solid #2c2c34; margin: 16px 0 0; padding: 12px 0 0;
+    color: #a8a8b4;
+  }
+  #links a { color: #8cc6ff; }
   /* Phone: one column, and let the key table scroll rather than widen it. */
   @media (max-width: 560px) {
     body { padding: 10px; }
@@ -57,7 +114,7 @@
 </head>
 <body>
 <h1>z2rs — Zelda II reconstruction (web frontend)</h1>
-<p class="sub">Drop your own Zelda II (USA) <code>.nes</code> dump below. The ROM is hash-gated
+<p class="sub" id="romIntro">Drop your own Zelda II (USA) <code>.nes</code> dump below. The ROM is hash-gated
 in-tab (body CRC32 <code>BA322865</code>) and never uploaded anywhere.</p>
 
 <div id="stage">
@@ -76,7 +133,8 @@ in-tab (body CRC32 <code>BA322865</code>) and never uploaded anywhere.</p>
     <p><button id="audioBtn" disabled>Enable audio</button>
        <button id="pauseBtn" disabled>Pause</button>
        <button id="zoomOut" title="Smaller picture">−</button>
-       <button id="zoomIn" title="Bigger picture">+</button></p>
+       <button id="zoomIn" title="Bigger picture">+</button>
+       <button id="touchBtn" title="On-screen controller for touch screens (player 1)">Touch pad</button></p>
     <p>
       <label>Screen
         <select id="wideSel">
@@ -95,7 +153,13 @@ in-tab (body CRC32 <code>BA322865</code>) and never uploaded anywhere.</p>
   </div>
 </div>
 
-<div id="drop">Drop <code>.nes</code> ROM here, or <input type="file" id="romFile" accept=".nes,.bin" /></div>
+<div id="drop"><span id="dropPrompt">Drop <code>.nes</code> ROM here, or <input type="file" id="romFile" accept=".nes,.bin" /></span>
+  <!-- Shown only when a host serves the ROM itself (#z2-config rom.url);
+       the vanilla site never reveals either line. -->
+  <p id="romAuto" class="sub" hidden></p>
+  <p id="romKeyBox" hidden><label>Access key <input type="password" id="romKey" size="20" autocomplete="off" /></label>
+    <button id="romKeyBtn">Load ROM</button></p>
+</div>
 
 <fieldset id="hdBox">
   <legend>HD graphics pack</legend>
@@ -168,6 +232,27 @@ in-tab (body CRC32 <code>BA322865</code>) and never uploaded anywhere.</p>
   <legend>Status</legend>
   <div id="status">Loading wasm…</div>
 </fieldset>
+
+<footer id="links">
+  <a href="https://x.com/troygentic/status/2101572848506573135" target="_blank" rel="noopener noreferrer">Release article</a>
+  <a href="https://discord.gg/buZrPenm6K" target="_blank" rel="noopener noreferrer">Discord (HD pack)</a>
+  <a href="https://github.com/troyedwardsjr/z2rs" target="_blank" rel="noopener noreferrer">Source code</a>
+</footer>
+
+<!-- On-screen controller (player 1). Hidden unless the device has a touch
+     screen as its main pointer, the Touch pad button is pressed, or ?touch=1. -->
+<div id="touchSpacer" hidden></div>
+<div id="touchpad" hidden aria-hidden="true">
+  <div class="tp-dpad" id="tpDpad"><i class="u"></i><i class="d"></i><i class="l"></i><i class="r"></i></div>
+  <div class="tp-mid">
+    <button type="button" data-pad="4" tabindex="-1">SELECT</button>
+    <button type="button" data-pad="8" tabindex="-1">START</button>
+  </div>
+  <div class="tp-ab">
+    <button type="button" class="b" data-pad="2" tabindex="-1">B</button>
+    <button type="button" class="a" data-pad="1" tabindex="-1">A</button>
+  </div>
+</div>
 
 <script type="module" src="./app.js"></script>
 </body>

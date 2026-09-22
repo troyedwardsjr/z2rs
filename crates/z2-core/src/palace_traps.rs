@@ -182,14 +182,17 @@ pub fn pc_locked_door(game: &mut Game) {
 }
 
 /// Item grant (`bank7_get_item`, `$E771`): classifies `$AF,x & $7F` via
-/// [`player_magic::item_pickup`] (read-only) and applies the palace arms —
-/// flag row (`$0785,y |= 1`), key (`INC $0793` + `$0728` clear), containers
-/// (pending refill staging). Other codes hold (drop-table scope).
+/// [`player_magic::item_pickup`] and applies every arm — flag row
+/// (`$0785,y |= 1`), key (`INC $0793` + `$0728` clear), containers
+/// (`INC $0783`/`$0784`, the seven-magic Kasuto bit, pending refill
+/// `code << 4` into `$070C`/`$070D`), jars (`$070C += …`), the doll
+/// (`INC $0700`) and the flag-only pickups (child/trophy/medicine).
 pub fn pc_item_grant(game: &mut Game) {
     let s = slot(game) as u16;
     let code = r(&game.ram, 0x00AF + s) & 0x7F;
     let boss_lock = r(&game.ram, pal::ADDR_FREEZE) != 0;
-    match player_magic::item_pickup(code, 0, boss_lock) {
+    let containers = r(&game.ram, player_magic::ADDR_MAG_CTR);
+    match player_magic::item_pickup(code, containers, boss_lock) {
         player_magic::Pickup::Inventory { .. } => {
             let mut row = [0u8; 8];
             for (i, b) in row.iter_mut().enumerate() {
@@ -207,12 +210,39 @@ pub fn pc_item_grant(game: &mut Game) {
             }
             pc_key_pickup(game);
         }
-        player_magic::Pickup::Container { magic, .. } => {
-            // Pending-refill staging (`level << 4` at `$E7F8`); level bytes
-            // need the save block (gap: stage the magic-side default).
-            w(&mut game.ram, pal::ADDR_MAGIC_ADD, u8::from(magic) << 4);
+        player_magic::Pickup::Container { magic, pending } => {
+            // `INC $0775,x` with `X` = the item code lands on `$0783`
+            // (magic) or `$0784` (life); the refill stages at `$06FE,x`,
+            // which is `$070C`/`$070D` the same way (`$E7CD-$E7E8`).
+            let (ctr_addr, add_addr) = if magic {
+                (player_magic::ADDR_MAG_CTR, pal::ADDR_MAGIC_ADD)
+            } else {
+                (player_magic::ADDR_HEART_CTR, pal::ADDR_LIFE_ADD)
+            };
+            let (count, kasuto, _) =
+                player_magic::container_pickup(r(&game.ram, ctr_addr), code, magic);
+            w(&mut game.ram, ctr_addr, count);
+            if kasuto {
+                let v = r(&game.ram, player_magic::ADDR_SEVEN_FLAG)
+                    | player_magic::SEVEN_CONTAINERS_BIT;
+                w(&mut game.ram, player_magic::ADDR_SEVEN_FLAG, v);
+            }
+            w(&mut game.ram, add_addr, pending);
         }
-        _ => {}
+        player_magic::Pickup::Jar { magic_add } => {
+            // Both jar codes add their staged size to the magic refill
+            // (`$E863-$E86C`); the add wraps like the 6502 `ADC`.
+            let v = r(&game.ram, pal::ADDR_MAGIC_ADD).wrapping_add(magic_add);
+            w(&mut game.ram, pal::ADDR_MAGIC_ADD, v);
+        }
+        player_magic::Pickup::Doll => {
+            inc(&mut game.ram, player_magic::ADDR_LIVES);
+        }
+        player_magic::Pickup::Flag { byte, bit } => {
+            let addr = 0x0700 | u16::from(byte);
+            let v = r(&game.ram, addr) | bit;
+            w(&mut game.ram, addr, v);
+        }
     }
 }
 

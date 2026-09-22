@@ -1,6 +1,6 @@
 # z2rs developer shortcuts.
 #
-# Portable macOS / Linux (`sh` only). Run from the repository root.
+# Portable macOS / Linux (`sh` only). Run from the worktree root.
 #
 # ROM policy (see LEGAL.md): the Zelda II (USA) ROM is never committed and
 # never copied into the tree. ROM-gated targets read it read-only via
@@ -184,7 +184,7 @@ netplay-e2e:
 	@command -v node >/dev/null 2>&1 || { echo "netplay-e2e: node not found."; echo "  Install Node.js 18+ (https://nodejs.org), then: make netplay-e2e-setup"; exit 2; }
 	@node -e "require.resolve('playwright')" >/dev/null 2>&1 || { echo "netplay-e2e: the playwright npm module is not installed."; echo "  One-off bootstrap (dev tooling only, never committed):"; echo "    make netplay-e2e-setup"; exit 2; }
 	@command -v wasm-pack >/dev/null 2>&1 || { echo "netplay-e2e: wasm-pack not found."; echo "  Install it (https://rustwasm.github.io/wasm-pack/installer/), then retry."; exit 2; }
-	@[ -f "$(NETPLAY_E2E_MOVIE)" ] || { echo "netplay-e2e: no movie at '$(NETPLAY_E2E_MOVIE)'."; echo "  The run replays a player-1 input track through the live session to walk"; echo "  into a side-view area, which is the only place player 2 exists."; echo "  Fetch the out-of-tree corpus (see README.md), or:"; echo "    make netplay-e2e Z2_MOVIE=/path/to/track.fm2"; echo "  It must be .fm2 text; .bk2 is a ZIP and is rejected by design."; exit 2; }
+	@[ -f "$(NETPLAY_E2E_MOVIE)" ] || { echo "netplay-e2e: no movie at '$(NETPLAY_E2E_MOVIE)'."; echo "  The run replays a player-1 input track through the live session to walk"; echo "  into a side-view area, which is the only place player 2 exists"; echo "  (README.md). Fetch the out-of-tree corpus (README.md), or:"; echo "    make netplay-e2e Z2_MOVIE=/path/to/track.fm2"; echo "  It must be .fm2 text; .bk2 is a ZIP and is rejected by design."; exit 2; }
 	wasm-pack build crates/z2-web --target web --out-dir site/pkg -- --features hd,netplay
 	cargo build --release -p z2-signal
 	cargo build --release -p z2-net --features matchbox --example net_peer
@@ -203,7 +203,7 @@ netplay-e2e-rollback:
 	@command -v node >/dev/null 2>&1 || { echo "netplay-e2e-rollback: node not found."; echo "  Install Node.js 18+ (https://nodejs.org), then: make netplay-e2e-setup"; exit 2; }
 	@node -e "require.resolve('playwright')" >/dev/null 2>&1 || { echo "netplay-e2e-rollback: the playwright npm module is not installed."; echo "    make netplay-e2e-setup"; exit 2; }
 	@command -v wasm-pack >/dev/null 2>&1 || { echo "netplay-e2e-rollback: wasm-pack not found."; echo "  Install it (https://rustwasm.github.io/wasm-pack/installer/), then retry."; exit 2; }
-	@[ -f "$(NETPLAY_E2E_MOVIE)" ] || { echo "netplay-e2e-rollback: no movie at '$(NETPLAY_E2E_MOVIE)'."; echo "  Fetch the out-of-tree corpus (see README.md), or:"; echo "    make netplay-e2e-rollback Z2_MOVIE=/path/to/track.fm2"; exit 2; }
+	@[ -f "$(NETPLAY_E2E_MOVIE)" ] || { echo "netplay-e2e-rollback: no movie at '$(NETPLAY_E2E_MOVIE)'."; echo "  Fetch the out-of-tree corpus (README.md), or:"; echo "    make netplay-e2e-rollback Z2_MOVIE=/path/to/track.fm2"; exit 2; }
 	wasm-pack build crates/z2-web --target web --out-dir site/pkg -- --features hd,netplay
 	cargo build --release -p z2-signal
 	Z2_MOVIE="$(NETPLAY_E2E_MOVIE)" node crates/z2-web/site/netplay-e2e-rollback.mjs
@@ -223,9 +223,9 @@ netplay-play:
 	node crates/z2-web/site/netplay-play.mjs
 
 corpus-mint:
-	@[ -d "$(Z2_CORPUS)" ] || { echo "corpus-mint: Z2_CORPUS='$(Z2_CORPUS)' is not a directory."; echo "  Check out (or point at) the out-of-tree corpus, e.g.:"; echo "    make corpus-mint Z2_CORPUS=/path/to/z2-corpus   (see README.md)"; echo "  It must contain movies/ (.fm2/.bk2 you downloaded yourself, see README.md);"; echo "  snapshots land in corpus/snapshots/ and are never committed."; exit 2; }
+	@[ -d "$(Z2_CORPUS)" ] || { echo "corpus-mint: Z2_CORPUS='$(Z2_CORPUS)' is not a directory."; echo "  Check out (or point at) the out-of-tree corpus, e.g.:"; echo "    make corpus-mint Z2_CORPUS=/path/to/z2-corpus   (see README.md)"; echo "  It must contain corpus/movies/ (.fm2/.bk2 fetched per README.md);"; echo "  snapshots land in corpus/snapshots/ and are never committed."; exit 2; }
 	@[ -n "$(Z2_ROM)" ] || { echo "corpus-mint: Z2_ROM is not set (minting replays the oracle against your ROM)."; echo "    export Z2_ROM=/path/to/zelda2.nes   (see LEGAL.md)"; exit 2; }
-	@echo "minting snapshots from $(Z2_CORPUS)/movies into $(Z2_CORPUS)/snapshots"
+	@echo "minting snapshots from $(Z2_CORPUS)/movies into $(Z2_CORPUS)/snapshots (see README.md)"
 	Z2_CORPUS="$(Z2_CORPUS)" cargo xtask corpus mint
 
 fmt:

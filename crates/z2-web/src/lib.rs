@@ -141,8 +141,10 @@ fn canonical_ines(body: &[u8]) -> Vec<u8> {
     ines
 }
 
-/// Audio FIFO cap in samples (~5 s at 44.1 kHz): the worklet normally
-/// drains every frame, but a muted/backgrounded tab must not grow memory.
+/// Audio FIFO cap in samples (~5 s at 44.1 kHz, ~4.6 s at 48 kHz): the page
+/// drains this every rAF tick whether or not audio is on, so it is a memory
+/// guard for a stopped tab, not a latency budget — the worklet's queue is
+/// what the player hears as delay (see `site/worklet.js`).
 const AUDIO_FIFO_CAP: usize = 44_100 * 5;
 
 // ---------------------------------------------------------------------------
@@ -263,6 +265,10 @@ pub struct WebEmu {
     movie_kind: Option<MovieKind>,
     apu: Apu,
     audio_fifo: Vec<i16>,
+    /// PCM rate the synth renders at. Set from the page's `AudioContext`
+    /// rate (see [`WebEmu::set_audio_rate`]) so no resampling — and no
+    /// production/consumption drift — sits between the two.
+    audio_rate: u32,
     last_input: u8,
     /// Widescreen margin tiles per side (0 = off).
     wide_tiles: u8,
@@ -542,6 +548,7 @@ impl WebEmu {
             movie_kind: None,
             apu: Apu::new(SAMPLE_RATE),
             audio_fifo: Vec::new(),
+            audio_rate: SAMPLE_RATE,
             last_input: 0,
             wide_tiles: 0,
             margins: None,
@@ -1300,9 +1307,44 @@ impl WebEmu {
         Ok(())
     }
 
-    /// Queued PCM samples (44.1 kHz mono) awaiting the AudioWorklet.
+    /// Queued PCM samples (mono, at [`WebEmu::audio_rate`]) awaiting the
+    /// AudioWorklet.
     pub fn audio_queued(&self) -> usize {
         self.audio_fifo.len()
+    }
+
+    /// PCM rate the synth currently renders at, in Hz.
+    pub fn audio_rate(&self) -> u32 {
+        self.audio_rate
+    }
+
+    /// Render PCM at `rate` from now on; returns the rate actually applied.
+    ///
+    /// The page calls this with its `AudioContext` sample rate once the
+    /// context exists. Matching the two matters for latency, not just pitch:
+    /// the page steps 60.0988 NES frames per wall-clock second and each frame
+    /// renders `rate / 60.0988` samples, so production is exactly `rate`
+    /// samples per second. The audio thread consumes exactly the context's
+    /// rate. Render 44100 into a 48000 Hz context and the worklet runs 3900
+    /// samples/s short (a permanent underrun, ~8% sharp); render 48000 into a
+    /// 44100 Hz context and it gains 3900 samples/s, i.e. a second of extra
+    /// delay every 11 s until the worklet's cap starts dropping audio.
+    ///
+    /// Only the two shipped game rates are synthesisable; anything else
+    /// falls back to 44100 and is reported by the return value so the caller
+    /// can rebuild its context at a rate the synth can feed exactly. The
+    /// queue is dropped because its contents are at the old rate.
+    pub fn set_audio_rate(&mut self, rate: u32) -> u32 {
+        let want = if z2_apu::audio::sample_rate_supported(rate) {
+            rate
+        } else {
+            SAMPLE_RATE
+        };
+        if want != self.audio_rate {
+            self.audio_rate = self.apu.set_sample_rate(want);
+            self.audio_fifo.clear();
+        }
+        self.audio_rate
     }
 
     /// Drain queued PCM as `f32` mono in `[-1, 1]` (empties the queue).
@@ -1464,7 +1506,7 @@ impl WebEmu {
             });
         }
 
-        self.apu = Apu::new(SAMPLE_RATE);
+        self.apu = Apu::new(self.audio_rate);
         // DMC sample bytes come from the cartridge PRG the game just parsed.
         self.apu
             .install_dmc_source(Box::new(PrgSource::new(game.prg.to_vec())));
@@ -2395,6 +2437,30 @@ mod tests {
         assert_eq!(state["frame"], 1);
         let shot = emu.screenshot().unwrap();
         assert_eq!(shot.len(), FRAME_RGBA_LEN);
+    }
+
+    #[test]
+    fn audio_rate_follows_the_context_and_paces_production() {
+        let mut emu = booted();
+        assert_eq!(
+            emu.audio_rate(),
+            44_100,
+            "44.1 kHz until the page says otherwise"
+        );
+        // A 48 kHz AudioContext: the synth must render 48000 samples per
+        // wall-clock second too, or the worklet queue drifts by 3900
+        // samples/s and the delay grows about a second every 11 seconds.
+        assert_eq!(emu.set_audio_rate(48_000), 48_000);
+        emu.take_audio_f32(); // the switch drops samples rendered at the old rate
+        emu.step_frames(0, 60).unwrap();
+        let queued = emu.audio_queued();
+        // 60 frames at 60.0988 Hz is 0.998 s, so 48000 Hz gives ~47921
+        // samples (and 44100 would give only ~44027 — well outside this).
+        assert!((47_800..=48_050).contains(&queued), "queued={queued}");
+        // A rate the synth cannot render falls back and reports the fallback
+        // so the page can rebuild its context to match.
+        assert_eq!(emu.set_audio_rate(22_050), 44_100);
+        assert_eq!(emu.audio_rate(), 44_100);
     }
 
     #[test]

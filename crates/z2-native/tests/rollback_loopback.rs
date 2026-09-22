@@ -59,7 +59,8 @@ struct Peer {
     rebuild: Rebuild,
     /// Pad for each session frame (indexed by the frame it applies to).
     pads: Vec<u8>,
-    /// Full-state checksum at tick ends, keyed by the frame the state is at.
+    /// Full-state checksums keyed by the frame the state is at: the live game
+    /// at each tick end, and the ring's saves for frames a rollback replayed.
     latest: BTreeMap<u32, u64>,
     /// Checksums of states no rollback can change any more.
     final_sums: BTreeMap<u32, u64>,
@@ -86,8 +87,18 @@ impl Peer {
         self.advanced += u64::from(out.advanced);
         self.replayed += u64::from(out.replayed);
         if let Some(r) = out.loaded_from {
-            // States after the restored frame were re-simulated.
+            // States after the restored frame were re-simulated within this
+            // tick. The replay saved each of them into the ring again, so
+            // re-record them from there: only dropping them leaves a hole of
+            // up to `max_prediction` frames per rollback, and while both pads
+            // change often the two peers' holes leave no frame in common.
             let _ = self.latest.split_off(&(r + 1));
+            for f in r + 1..self.link.session.frame() {
+                let state = self.link.ring.get(f).unwrap_or_else(|| {
+                    panic!("{}: replayed state {f} is not in the ring", self.name)
+                });
+                self.latest.insert(f, netplay::rollback_checksum(state));
+            }
         }
         for ev in self.link.take_events() {
             match ev {
@@ -219,33 +230,25 @@ fn run_pair(
     assert_eq!(host.emu.game.exec_errors, 0, "host faulted");
     assert_eq!(guest.emu.game.exec_errors, 0, "guest faulted");
 
-    // Every final state both peers recorded must agree.
-    let mut common_frames = 0u32;
-    for (f, h) in host.final_sums.range(..=frames) {
-        if let Some(g) = guest.final_sums.get(f) {
-            assert_eq!(h, g, "[{}] state at frame {f} differs", net.name);
-            common_frames += 1;
-        }
+    // Each peer records the state at every frame from 1 on (a tick ends one
+    // frame after the last, or on the same frame while stalled; a rollback
+    // re-records what it replayed), so the whole run is compared, not a sample.
+    let final_sum = |p: &Peer, f: u32| {
+        *p.final_sums.get(&f).unwrap_or_else(|| {
+            panic!(
+                "[{}] {} recorded no final state at frame {f}",
+                net.name, p.name
+            )
+        })
+    };
+    for f in 1..=frames {
+        assert_eq!(
+            final_sum(&host, f),
+            final_sum(&guest, f),
+            "[{}] state at frame {f} differs",
+            net.name
+        );
     }
-    // Stalled ticks end on the same frame as the tick before, so each peer
-    // records most frames but not all; the sessions' own checksums (every 30
-    // frames, a mismatch panics above) cover the gaps.
-    assert!(
-        common_frames >= frames / 3,
-        "[{}] too few common final frames compared: {common_frames}",
-        net.name
-    );
-    let last_common = host
-        .final_sums
-        .keys()
-        .rev()
-        .find(|f| guest.final_sums.contains_key(f))
-        .copied()
-        .expect("a common final frame");
-    assert!(
-        last_common + 16 >= frames,
-        "last common frame {last_common}"
-    );
     let min_checks = frames / 30 - 4;
     assert!(
         hs.checksums_ok >= min_checks && gs.checksums_ok >= min_checks,
@@ -256,7 +259,7 @@ fn run_pair(
     );
     assert!(host.advanced >= u64::from(frames) && guest.advanced >= u64::from(frames));
     eprintln!(
-        "rollback_loopback [{}]: {common_frames} common final frames identical, last {last_common}",
+        "rollback_loopback [{}]: final states at frames 1..={frames} identical",
         net.name
     );
 }
@@ -321,8 +324,29 @@ fn synthetic_emu() -> Emu {
     }
 }
 
+/// Run `body` on a thread with an explicit stack. An `Emu` is 83 KiB and an
+/// unoptimized build moves it by value through `run_pair`, `Peer::tick` and
+/// the constructors behind `Rebuild`; measured on a debug build, the ROM run
+/// needs more than the 2 MiB a test thread gets and the synthetic run more
+/// than 1.25 MiB of it. A panic in `body` fails the test with its own message.
+fn tall_stack(body: impl FnOnce() + Send + 'static) {
+    let name = std::thread::current().name().unwrap_or("test").to_string();
+    let worker = std::thread::Builder::new()
+        .name(name)
+        .stack_size(64 * 1024 * 1024)
+        .spawn(body)
+        .expect("spawn tall-stack test thread");
+    if let Err(panic) = worker.join() {
+        std::panic::resume_unwind(panic);
+    }
+}
+
 #[test]
 fn synthetic_games_agree_under_rollback_over_loopback() {
+    tall_stack(synthetic_run);
+}
+
+fn synthetic_run() {
     for net in nets() {
         let make = || -> (Emu, Rebuild) {
             (
@@ -350,7 +374,11 @@ fn rom_games_agree_under_rollback_over_loopback() {
     let Some(raw) = common::rom_bytes(test) else {
         return;
     };
-    let body = z2_assets::rom::strip_ines_header(&raw).to_vec();
+    tall_stack(move || rom_run(&raw));
+}
+
+fn rom_run(raw: &[u8]) {
+    let body = z2_assets::rom::strip_ines_header(raw).to_vec();
     let frames: u32 = if cfg!(debug_assertions) { 300 } else { 3_000 };
     let n = frames as usize + 64;
     // Player 1 replays the any% movie (indexed by the frame each pad applies

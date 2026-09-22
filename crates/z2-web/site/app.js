@@ -1,9 +1,13 @@
 // z2rs web frontend glue — vanilla ES module, zero npm dependencies.
 //
-// Wiring: ./pkg/z2_web.js must exist (see site/README "Build"). This module
+// Wiring: ./pkg/z2_web.js must exist (see site/README "Build") unless the
+// page's #z2-config names another release (readConfig below). This module
 // owns the DOM, canvas, IndexedDB, keyboard/Gamepad and AudioContext; the
 // wasm side (crates/z2-web/src/lib.rs) owns emulation and only exchanges
 // bytes, strings and numbers.
+//
+// Hosting: `make run-web` serves this file unbundled, straight to the
+// browser. A hosting page may add an optional #z2-config element.
 //
 // Shared input contract (bits 0..7): A,B,Select,Start,Up,Down,Left,Right.
 // Keyboard P1: Z=A, X=B, Shift=Select, Enter=Start, arrows=d-pad.
@@ -64,6 +68,34 @@ function setZoom(z) {
   syncCanvas();
 }
 
+// --- host configuration -----------------------------------------------------
+// A page may carry <script id="z2-config" type="application/json">…</script>
+// (a hosting page may render one; the vanilla index.html has none):
+//   { wasm:  { js, wasm },          // URLs of the glue module and the binary
+//     rom:   { url, keyRequired },  // the host serves the ROM from `url`
+//     notes: [ … ] }                // lines to append to Status at boot
+// Everything is optional. With no element the page behaves as it always has:
+// ./pkg/z2_web.js next to this file, and the ROM only by drop.
+const CONFIG = readConfig();
+function readConfig() {
+  const cfg = { wasm: null, rom: null, notes: [] };
+  const el = document.getElementById('z2-config');
+  if (!el) return cfg;
+  try {
+    const raw = JSON.parse(el.textContent || '{}');
+    if (raw.wasm && typeof raw.wasm.js === 'string') {
+      cfg.wasm = { js: raw.wasm.js, wasm: typeof raw.wasm.wasm === 'string' ? raw.wasm.wasm : null };
+    }
+    if (raw.rom && typeof raw.rom.url === 'string') {
+      cfg.rom = { url: raw.rom.url, keyRequired: !!raw.rom.keyRequired };
+    }
+    if (Array.isArray(raw.notes)) cfg.notes = raw.notes.filter((n) => typeof n === 'string');
+  } catch (e) {
+    cfg.notes.push(`host config ignored: ${e}`);
+  }
+  return cfg;
+}
+
 let WebEmu = null;
 let emu = null;
 let running = false; // ROM loaded and loop armed
@@ -90,23 +122,43 @@ function setStatus(extra = '') {
 }
 
 // `audio off` until the button is pressed; then the context state, the
-// worklet's queue depth and how often it ran dry.
+// worklet's queue depth (the delay behind the picture) and how often it ran
+// dry.
 function audioStatus() {
   if (!actx) return 'audio off';
   if (actx.state !== 'running') return `audio ${actx.state}`;
-  const ms = Math.round(audioReport.queued / 44.1);
+  const ms = Math.round((audioReport.queued * 1000) / actx.sampleRate);
   return `audio on (${ms} ms buffered, ${audioReport.underruns} underruns)`;
 }
 
 // --- wasm boot ------------------------------------------------------------
+// The glue module comes from CONFIG.wasm (a host pointing at an uploaded
+// release) or, by default, from ./pkg/ next to this file (the vanilla site,
+// `make run-web`). The binary's URL is passed explicitly when the host names
+// one; otherwise the glue resolves z2_web_bg.wasm beside itself.
 async function boot() {
+  const jsUrl = CONFIG.wasm ? CONFIG.wasm.js : './pkg/z2_web.js';
+  if (hostRomWanted()) {
+    // The host serves the ROM, so the page says nothing about ROMs at all: the
+    // "drop your own dump" intro goes, and the drop box only shows progress. It
+    // comes back, with its prompt, if the host's ROM cannot be had.
+    $('romIntro').hidden = true;
+    showDropPrompt(false);
+    romSay('loading the game…');
+  }
   try {
-    const pkg = await import('./pkg/z2_web.js');
-    await pkg.default();
+    const pkg = await import(jsUrl);
+    if (typeof pkg.default !== 'function') {
+      throw new Error('the module loaded but is empty or is not a wasm-pack bundle (no init export)');
+    }
+    await pkg.default(CONFIG.wasm && CONFIG.wasm.wasm ? { module_or_path: CONFIG.wasm.wasm } : undefined);
     WebEmu = pkg.WebEmu;
   } catch (e) {
-    statusEl.textContent =
-      `wasm bundle missing (./pkg/z2_web.js). Build it first — see site/README "Build".\n${e}`;
+    statusEl.textContent = CONFIG.wasm
+      ? `wasm release failed to load (${jsUrl}).\n${e}`
+      : `wasm bundle missing (./pkg/z2_web.js). Build it first — see site/README "Build".\n${e}`;
+    if (CONFIG.notes.length) statusEl.textContent += `\n${CONFIG.notes.join('\n')}`;
+    if (hostRomWanted()) romSay('the game engine failed to load — see Status below.', 'err');
     return;
   }
   emu = new WebEmu();
@@ -119,7 +171,10 @@ async function boot() {
   if (!emu.net_supported()) $('netBox').classList.add('unsupported');
   syncNetButtons();
   syncHdPanel();
-  statusEl.textContent += `\nz2-web ${emu.version()} ready — drop a Zelda II (USA) .nes file.`;
+  statusEl.textContent += `\nz2-web ${emu.version()} ready — ` +
+    (hostRomWanted() ? 'starting the game.' : 'drop a Zelda II (USA) .nes file.');
+  if (CONFIG.notes.length) statusEl.textContent += `\n${CONFIG.notes.join('\n')}`;
+  if (hostRomWanted()) await loadRomFromHost();
 }
 
 // `?widescreen=16:9` (or `?wide=`) and `?coop=1` so a QA run or a bookmark can
@@ -251,8 +306,13 @@ function publishZ2() {
       },
       // local co-op
       // audio: what the AudioWorklet last reported, for QA (`peak` > 0 means
-      // non-silent samples actually reached the output).
-      audio: () => ({ state: actx ? actx.state : 'off', ...audioReport }),
+      // non-silent samples actually reached the output; `queued` over `rate`
+      // is how far the sound trails the picture).
+      audio: () => ({
+        state: actx ? actx.state : 'off',
+        rate: actx ? actx.sampleRate : emu.audio_rate(),
+        ...audioReport,
+      }),
       coopEnable: (on) => { setCoop(!!on); return emu.coop_enabled(); },
       coopEnabled: () => emu.coop_enabled(),
       coopStatus: () => emu.coop_status(),
@@ -307,6 +367,12 @@ function publishZ2() {
         // so a test can hold a real key and still advance frame by frame.
         step: (pad = null, max = 1) =>
           emu.net_step(pad === null || pad === undefined ? pollInput() : pad >>> 0, max >>> 0),
+      },
+      // On-screen controller: show/hide it, and read the pad byte it contributes.
+      touch: {
+        show: (on) => { showTouchPad(!!on); return !touchPad.hidden; },
+        shown: () => !touchPad.hidden,
+        mask: () => touchMask(),
       },
       trapsetId: () => emu.trapset_id_hex(),
       // Rollback cost probes, timed here with performance.now(). Leaves the
@@ -371,7 +437,7 @@ addEventListener('keyup', (e) => keys.delete(e.code));
 // (clicking across to the other netplay-play window, say), so it would stay
 // pressed until it was pressed and released again in this window. Release
 // everything on blur instead.
-addEventListener('blur', () => keys.clear());
+addEventListener('blur', () => { keys.clear(); touchRelease(); });
 
 // Player 1: Z=A, X=B (matches the native app).
 function keyboardMask() {
@@ -441,8 +507,104 @@ function gamepadMask(player = 0) {
   return gp ? padBits(gp) : 0;
 }
 
-const pollInput = () => keyboardMask() | gamepadMask(0);
+const pollInput = () => keyboardMask() | gamepadMask(0) | touchMask();
 const pollInputP2 = () => keyboardMaskP2() | gamepadMask(1);
+
+// --- touch gamepad (on-screen controller, player 1) ---------------------------
+// #touchpad is a d-pad, Select/Start and B/A floating over the bottom of the
+// viewport. Every finger is tracked by pointer id and re-hit-tested as it moves,
+// so a thumb can roll from B onto A or slide round the d-pad without lifting.
+// A finger that started on the d-pad keeps steering even after it drifts off
+// the disc. The pad bits are OR-ed into pollInput(), so the overlay drives
+// exactly what the keyboard drives: local play, co-op player 1 and netplay.
+const TOUCH_UP = 1 << 4, TOUCH_DOWN = 1 << 5, TOUCH_LEFT = 1 << 6, TOUCH_RIGHT = 1 << 7;
+const TOUCH_DEAD = 0.2; // d-pad dead zone, as a fraction of its radius
+// Eight ways, clockwise from east (atan2 has +y pointing down the screen).
+const TOUCH_OCTANTS = [TOUCH_RIGHT, TOUCH_RIGHT | TOUCH_DOWN, TOUCH_DOWN, TOUCH_DOWN | TOUCH_LEFT,
+  TOUCH_LEFT, TOUCH_LEFT | TOUCH_UP, TOUCH_UP, TOUCH_UP | TOUCH_RIGHT];
+const touchPad = $('touchpad');
+const touchDpad = $('tpDpad');
+const touchPointers = new Map(); // pointerId -> { bits, dpad }
+
+function touchMask() {
+  let m = 0;
+  for (const p of touchPointers.values()) m |= p.bits;
+  return m;
+}
+
+function touchDpadBits(x, y) {
+  const r = touchDpad.getBoundingClientRect();
+  const dx = (x - (r.left + r.width / 2)) / (r.width / 2);
+  const dy = (y - (r.top + r.height / 2)) / (r.height / 2);
+  if (Math.hypot(dx, dy) < TOUCH_DEAD) return 0;
+  const oct = Math.round(Math.atan2(dy, dx) / (Math.PI / 4));
+  return TOUCH_OCTANTS[(oct + 8) % 8];
+}
+
+function touchBitsAt(p, x, y) {
+  if (p.dpad) return touchDpadBits(x, y);
+  const el = document.elementFromPoint(x, y);
+  const btn = el && el.closest ? el.closest('#touchpad [data-pad]') : null;
+  return btn ? Number(btn.dataset.pad) : 0;
+}
+
+function touchPaint() {
+  const m = touchMask();
+  for (const b of touchPad.querySelectorAll('[data-pad]')) b.classList.toggle('on', (m & Number(b.dataset.pad)) !== 0);
+  touchDpad.classList.toggle('up', (m & TOUCH_UP) !== 0);
+  touchDpad.classList.toggle('down', (m & TOUCH_DOWN) !== 0);
+  touchDpad.classList.toggle('left', (m & TOUCH_LEFT) !== 0);
+  touchDpad.classList.toggle('right', (m & TOUCH_RIGHT) !== 0);
+}
+
+function touchRelease() {
+  touchPointers.clear();
+  touchPaint();
+}
+
+touchPad.addEventListener('pointerdown', (e) => {
+  e.preventDefault(); // no focus, no text selection, no long-press menu
+  const p = { bits: 0, dpad: !!(e.target.closest && e.target.closest('#tpDpad')) };
+  p.bits = touchBitsAt(p, e.clientX, e.clientY);
+  touchPointers.set(e.pointerId, p);
+  // Keep getting this finger's moves after it slides off the control.
+  try { e.target.setPointerCapture(e.pointerId); } catch { /* synthetic pointer: nothing to capture */ }
+  touchPaint();
+});
+touchPad.addEventListener('pointermove', (e) => {
+  const p = touchPointers.get(e.pointerId);
+  if (!p) return;
+  const bits = touchBitsAt(p, e.clientX, e.clientY);
+  if (bits !== p.bits) { p.bits = bits; touchPaint(); }
+});
+for (const type of ['pointerup', 'pointercancel']) {
+  touchPad.addEventListener(type, (e) => {
+    if (!touchPointers.delete(e.pointerId)) return;
+    touchPaint();
+    // Lifting a finger is a user gesture (pressing one down is not, for touch),
+    // so this is where a phone gets its sound without hunting for the button.
+    if (type === 'pointerup' && !actx && !$('audioBtn').disabled) $('audioBtn').click();
+  });
+}
+touchPad.addEventListener('contextmenu', (e) => e.preventDefault());
+
+// Shown by default where touch is the main way in; `?touch=1` / `?touch=0` and
+// the Touch pad button override that either way.
+function touchWanted() {
+  const q = new URLSearchParams(location.search).get('touch');
+  if (q === '1' || q === 'true') return true;
+  if (q === '0' || q === 'false') return false;
+  return matchMedia('(pointer: coarse)').matches;
+}
+
+function showTouchPad(on) {
+  touchPad.hidden = !on;
+  $('touchSpacer').hidden = !on;
+  $('touchBtn').textContent = on ? 'Hide touch pad' : 'Touch pad';
+  if (!on) touchRelease();
+}
+$('touchBtn').addEventListener('click', () => showTouchPad(touchPad.hidden));
+showTouchPad(touchWanted());
 
 // --- frame loop (rAF accumulator @ NTSC_HZ) --------------------------------
 let lastT = 0;
@@ -555,14 +717,34 @@ function loop(t) {
 // --- audio (AudioWorklet ring buffer) --------------------------------------
 let actx = null;
 let worklet = null;
-// Last report from the worklet: `{underruns, queued, peak}` (see worklet.js).
-let audioReport = { underruns: 0, queued: 0, peak: 0 };
+// Last report from the worklet: `{underruns, queued, peak, dropped}` (see
+// worklet.js).
+let audioReport = { underruns: 0, queued: 0, peak: 0, dropped: 0 };
 
 $('audioBtn').addEventListener('click', async () => {
   try {
-    actx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 44100 });
-    await actx.audioWorklet.addModule('./worklet.js');
-    worklet = new AudioWorkletNode(actx, 'z2-ring');
+    const Ctx = window.AudioContext || window.webkitAudioContext;
+    // Take the device's own rate and synthesise at it, rather than demanding
+    // 44100. Forcing a rate either buys a pointless resample (the browser's,
+    // on a 48 kHz device) or is quietly ignored — and a context running at a
+    // different rate from the synth drifts by 3900 samples/s, which is heard
+    // as a delay that grows by about a second every 11 seconds, or as a
+    // permanent underrun, depending on which way the mismatch goes.
+    // 'interactive' asks for the smallest output buffer the device offers.
+    actx = new Ctx({ latencyHint: 'interactive' });
+    let rate = emu.set_audio_rate(actx.sampleRate);
+    if (rate !== actx.sampleRate) {
+      // An exotic context rate the synth cannot render (it ships 44100 and
+      // 48000 only): rebuild the context at the rate it fell back to.
+      await actx.close();
+      actx = new Ctx({ sampleRate: rate, latencyHint: 'interactive' });
+      rate = actx.sampleRate;
+    }
+    // Resolve against this module, not the document: a host may serve the
+    // page at / and this file at /z2/app.js, so a document-relative
+    // './worklet.js' would miss.
+    await actx.audioWorklet.addModule(new URL('./worklet.js', import.meta.url));
+    worklet = new AudioWorkletNode(actx, 'z2-ring', { processorOptions: { rate } });
     worklet.port.onmessage = (e) => { audioReport = e.data; };
     worklet.connect(actx.destination);
     await actx.resume();
@@ -584,8 +766,15 @@ function pushAudio() {
 }
 
 // --- pause -----------------------------------------------------------------
-function setPaused(p) {
+// `autoPaused` marks a pause the page took by itself (tab hidden). Only that
+// kind is undone when the tab comes back: a page that loaded its ROM in a
+// background tab, or a phone that was locked for a moment, must not greet the
+// player with a frozen picture and a Resume button. A pause the player asked
+// for stays until the player ends it.
+let autoPaused = false;
+function setPaused(p, auto = false) {
   paused = p;
+  autoPaused = p && auto;
   $('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
   if (actx) { paused ? actx.suspend() : actx.resume(); }
   setStatus();
@@ -595,12 +784,19 @@ document.addEventListener('visibilitychange', () => {
   // Never auto-pause during a session: a paused peer stalls the other one.
   // (requestAnimationFrame stops in a hidden tab anyway, so the peer sees a
   // stall regardless.)
-  if (document.hidden && running && !paused && !netActive) setPaused(true);
+  if (document.hidden) {
+    touchRelease();
+    if (running && !paused && !netActive) setPaused(true, true);
+  } else if (autoPaused) {
+    lastT = 0; acc = 0; // do not try to catch up on the time spent hidden
+    setPaused(false);
+  }
 });
 
 // --- ROM loading ------------------------------------------------------------
-async function loadRomFile(file) {
-  const buf = new Uint8Array(await file.arrayBuffer());
+// One entry point for every source (drop, file picker, host download): the
+// wasm side hash-gates the bytes, and nothing here stores them anywhere.
+function loadRomBytes(buf) {
   romLoadT0 = performance.now();
   firstFrameLogged = false;
   try {
@@ -635,6 +831,13 @@ async function loadRomFile(file) {
   syncNetButtons();
   setPaused(false);
   setStatus();
+  // On a phone the picture is the page: bring it under the thumbs' controller.
+  if (!touchPad.hidden) screen.scrollIntoView({ block: 'start', behavior: 'smooth' });
+}
+
+async function loadRomFile(file) {
+  loadRomBytes(new Uint8Array(await file.arrayBuffer()));
+  if (CONFIG.rom && emu.rom_loaded()) romSay('playing the dropped ROM.');
 }
 
 const drop = $('drop');
@@ -645,6 +848,105 @@ drop.addEventListener('drop', (e) => {
   if (e.dataTransfer.files.length) loadRomFile(e.dataTransfer.files[0]);
 });
 $('romFile').addEventListener('change', (e) => { if (e.target.files.length) loadRomFile(e.target.files[0]); });
+
+// --- ROM from the host ------------------------------------------------------
+// With CONFIG.rom the host serves the ROM itself (from private storage, or a
+// local Z2_ROM file in development), so the page starts without a
+// drop and without saying anything about it: once the game is running the
+// drop box is hidden. `?rom=drop` skips the download and plays a dropped dump
+// instead. A 401 means the host wants an access key (Z2_ROM_ACCESS_KEY): the
+// key box asks once and keeps the key in localStorage for this origin. The
+// ROM bytes never touch storage; only the key does.
+const ROM_KEY_STORAGE = 'z2rs-rom-key';
+let romKeyMem = ''; // the key for this page load when localStorage is unavailable
+
+function hostRomWanted() {
+  if (!CONFIG.rom) return false;
+  const p = new URLSearchParams(location.search).get('rom');
+  return !(p === '0' || p === 'drop' || p === 'none');
+}
+
+function romSay(text, cls = '') {
+  const el = $('romAuto');
+  if (!el) return;
+  el.hidden = !text;
+  el.className = `sub ${cls}`.trim();
+  el.textContent = text;
+}
+
+// The "Drop .nes ROM here, or [Choose File]" prompt inside the drop box, and
+// the box itself.
+function showDropPrompt(on) {
+  const el = $('dropPrompt');
+  if (el) el.hidden = !on;
+}
+function showDropBox(on) {
+  $('drop').hidden = !on;
+}
+
+function romKey() {
+  if (romKeyMem) return romKeyMem;
+  try { return localStorage.getItem(ROM_KEY_STORAGE) || ''; } catch { return ''; }
+}
+
+function showKeyBox(why) {
+  romSay(why, 'warn');
+  showDropBox(true);
+  showDropPrompt(true);
+  $('romKeyBox').hidden = false;
+  $('romKey').focus();
+}
+
+async function loadRomFromHost() {
+  $('romKeyBox').hidden = true;
+  showDropBox(true);
+  romSay('loading the game…');
+  let res;
+  try {
+    const headers = {};
+    const key = romKey();
+    if (key) headers['x-z2-rom-key'] = key;
+    res = await fetch(CONFIG.rom.url, { headers });
+  } catch (e) {
+    showDropPrompt(true);
+    romSay(`ROM download failed (${e}) — drop a .nes instead.`, 'err');
+    return;
+  }
+  if (res.status === 401 || res.status === 403) {
+    showKeyBox(res.status === 403 && romKey()
+      ? 'that access key was refused — enter the current one (or drop your own .nes).'
+      : 'this deployment needs an access key to load its ROM (or drop your own .nes).');
+    return;
+  }
+  if (!res.ok) {
+    let why = `HTTP ${res.status}`;
+    try { why = (await res.text()).trim() || why; } catch { /* keep the status code */ }
+    showDropPrompt(true);
+    romSay(`no ROM from this deployment (${why}) — drop a .nes instead.`, 'err');
+    return;
+  }
+  loadRomBytes(new Uint8Array(await res.arrayBuffer()));
+  if (emu.rom_loaded()) {
+    // Running: nothing to announce, the player can see it.
+    romSay('');
+    showDropBox(false);
+  } else {
+    showDropPrompt(true);
+    romSay("the deployment's ROM was rejected (see Status) — drop a .nes instead.", 'err');
+  }
+}
+
+$('romKeyBtn').addEventListener('click', () => {
+  const key = $('romKey').value.trim();
+  romKeyMem = key;
+  try {
+    if (key) localStorage.setItem(ROM_KEY_STORAGE, key);
+    else localStorage.removeItem(ROM_KEY_STORAGE);
+  } catch { /* private browsing: romKeyMem carries the key for this load */ }
+  $('romKey').value = '';
+  loadRomFromHost();
+});
+$('romKey').addEventListener('keydown', (e) => { if (e.key === 'Enter') $('romKeyBtn').click(); });
 
 // --- movie ------------------------------------------------------------------
 $('movieFile').addEventListener('change', async (e) => {

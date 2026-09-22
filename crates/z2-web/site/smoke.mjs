@@ -264,10 +264,18 @@ try {
     loudest = Math.max(loudest, audio.peak);
   }
   if (!(loudest >= 0.01)) fail(`audio is on but silent after 15 s: ${JSON.stringify(audio)}`);
-  if (audio.queued > 44100) fail(`the worklet is holding ${audio.queued} samples (> 1 s of latency)`);
+  // The worklet resyncs to a 50 ms target and never lets the queue past
+  // 90 ms (worklet.js), so anything near a tenth of a second means the cap
+  // stopped working and the old creeping delay is back. The bound is in
+  // milliseconds because the context rate now follows the device.
+  const rate = await page.evaluate(() => window.z2.ext.audio().rate);
+  const latencyMs = (audio.queued * 1000) / rate;
+  if (latencyMs > 150) {
+    fail(`the worklet is holding ${audio.queued} samples at ${rate} Hz (${latencyMs.toFixed(0)} ms of latency)`);
+  }
 
   if (errors.length) fail(`page errors: ${errors.join(' | ').slice(0, 500)}`);
-  console.log(`SMOKE-OK: frame ${f0} -> ${st.frame}, facts valid, snapshot+shot ok, audio peak ${loudest.toFixed(3)} (${audio.queued} smp queued, ${audio.underruns} underruns)`);
+  console.log(`SMOKE-OK: frame ${f0} -> ${st.frame}, facts valid, snapshot+shot ok, audio peak ${loudest.toFixed(3)} (${latencyMs.toFixed(0)} ms queued, ${audio.underruns} underruns, ${audio.dropped || 0} dropped)`);
 } finally {
   await browser.close();
   await server.close();

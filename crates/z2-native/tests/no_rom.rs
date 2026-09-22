@@ -17,13 +17,16 @@ fn no_rom_title_is_exact_and_shown_while_cartless() {
     );
     assert_eq!(app::no_rom_title(), NO_ROM_TITLE);
     assert_eq!(
-        app::window_title(60.0, 0, false, false, false),
+        app::window_title(60.0, 0, false, false, false, 0),
         NO_ROM_TITLE
     );
     // Paused or fast-forward, the cartless window still says no-ROM.
-    assert_eq!(app::window_title(60.0, 0, true, true, false), NO_ROM_TITLE);
+    assert_eq!(
+        app::window_title(60.0, 0, true, true, false, 0),
+        NO_ROM_TITLE
+    );
     // With a ROM the meter line returns.
-    let t = app::window_title(59.9, 2, false, false, true);
+    let t = app::window_title(59.9, 2, false, false, true, 0);
     assert!(t.starts_with("z2rs — "));
     assert!(!t.contains("no ROM"));
 }

@@ -50,10 +50,19 @@ Without a ROM the app starts in a synthetic mode with no cartridge. You can also
 | A | `Z` | `G` |
 | B | `X` | `F` |
 | Start | `Enter` | `T` |
-| Select | `RightShift` | `R` |
+| Select | `Shift` (either one) | `R` |
 | D-pad | arrow keys | `W` `A` `S` `D` |
 
-Other keys: `Tab` fast-forward, `F5` save state, `F7` load state, `P` pause, `.` single-step while paused, `Esc` quit.
+Both Shift keys are Select, because Select is how you cast a spell and the
+left one is easier to reach while the right hand is on the arrow keys.
+
+Other keys: `Tab` fast-forward, `F5` save state, `F7` load state, `P` pause,
+`.` single-step while paused, `Esc` quit.
+
+There are ten save-state slots. `F6` cycles through them and the digits `1` to
+`9` and `0` pick one directly. `F5` and `F7` use the selected slot, and the
+window title shows ` [SLOT n]` while it is anything other than 0. Each slot is
+a separate `savestate<n>.z2snap` file in the data directory.
 
 ### Command-line flags
 

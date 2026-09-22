@@ -1,4 +1,4 @@
-//! `cpal` audio plumbing over `z2-apu`.
+//! `cpal` audio plumbing over `z2-apu` (output-chain audit R2).
 //!
 //! Headlines come from `z2_apu::audio` (read-only reuse):
 //! [`z2_apu::PcmFifo`], [`z2_apu::nominal_frame_samples`],
