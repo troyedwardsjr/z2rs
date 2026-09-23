@@ -403,3 +403,160 @@ fn scale_two_cells() {
     assert_eq!(px.pixel(7, 15), RED);
     assert_eq!(px.pixel(8, 15)[3], 0);
 }
+
+#[test]
+fn sprite_alpha_and_bleed_are_validated() {
+    let free = |tiles: &str, alpha: &str| {
+        format!(
+            r#"{{"version":1,"name":"t","scale":2,{alpha}"sheets":[{{"file":"s.png"}}],"tiles":[{tiles}]}}"#
+        )
+    };
+    // A 40x24 sheet at scale 2: one 16 px core with up to 12 px around it.
+    let sheet = || vec![("s.png", solid_png(40, 24, GREEN))];
+    let tile = r#"{"page":3,"tile":7,"sheet":0,"x":8,"y":4,"bleed":[4,2,8,2]}"#;
+
+    let p = load(&free(tile, r#""sprite_alpha":"art","#), sheet()).unwrap();
+    assert!(p.sprite_alpha_art());
+    assert_eq!(p.max_bleed_v(), 2);
+    let cell = p.lookup(3, 7, [0; 3]).unwrap();
+    assert_eq!(cell.bleed, [4, 2, 8, 2]);
+    let px = p.cell_pixels(cell);
+    assert_eq!(
+        px.pixel_rel(-8, -4),
+        Some(GREEN),
+        "bleed is in sheet pixels around the core"
+    );
+    assert_eq!(px.pixel_rel(31, 19), Some(GREEN));
+    assert_eq!(
+        (
+            px.pixel_rel(-9, 0),
+            px.pixel_rel(32, 0),
+            px.pixel_rel(0, 20)
+        ),
+        (None, None, None)
+    );
+
+    let p = load(&free(tile, r#""sprite_alpha":"nes","#), sheet()).unwrap();
+    assert!(!p.sprite_alpha_art());
+    assert_eq!(
+        err(&free(tile, r#""sprite_alpha":"hd","#), sheet()),
+        PackError::SpriteAlpha { got: "hd".into() }
+    );
+
+    for (bad, want) in [
+        (r#""bleed":[1,2,3]"#, "has 3 values"),
+        (r#""bleed":[0,0,9,0]"#, "value 9 out of range (0..=8)"),
+        (
+            r#""bleed":[5,0,0,0]"#,
+            "does not fit inside \"s.png\" (40x24 px)",
+        ),
+        (r#""bleed":[0,0,0,3]"#, "does not fit inside"),
+    ] {
+        let json = free(&tile.replace(r#""bleed":[4,2,8,2]"#, bad), "");
+        let e = err(&json, sheet());
+        assert!(matches!(e, PackError::Bleed { .. }), "{bad}: {e:?}");
+        assert!(e.to_string().contains(want), "{bad}: {e}");
+        assert!(
+            e.to_string().starts_with("pack.json tiles[0]: bleed "),
+            "{e}"
+        );
+    }
+}
+
+#[test]
+fn layers_are_validated_and_resolved() {
+    use z2_render::{LayerDepth, SceneView};
+    let pack =
+        |layers: &str| format!(r#"{{"version":1,"name":"t","scale":2,"layers":[{layers}]}}"#);
+    let art = || {
+        vec![
+            ("l/far.png", solid_png(64, 32, BLUE)),
+            ("l/near.png", solid_png(8, 8, RED)),
+        ]
+    };
+
+    let p = load(
+        &pack(
+            r#"{"file":"l/far.png","x":-66,"scroll":20,"repeat_x":true,"when":{"world":1,"scene":7}},
+               {"file":"l/near.png","depth":"front","x":22,"y":208,
+                "over_tiles":[{"page":7,"tile":75},{"page":7,"tile":3},{"page":7,"tile":75}]}"#,
+        ),
+        art(),
+    )
+    .unwrap();
+    let [far, near] = p.layers() else {
+        panic!("two layers")
+    };
+    assert_eq!(
+        (far.depth, far.x, far.y, far.scroll, far.repeat_x),
+        (LayerDepth::Back, -66, 0, 20, true)
+    );
+    assert_eq!((far.world, far.region, far.scene), (Some(1), None, Some(7)));
+    assert_eq!(
+        (near.depth, near.scroll, near.repeat_x),
+        (LayerDepth::Front, 100, false)
+    );
+    assert_eq!(
+        near.over_tiles,
+        vec![(7, 3), (7, 75)],
+        "sorted, deduplicated"
+    );
+    assert!(near.covers_tile(7, 75) && !near.covers_tile(7, 76));
+    assert!(far.covers_tile(0, 0), "no list covers every tile");
+    assert_eq!(p.sheet_file(usize::from(far.sheet)), Some("l/far.png"));
+
+    let scene = |world, scene| SceneView {
+        world,
+        region: 0,
+        scene,
+        camera_x: 0,
+    };
+    assert!(far.matches(Some(&scene(1, 7))));
+    assert!(!far.matches(Some(&scene(1, 8))) && !far.matches(Some(&scene(2, 7))));
+    assert!(!far.matches(None), "a layer that names a scene needs one");
+    assert!(near.matches(None) && near.matches(Some(&scene(5, 5))));
+
+    for (bad, want) in [
+        (
+            r#"{"file":"l/far.png","depth":"middle"}"#,
+            "unknown depth \"middle\"",
+        ),
+        (
+            r#"{"file":"l/far.png","scroll":101}"#,
+            "scroll 101 out of range (0..=100)",
+        ),
+        (r#"{"file":"l/far.png","x":70000}"#, "x 70000 out of range"),
+        (
+            r#"{"file":"l/far.png","when":{"scene":256}}"#,
+            "when.scene 256 out of range",
+        ),
+        (
+            r#"{"file":"l/far.png","over_tiles":[{"page":7,"tile":75}]}"#,
+            "\"over_tiles\" needs depth \"front\"",
+        ),
+    ] {
+        let e = err(&pack(bad), art());
+        assert!(matches!(e, PackError::Layer { .. }), "{bad}: {e:?}");
+        assert!(e.to_string().contains(want), "{bad}: {e}");
+        assert!(
+            e.to_string()
+                .starts_with("pack.json layers[0] (\"l/far.png\"): "),
+            "{e}"
+        );
+    }
+    assert!(matches!(
+        err(&pack(r#"{"file":"l/missing.png"}"#), art()),
+        PackError::MissingFile { .. }
+    ));
+    assert!(matches!(
+        err(&pack(r#"{"file":"../far.png"}"#), art()),
+        PackError::Path { .. }
+    ));
+    assert!(matches!(
+        err(
+            &pack(r#"{"file":"l/near.png","depth":"front","over_tiles":[{"page":32,"tile":0}]}"#),
+            art()
+        ),
+        PackError::Page { got: 32, .. }
+    ));
+}

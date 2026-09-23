@@ -1249,6 +1249,15 @@ impl Display {
                 self.presenter.margins_mut().clear_backdrop();
             }
         }
+        if self.presenter.needs_scene() {
+            self.presenter
+                .set_scene(game.sideview_scene().map(|s| z2_render::SceneView {
+                    world: s.world,
+                    region: s.region,
+                    scene: s.scene,
+                    camera_x: s.camera_x,
+                }));
+        }
         let record = game.frame_record().unwrap_or(&self.empty_record);
         if let Some(rec) = self.recorder.as_mut() {
             rec.observe(record);

@@ -71,8 +71,8 @@ fn scene(chr: &[u8]) -> Ppu {
     p
 }
 
-/// Pack covering every tile of both pages in the line's own colours.
-fn full_pack(chr: &[u8], rec: &FrameRecord, scale: u32) -> HdPack {
+/// Page sheets covering every tile of both pages in the line's own colours.
+fn full_pack_files(chr: &[u8], rec: &FrameRecord, scale: u32) -> Vec<(String, Vec<u8>)> {
     let line = rec.line(120);
     let bg3 = bg_colors(line, 0).map(|c| MasterPalette::NES.rgb(c));
     let spr3 = sprite_colors(line, 0).map(|c| MasterPalette::NES.rgb(c));
@@ -82,12 +82,7 @@ fn full_pack(chr: &[u8], rec: &FrameRecord, scale: u32) -> HdPack {
     let spr = paint_page_sheet(&chr[usize::from(SPR_PAGE) * CHR_BANK_LEN..], scale, |_| {
         Some(spr3)
     });
-    let json = format!(
-        "{{\"version\":1,\"name\":\"bench\",\"scale\":{scale},\"sheets\":[\
-         {{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\",\"page\":{SPR_PAGE}}}]}}"
-    );
-    HdPack::from_files(&[
-        ("pack.json".to_string(), json.into_bytes()),
+    vec![
         (
             "bg.png".to_string(),
             encode_png_rgba(bg.width, bg.height, &bg.rgba, &[]).unwrap(),
@@ -96,8 +91,47 @@ fn full_pack(chr: &[u8], rec: &FrameRecord, scale: u32) -> HdPack {
             "spr.png".to_string(),
             encode_png_rgba(spr.width, spr.height, &spr.rgba, &[]).unwrap(),
         ),
-    ])
-    .unwrap()
+    ]
+}
+
+/// Pack covering every tile of both pages in the line's own colours.
+fn full_pack(chr: &[u8], rec: &FrameRecord, scale: u32) -> HdPack {
+    let json = format!(
+        "{{\"version\":1,\"name\":\"bench\",\"scale\":{scale},\"sheets\":[\
+         {{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\",\"page\":{SPR_PAGE}}}]}}"
+    );
+    let mut files = vec![("pack.json".to_string(), json.into_bytes())];
+    files.extend(full_pack_files(chr, rec, scale));
+    HdPack::from_files(&files).unwrap()
+}
+
+/// [`full_pack`] plus the three layers a whole-scene paint-over uses: a far
+/// backdrop at 20% scroll, a repeating ground strip over one tile and a
+/// full-width painting.
+fn layer_pack(chr: &[u8], rec: &FrameRecord, scale: u32) -> HdPack {
+    let w = 432 * scale;
+    let px = |a: u8| {
+        let rgba: Vec<u8> = (0..w * 240 * scale)
+            .flat_map(|i| [a, 0, 0, (i % 3) as u8 * 127])
+            .collect();
+        encode_png_rgba(w, 240 * scale, &rgba, &[]).unwrap()
+    };
+    let json = format!(
+        "{{\"version\":1,\"name\":\"layers\",\"scale\":{scale},\"sprite_alpha\":\"art\",\
+         \"sheets\":[{{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\",\"page\":{SPR_PAGE}}}],\
+         \"layers\":[\
+         {{\"file\":\"far.png\",\"x\":-66,\"scroll\":20,\"repeat_x\":true}},\
+         {{\"file\":\"ground.png\",\"depth\":\"front\",\"x\":22,\"y\":208,\"repeat_x\":true,\
+           \"over_tiles\":[{{\"page\":{BG_PAGE},\"tile\":66}}]}},\
+         {{\"file\":\"paint.png\",\"depth\":\"front\",\"x\":22,\"y\":32}}]}}"
+    );
+    let base = full_pack_files(chr, rec, scale);
+    let mut files = vec![("pack.json".to_string(), json.into_bytes())];
+    files.extend(base);
+    files.push(("far.png".to_string(), px(10)));
+    files.push(("ground.png".to_string(), px(20)));
+    files.push(("paint.png".to_string(), px(30)));
+    HdPack::from_files(&files).unwrap()
 }
 
 #[test]
@@ -132,7 +166,12 @@ fn compose_cost_per_frame() {
     let mut worst_ms = 0.0f64;
     for scale in [1u32, 2, 4] {
         let pack = full_pack(&chr, &rec, scale);
-        for (label, use_pack) in [("no pack ", false), ("full pack", true)] {
+        let layered = layer_pack(&chr, &rec, scale);
+        for (label, use_pack) in [
+            ("no pack  ", None),
+            ("full pack", Some(&pack)),
+            ("+ layers ", Some(&layered)),
+        ] {
             for (geom, tiles) in [("256", 0u8), ("wide 8", 8)] {
                 let mut c = Compositor::with_margins(scale, tiles).unwrap();
                 let mut out = vec![0u8; c.rgba_len()];
@@ -145,9 +184,15 @@ fn compose_cost_per_frame() {
                     indexed,
                     record: &rec,
                     chr_rom: &chr,
-                    pack: if use_pack { Some(&pack) } else { None },
+                    pack: use_pack,
                     margins: if tiles == 0 { None } else { Some(&margins) },
                     palette: &MasterPalette::NES,
+                    scene: Some(z2_render::SceneView {
+                        world: 1,
+                        region: 0,
+                        scene: 7,
+                        camera_x: 123,
+                    }),
                 };
                 // Warm up caches, then time.
                 c.compose(input, &mut out).unwrap();

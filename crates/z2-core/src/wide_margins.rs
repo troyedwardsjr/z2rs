@@ -319,6 +319,46 @@ pub fn sideview_world_left(ram: &[u8; 0x800], line: &LineRecord) -> i32 {
     resolve_ring(i32::from(FrameRecord::ring_x(line)), SIDEVIEW_RING, est)
 }
 
+/// Which sideview scene is on screen and where its camera is: what a display
+/// layer needs to know to follow the level (README.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SideviewScene {
+    /// `$0707`: 0 caves and fields, 1 West towns, 2 East towns, 3-5 palaces.
+    pub world: u8,
+    /// `$0706`: 0 West, 1 Death Mountain and Maze Island, 2 East.
+    pub region: u8,
+    /// `$0561`: scene layout index inside the world.
+    pub scene: u8,
+    /// Level pixel at window x = 0 on the first play-field line.
+    pub camera_x: i32,
+}
+
+/// World (`$0707`).
+pub const ADDR_WORLD: u16 = 0x0707;
+/// Scene layout index (`$0561`).
+pub const ADDR_SCENE_INDEX: u16 = 0x0561;
+
+/// The scene of a sideview frame, or `None` in any other mode or when no
+/// play-field line was recorded. Unlike the margins this stays known while
+/// the pause pane is open: the pane covers tiles, not the camera.
+#[must_use]
+pub fn sideview_scene(ram: &[u8; 0x800], record: &FrameRecord) -> Option<SideviewScene> {
+    if ram[usize::from(ADDR_GAME_MODE)] != MODE_SIDEVIEW {
+        return None;
+    }
+    let line = record.lines.iter().find(|l| {
+        l.valid
+            && FrameRecord::show_bg(l)
+            && (LEVEL_TOP_TILE_ROW..30).contains(&FrameRecord::coarse_y(l))
+    })?;
+    Some(SideviewScene {
+        world: ram[usize::from(ADDR_WORLD)],
+        region: ram[usize::from(ADDR_OW_REGION)],
+        scene: ram[usize::from(ADDR_SCENE_INDEX)],
+        camera_x: sideview_world_left(ram, line),
+    })
+}
+
 /// World pixel of window x = 0 on an overworld line (ring instance nearest
 /// `16 * ($74 - 8)` adjusted by the in-progress horizontal step).
 #[must_use]

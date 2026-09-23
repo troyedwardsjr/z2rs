@@ -7,7 +7,8 @@
 #   3. *.fm2 / *.bk2 movies outside corpus/ (corpus/ is out of tree,
 #      so any in-tree movie is a mistake),
 #   4. any blob whose SHA1 matches a known ROM image,
-#   5. HD-pack output: TEMPLATE-ROM-DERIVED.txt / hdpack-seen.json markers,
+#   5. HD-pack output: TEMPLATE-ROM-DERIVED.txt / hdpack-seen.json /
+#      SHEETS-ROM-DERIVED.txt markers, paint_sheets' sheets.json,
 #      anything under hdpacks/, hdpack-templates/ or *.hdpack/, a pack.json
 #      carrying the z2rs-hdpack format tag, and any PNG carrying the
 #      z2rs-template tEXt chunk (template sheets rendered from CHR).
@@ -59,8 +60,14 @@ while IFS= read -r f; do
         esac
     fi
     case "$f" in
-        hdpacks/* | */hdpacks/* | *hdpack-templates/* | *.hdpack/* | *TEMPLATE-ROM-DERIVED.txt | *hdpack-seen.json)
+        hdpacks/* | */hdpacks/* | *hdpack-templates/* | *.hdpack/* | *TEMPLATE-ROM-DERIVED.txt | *hdpack-seen.json | *SHEETS-ROM-DERIVED.txt)
             block "$f (HD-pack output is CHR-derived or belongs outside the repo; see LEGAL.md)"
+            ;;
+        *sheets.json)
+            n="$(git show ":$f" 2>/dev/null | LC_ALL=C grep -c '"tilesets"' || true)"
+            if [ "${n:-0}" != 0 ]; then
+                block "$f (paint_sheets output is drawn from ROM CHR; see README.md)"
+            fi
             ;;
         *pack.json)
             # grep -c reads the whole blob, so the producer never gets SIGPIPE under pipefail.

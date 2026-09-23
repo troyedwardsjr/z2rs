@@ -1662,6 +1662,14 @@ impl WebEmu {
             p.margins_mut().fill_right_clip = right_clip;
             game.wide_margins(tiles, p.margins_mut());
         }
+        if p.needs_scene() {
+            p.set_scene(game.sideview_scene().map(|s| z2_render::SceneView {
+                world: s.world,
+                region: s.region,
+                scene: s.scene,
+                camera_x: s.camera_x,
+            }));
+        }
         // An unarmed record still composes: `FrameRecord::new()` yields the
         // centre frame with backdrop margins and no HD substitutions.
         let empty = z2_ppu::FrameRecord::new();

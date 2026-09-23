@@ -294,3 +294,52 @@ fn build_margins_overworld_end_to_end() {
     // Unrecorded lines are backdrop.
     assert_eq!(m.lines[1].fill, MarginFill::Backdrop);
 }
+
+/// `sideview_scene`: scene identity from RAM, camera from the first
+/// play-field line's ring position (RAM only picks the ring instance), and
+/// nothing outside sideview play.
+#[test]
+fn sideview_scene_reads_identity_and_camera() {
+    let mut ram = synth_ram(3, 1);
+    ram[usize::from(ADDR_GAME_MODE)] = MODE_SIDEVIEW;
+    ram[usize::from(ADDR_WORLD)] = 1;
+    ram[usize::from(ADDR_OW_REGION)] = 2;
+    ram[usize::from(ADDR_SCENE_INDEX)] = 7;
+    // RAM camera 2 px ahead of what the PPU drew: page 1, pixel $62 = 354.
+    ram[usize::from(ADDR_SCROLL_HI)] = 1;
+    ram[usize::from(ADDR_SCROLL_LO)] = 0x62;
+    let line = |coarse_y: u16, ring: u16| LineRecord {
+        valid: true,
+        mask: PPUMASK_SHOW_BG,
+        v_start: ((ring >> 8) << 10) | (coarse_y << 5) | ((ring & 0xFF) >> 3),
+        fine_x: (ring & 7) as u8,
+        ..LineRecord::EMPTY
+    };
+    let mut rec = FrameRecord::new();
+    // HUD rows (coarse Y < 4) scroll on their own and do not count.
+    rec.lines[8] = line(1, 0);
+    rec.lines[40] = line(5, 352);
+    rec.lines[41] = line(5, 17);
+    assert_eq!(
+        sideview_scene(&ram, &rec),
+        Some(SideviewScene {
+            world: 1,
+            region: 2,
+            scene: 7,
+            camera_x: 352
+        })
+    );
+
+    // The pause pane hides the margins but not the scene.
+    ram[usize::from(ADDR_MENU)] = 1;
+    assert_eq!(sideview_scene(&ram, &rec).map(|s| s.camera_x), Some(352));
+
+    ram[usize::from(ADDR_GAME_MODE)] = MODE_OVERWORLD;
+    assert_eq!(sideview_scene(&ram, &rec), None);
+    ram[usize::from(ADDR_GAME_MODE)] = MODE_SIDEVIEW;
+    assert_eq!(
+        sideview_scene(&ram, &FrameRecord::new()),
+        None,
+        "no play-field line"
+    );
+}

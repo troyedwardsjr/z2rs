@@ -49,8 +49,9 @@ pub use compositor::{
     bg_colors, sprite_colors, ComposeError, ComposeInput, Compositor, IndexedView,
 };
 pub use pack::{
-    CellPixels, CellRef, HdPack, PackError, PackManifest, PaletteSpec, SheetEntry, SheetRef,
-    TileEntry, PACK_FORMAT, PACK_MANIFEST, PACK_VERSION,
+    CellPixels, CellRef, HdPack, Layer, LayerDepth, LayerEntry, LayerWhen, OverTile, PackError,
+    PackManifest, PaletteSpec, SceneView, SheetEntry, SheetRef, TileEntry, MAX_BLEED, PACK_FORMAT,
+    PACK_MANIFEST, PACK_VERSION,
 };
 pub use palette::MasterPalette;
 pub use png_io::{decode_png_rgba, encode_png_rgba, PngError, RgbaImage, MAX_SHEET_DIM};

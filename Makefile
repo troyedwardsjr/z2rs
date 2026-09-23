@@ -11,7 +11,7 @@
 # (default: the sibling ../z2-corpus checkout, override as needed).
 
 .DEFAULT_GOAL := help
-.PHONY: help build test test-rom verify-smoke extract fuzz-smoke run run-debug run-release run-web run-web-net signal check-net netplay-e2e netplay-e2e-rollback netplay-play netplay-e2e-setup corpus-mint fmt clippy clean
+.PHONY: hd-sheets hd-pack hd-play help build test test-rom verify-smoke extract fuzz-smoke run run-debug run-release run-web run-web-net signal check-net netplay-e2e netplay-e2e-rollback netplay-play netplay-e2e-setup corpus-mint fmt clippy clean
 
 # Out-of-tree corpus checkout (movies + minted snapshots live here, never in
 # this repo). Override: `make corpus-mint Z2_CORPUS=/path/to/corpus`.
@@ -23,6 +23,14 @@ MOVIE ?=
 # Extra flags passed through to the native app, e.g.
 #   make run ARGS="--widescreen 16:9 --coop-local"
 ARGS ?=
+# HD pack spritesheets (`make hd-sheets`, `make hd-pack`, `make hd-play`). All
+# three directories hold art drawn from your ROM, so they default to a folder
+# outside the repository (LEGAL.md); the tools refuse a path inside it.
+HD_ART ?= $(HOME)/z2-art
+HD_SHOTS ?= $(HD_ART)/captures
+HD_SHEETS ?= $(HD_ART)/sheets
+HD_PACK ?= $(HD_ART)/my-pack
+HD_SCALE ?= 4
 # Signalling server bind address for `make signal`.
 SIGNAL_BIND ?= 0.0.0.0:3536
 # Player-1 input track `make netplay-e2e` replays through the live session to
@@ -62,6 +70,10 @@ help:
 	@echo "               right P2) for playing by hand (needs Z2_ROM + setup below)"
 	@echo "  netplay-e2e-setup  one-off: npm install playwright + download chromium (dev only)"
 	@echo "  corpus-mint  delegate snapshot minting to xtask (needs Z2_CORPUS + Z2_ROM)"
+	@echo "  hd-sheets    capture the whole game and write paintable spritesheets to HD_SHEETS:"
+	@echo "               every sprite pose and every scene's tileset (needs Z2_ROM + Z2_CORPUS)"
+	@echo "  hd-pack      cut the painted HD_SHEETS into an HD pack in HD_PACK and validate it"
+	@echo "  hd-play      play with HD_PACK loaded (16:9 widescreen, HD_SCALE)"
 	@echo "  fmt          cargo fmt --all"
 	@echo "  clippy       cargo clippy --workspace --all-targets -- -D warnings"
 	@echo "  clean        cargo clean"
@@ -233,6 +245,39 @@ fmt:
 
 clippy:
 	cargo clippy --workspace --all-targets -- -D warnings
+
+# --- HD pack spritesheets (tools/hd-sheets/paint_sheets.py) ---
+# hd-sheets replays the corpus movie into every town, palace, boss and field,
+# records which CHR tile drew each pixel, and lays the result out as sheets:
+# one per sprite palette (whole figures, one slot per animation frame) and one
+# tileset per scene. Paint over them, then hd-pack slices them back into a pack.
+HD_SHOTS_BIN = cargo run --release -q -p z2-native --example article_shots --
+
+hd-sheets:
+	@[ -n "$(Z2_ROM)" ] || { echo "hd-sheets: Z2_ROM is not set."; echo "  Set it to your own Zelda II (USA) dump, e.g.:"; echo "    export Z2_ROM=/path/to/zelda2.nes   (see LEGAL.md)"; exit 2; }
+	@[ -f "$(Z2_CORPUS)/movies/anypct.bk2" ] || { echo "hd-sheets: no $(Z2_CORPUS)/movies/anypct.bk2."; echo "  The captures replay the corpus movies; point Z2_CORPUS at the directory holding movies/anypct.bk2."; exit 2; }
+	python3 tools/hd-sheets/specs.py "$(HD_SHOTS)/specs"
+	$(HD_SHOTS_BIN) --movie "$(Z2_CORPUS)/movies/anypct.bk2" --spec "$(HD_SHOTS)/specs/sheets.spec" --out "$(HD_SHOTS)/moves" --scale 1 --tilemap
+	$(HD_SHOTS_BIN) --movie "$(Z2_CORPUS)/movies/anypct.bk2" --spec "$(HD_SHOTS)/specs/scenes.spec" --out "$(HD_SHOTS)/scenes" --scale 1 --tilemap
+	$(HD_SHOTS_BIN) --movie "$(Z2_CORPUS)/movies/anypct.bk2" --spec "$(HD_SHOTS)/specs/special.spec" --out "$(HD_SHOTS)/special" --scale 1 --tilemap
+	@if [ -f "$(Z2_CORPUS)/movies/hundred-percent.bk2" ]; then \
+		$(HD_SHOTS_BIN) --movie "$(Z2_CORPUS)/movies/hundred-percent.bk2" --spec "$(HD_SHOTS)/specs/m100.spec" --out "$(HD_SHOTS)/m100" --scale 1 --tilemap; \
+	else echo "hd-sheets: no hundred-percent.bk2, skipping the title/name-entry/game-over captures"; fi
+	$(HD_SHOTS_BIN) --spec "$(HD_SHOTS)/specs/title.spec" --out "$(HD_SHOTS)/title" --scale 1 --tilemap
+	python3 tools/hd-sheets/paint_sheets.py build --out "$(HD_SHEETS)" --scale $(HD_SCALE) \
+		--shots "$(HD_SHOTS)/moves" "$(HD_SHOTS)/scenes" "$(HD_SHOTS)/special" "$(HD_SHOTS)/m100" "$(HD_SHOTS)/title"
+	@echo ""
+	@echo "hd-sheets: paint over $(HD_SHEETS)/sheets/*.png, then run: make hd-pack"
+
+hd-pack:
+	@[ -f "$(HD_SHEETS)/sheets.json" ] || { echo "hd-pack: no $(HD_SHEETS)/sheets.json; run make hd-sheets first"; exit 2; }
+	python3 tools/hd-sheets/paint_sheets.py cut --sheets "$(HD_SHEETS)" --out "$(HD_PACK)" --name "$${HD_PACK_NAME:-My HD pack}"
+	cargo xtask hdpack check --pack "$(HD_PACK)"
+
+hd-play:
+	@[ -n "$(ROM)" ] || { echo "hd-play: no ROM (set Z2_ROM or ROM=)"; exit 2; }
+	@[ -f "$(HD_PACK)/pack.json" ] || { echo "hd-play: no $(HD_PACK)/pack.json; run make hd-pack first"; exit 2; }
+	cargo run --release -p z2-native -- --rom "$(ROM)" --hd-pack "$(HD_PACK)" --hd-scale $(HD_SCALE) --widescreen 16:9 $(ARGS)
 
 clean:
 	cargo clean

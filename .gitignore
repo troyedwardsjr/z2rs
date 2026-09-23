@@ -40,3 +40,9 @@ hdpack-templates/
 .z2rs-data/
 **/TEMPLATE-ROM-DERIVED.txt
 **/hdpack-seen.json
+**/SHEETS-ROM-DERIVED.txt
+**/sheets.json
+**/paintover-report.txt
+**/build-report.txt
+**/cut-report.txt
+.env.local

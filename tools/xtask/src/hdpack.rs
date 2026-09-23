@@ -518,6 +518,39 @@ fn check(args: &[String]) -> i32 {
             println!("    page {page:2}: {d:3} default, {v:3} variant");
         }
     }
+    if pack.sprite_alpha_art() {
+        println!(
+            "  sprite_alpha \"art\": sprite cells keep their own shape (largest vertical bleed {} px)",
+            pack.max_bleed_v()
+        );
+    }
+    if !pack.layers().is_empty() {
+        println!("  {} layer(s), drawn in this order:", pack.layers().len());
+    }
+    for layer in pack.layers() {
+        let any = "any".to_string();
+        let when = |v: Option<u8>| v.map_or(any.clone(), |v| v.to_string());
+        let sheet = usize::from(layer.sheet);
+        println!(
+            "    {} ({}x{}): {:?} at ({}, {}), scroll {}%{}{}; world {}, region {}, scene {}",
+            pack.sheet_file(sheet).unwrap_or("?"),
+            pack.sheets()[sheet].width,
+            pack.sheets()[sheet].height,
+            layer.depth,
+            layer.x,
+            layer.y,
+            layer.scroll,
+            if layer.repeat_x { ", repeats" } else { "" },
+            if layer.over_tiles.is_empty() {
+                String::new()
+            } else {
+                format!(", over {} tile(s)", layer.over_tiles.len())
+            },
+            when(layer.world),
+            when(layer.region),
+            when(layer.scene)
+        );
+    }
     EXIT_OK
 }
 

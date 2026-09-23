@@ -58,7 +58,7 @@ make run-web        # build the wasm bundle and serve it on :8080
 | [guide/desktop.md](guide/desktop.md) | every key, save-state slots, command-line flags, the config file, gamepads |
 | [guide/browser.md](guide/browser.md) | the web build, its URL parameters, optional features and bundle size |
 | [guide/co-op.md](guide/co-op.md) | two Links locally or online, widescreen, how both work and what they cannot do |
-| [guide/hd-packs.md](guide/hd-packs.md) | making a pack from your own ROM's graphics and playing with it |
+| [guide/hd-packs.md](guide/hd-packs.md) | making a pack by painting over spritesheets of the game (`make hd-sheets`, `make hd-pack`) and playing with it |
 | [guide/development.md](guide/development.md) | repository layout, headless runs, and how the port is checked against the original |
 
 ## Contributing and legal

@@ -164,6 +164,8 @@ pub(crate) fn empty_manifest(name: &str, scale: u32) -> PackManifest {
         palette: None,
         sheets: Vec::new(),
         tiles: Vec::new(),
+        sprite_alpha: None,
+        layers: Vec::new(),
         groups: None,
     }
 }

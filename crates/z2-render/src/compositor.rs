@@ -43,11 +43,30 @@
 //!   window pixels 248..256 alone and they keep the pack's art for that tile
 //!   (or the upscaled original where the pack has none).
 //! * Lines the pack cannot safely improve keep the exact NES image: greyscale
-//!   lines (the greyscale bit rewrites every index), unrecorded lines, and
-//!   mid-line split lines ([`LineRecord::split`] / `pixel_split`), where the
-//!   slot-to-pixel mapping does not hold for the whole line.
+//!   lines (the greyscale bit rewrites every index), unrecorded lines,
+//!   `pixel_split` lines, and [`LineRecord::split`] lines whose fine X moved,
+//!   where the slot-to-pixel mapping does not hold for the whole line.
 //! * Integer arithmetic only, no allocation in [`Compositor::compose`], no
 //!   hash iteration: output is deterministic.
+//!
+//! ## Pack extensions
+//!
+//! A pack with `"sprite_alpha": "art"` or with layers that match the scene
+//! takes a second sprite pass, [`Compositor::replay_sprites_shaped`]: every
+//! NES sprite pixel on the line is first painted back to the true background
+//! (layer, HD cell or NES colour), then the sprites are drawn front to back
+//! with claims kept per *output* pixel. In `art` mode a replaced sprite covers
+//! where its cell is opaque, whatever the NES pattern says, and a cell's
+//! `bleed` is drawn around its box where nothing else claimed the pixel.
+//! `behind` still tests NES background opacity.
+//!
+//! Layers ([`crate::pack::Layer`]) are sampled at
+//! `window_x * scale - (x * scale - camera_x * scale * scroll / 100)`: a back
+//! layer shows where the background is transparent (NES pattern 0 with no HD
+//! cell, or a hole in the HD cell), a front layer covers the background.
+//! Split lines have no usable tile identities, so there a back layer shows
+//! where the indexed pixel equals the line's backdrop and front layers are
+//! skipped. A pack without these keys composes exactly as before.
 
 use z2_ppu::record::{BgTileId, FrameRecord, LineRecord, NO_PAGE, RECORD_TILES_PER_LINE};
 use z2_ppu::wide::{
@@ -58,7 +77,7 @@ use z2_ppu::{
     PPUMASK_SHOW_LEFT_SPRITES, PPUMASK_SHOW_SPRITES, WIDTH,
 };
 
-use crate::pack::HdPack;
+use crate::pack::{CellRef, HdPack, LayerDepth, SceneView};
 use crate::palette::MasterPalette;
 use crate::MAX_SCALE;
 
@@ -112,6 +131,9 @@ pub struct ComposeInput<'a> {
     pub margins: Option<&'a Margins>,
     /// Display palette for indexed pixels.
     pub palette: &'a MasterPalette,
+    /// The scene on screen, for the pack's layers. `None` hides every layer
+    /// that names a scene.
+    pub scene: Option<SceneView>,
 }
 
 /// Compose-time failure.
@@ -180,7 +202,55 @@ pub struct Compositor {
     bg_opaque: Vec<bool>,
     /// Scratch: sprite pixel claims per window pixel.
     claimed: Vec<bool>,
+    /// Scratch: sprite claims per output pixel of one line (shaped pass).
+    claimed_out: Vec<bool>,
+    /// Scratch: background slot per source column of one line.
+    col_id: Vec<BgTileId>,
+    /// Scratch: pattern column of that slot per source column.
+    col_sub: Vec<u8>,
+    /// Scratch: NES background opacity per source column.
+    col_opaque: Vec<bool>,
+    /// Scratch: the pack layers shown this frame, in drawing order.
+    layers: Vec<LayerPlan>,
+    /// Scratch: byte offset of each layer's source row for each of the
+    /// `scale` output rows of the current line, or `NO_ROW`.
+    /// Indexed `plan * scale + fy`.
+    layer_rows: Vec<u32>,
+    /// Scratch: indices into `layers` of the back and the front layers, in
+    /// drawing order, so a sample only walks its own depth.
+    back_idx: Vec<u16>,
+    front_idx: Vec<u16>,
+    /// Whether any back / front layer reaches the line `prepare_layer_rows`
+    /// was last called for.
+    line_back: bool,
+    line_front: bool,
 }
+
+/// `layer_rows` entry for "this layer does not reach that output row".
+const NO_ROW: u32 = u32::MAX;
+
+/// Most layers one pack may show at once (scratch is reserved for them).
+pub const MAX_ACTIVE_LAYERS: usize = 64;
+
+/// One active layer with its frame-constant placement already worked out, so
+/// the camera and the `scroll` division stay out of the per-pixel path.
+#[derive(Debug, Clone, Copy)]
+struct LayerPlan {
+    index: u16,
+    sheet: u16,
+    depth: LayerDepth,
+    /// Left edge in HD pixels relative to window x 0, and top edge from the
+    /// top of the screen.
+    left: i32,
+    top: i32,
+    width: i32,
+    height: i32,
+    repeat_x: bool,
+    /// The layer names `over_tiles`, so it needs the column's identity.
+    restricted: bool,
+}
+/// Widest indexed source row (256 plus the widest margins).
+const MAX_SRC_WIDTH: usize = WIDTH + 2 * 8 * MARGIN_SLOTS;
 
 impl Compositor {
     /// Compositor at `scale` with no margins.
@@ -205,6 +275,16 @@ impl Compositor {
             bg_index: vec![0; WIDTH],
             bg_opaque: vec![false; WIDTH],
             claimed: vec![false; WIDTH],
+            claimed_out: vec![false; WIDTH * (MAX_SCALE * MAX_SCALE) as usize],
+            col_id: vec![BgTileId::NONE; MAX_SRC_WIDTH],
+            col_sub: vec![0; MAX_SRC_WIDTH],
+            col_opaque: vec![false; MAX_SRC_WIDTH],
+            layers: Vec::with_capacity(MAX_ACTIVE_LAYERS),
+            layer_rows: vec![NO_ROW; MAX_ACTIVE_LAYERS * MAX_SCALE as usize],
+            back_idx: Vec::with_capacity(MAX_ACTIVE_LAYERS),
+            front_idx: Vec::with_capacity(MAX_ACTIVE_LAYERS),
+            line_back: false,
+            line_front: false,
         };
         me.reconfigure(scale, margin_tiles)?;
         Ok(me)
@@ -295,15 +375,60 @@ impl Compositor {
             None => 1,
         };
 
+        self.layers.clear();
+        if let Some(pack) = input.pack {
+            let ps = pack.scale() as i32;
+            let camera = input.scene.map_or(0, |s| s.camera_x);
+            for (i, layer) in pack.layers().iter().enumerate() {
+                if self.layers.len() >= MAX_ACTIVE_LAYERS || !layer.matches(input.scene.as_ref()) {
+                    continue;
+                }
+                let img = &pack.sheets()[usize::from(layer.sheet)];
+                let travelled =
+                    (i64::from(camera) * i64::from(ps) * i64::from(layer.scroll)).div_euclid(100);
+                self.layers.push(LayerPlan {
+                    index: i as u16,
+                    sheet: layer.sheet,
+                    depth: layer.depth,
+                    left: (i64::from(layer.x) * i64::from(ps) - travelled) as i32,
+                    top: layer.y * ps,
+                    width: img.width as i32,
+                    height: img.height as i32,
+                    repeat_x: layer.repeat_x,
+                    restricted: !layer.over_tiles.is_empty(),
+                });
+            }
+        }
+        self.back_idx.clear();
+        self.front_idx.clear();
+        for (i, plan) in self.layers.iter().enumerate() {
+            match plan.depth {
+                LayerDepth::Back => self.back_idx.push(i as u16),
+                LayerDepth::Front => self.front_idx.push(i as u16),
+            }
+        }
+        let layered = !self.layers.is_empty();
+
         for y in 0..HEIGHT {
             self.upscale_line(&input, y, out);
             let Some(pack) = input.pack else { continue };
             let rec = input.record.line(y);
             if !Self::line_uses_hd(rec) {
+                if layered && rec.valid && rec.mask & PPUMASK_GRAYSCALE == 0 {
+                    self.prepare_layer_rows(pack, step, y);
+                    self.paint_layers_by_index(rec, &input, pack, step, y, out);
+                }
                 continue;
             }
             let hd_bg = self.paint_hd_background(rec, &input, pack, step, y, out);
-            self.replay_sprites(rec, &input, pack, step, y, hd_bg, out);
+            if layered || pack.sprite_alpha_art() {
+                self.resolve_columns(rec, &input, y);
+                self.prepare_layer_rows(pack, step, y);
+                let painted = layered && self.paint_layers(rec, &input, pack, step, y, out);
+                self.replay_sprites_shaped(rec, &input, pack, step, y, hd_bg || painted, out);
+            } else {
+                self.replay_sprites(rec, &input, pack, step, y, hd_bg, out);
+            }
         }
         Ok(())
     }
@@ -328,8 +453,17 @@ impl Compositor {
     }
 
     /// Can HD art be applied to this line at all?
+    ///
+    /// A fetch-state write that leaves fine X alone does not disturb the
+    /// slot-to-pixel mapping: every recorded tile still carries the identity
+    /// it was fetched with. Zelda II makes one such write on most sideview
+    /// frames (`$2000` when its frame logic ends, on whatever line that is),
+    /// so refusing those lines showed as a flickering row of original art.
     fn line_uses_hd(rec: &LineRecord) -> bool {
-        rec.valid && rec.mask & PPUMASK_GRAYSCALE == 0 && !rec.split && !rec.pixel_split
+        rec.valid
+            && rec.mask & PPUMASK_GRAYSCALE == 0
+            && !rec.pixel_split
+            && (!rec.split || rec.fine_x == rec.fine_x_end)
     }
 
     /// Tile identity of window pixel `wx`'s slot (window pixels only).
@@ -626,6 +760,479 @@ impl Compositor {
             self.bg_opaque[x] = opaque;
         }
         let _ = y;
+    }
+
+    /// Background slot, pattern column and NES opacity of every source
+    /// column of line `y` (margins included), with the compositor's region
+    /// rules: window pixels and slot 0's leading columns come from the record,
+    /// the rest from the margins.
+    fn resolve_columns(&mut self, rec: &LineRecord, input: &ComposeInput<'_>, y: usize) {
+        let margin_px = (self.src_width.saturating_sub(WIDTH) / 2) as i32;
+        let fine_x = i32::from(rec.fine_x & 7);
+        let show_bg = rec.mask & PPUMASK_SHOW_BG != 0;
+        let show_left_bg = rec.mask & PPUMASK_SHOW_LEFT_BG != 0;
+        let fill_left_clip = input.margins.is_some_and(|m| m.fill_left_clip);
+        let margin_line = input
+            .margins
+            .map(|m| &m.lines[y])
+            .filter(|ml| ml.fill == MarginFill::Tiles);
+        for sx in 0..self.src_width {
+            let wx = sx as i32 - margin_px;
+            let k = (wx + fine_x).div_euclid(8);
+            let sub_x = (wx + fine_x).rem_euclid(8) as u8;
+            let in_window = (0..WIDTH as i32).contains(&wx);
+            let mut id = if in_window || (wx < 0 && k >= 0) {
+                if (0..RECORD_TILES_PER_LINE as i32).contains(&k) {
+                    rec.tiles[k as usize]
+                } else {
+                    BgTileId::NONE
+                }
+            } else {
+                match margin_line {
+                    Some(ml) if wx < 0 => ml.left.get((-1 - k) as usize).copied(),
+                    Some(ml) => ml.right.get((k - 32) as usize).copied(),
+                    None => None,
+                }
+                .unwrap_or(BgTileId::NONE)
+            };
+            // The left 8 window columns the hardware clips show no tile.
+            if !show_bg || (in_window && wx < 8 && !show_left_bg && !fill_left_clip) {
+                id = BgTileId::NONE;
+            }
+            let usable = id.fetched && id.page != NO_PAGE;
+            self.col_id[sx] = if usable { id } else { BgTileId::NONE };
+            self.col_sub[sx] = sub_x;
+            self.col_opaque[sx] =
+                usable && chr_sub(input.chr_rom, id, sub_x).is_some_and(|v| v != 0);
+        }
+    }
+
+    /// Find each layer's source row for every output row of line `y`, once
+    /// per line, so the per-pixel path is a subtraction and an index.
+    fn prepare_layer_rows(&mut self, pack: &HdPack, step: u32, y: usize) {
+        let n = self.scale as usize;
+        let ps = pack.scale() as i32;
+        let (mut back, mut front) = (false, false);
+        for (i, plan) in self.layers.iter().enumerate() {
+            let mut any = false;
+            for fy in 0..n {
+                let ly = y as i32 * ps + (fy as i32) * step as i32 - plan.top;
+                let hit = (0..plan.height).contains(&ly);
+                any |= hit;
+                self.layer_rows[i * n + fy] = if hit {
+                    (ly as u32) * (plan.width as u32) * 4
+                } else {
+                    NO_ROW
+                };
+            }
+            match (any, plan.depth) {
+                (true, LayerDepth::Back) => back = true,
+                (true, LayerDepth::Front) => front = true,
+                _ => {}
+            }
+        }
+        (self.line_back, self.line_front) = (back, front);
+    }
+
+    /// Topmost layer of `depth` opaque at window HD column `hwx` of output
+    /// sub-row `fy`. A front layer restricted by `over_tiles` only counts
+    /// over tile `id`. Needs [`Compositor::prepare_layer_rows`] for the line.
+    #[inline]
+    fn sample_layers(
+        &self,
+        pack: &HdPack,
+        depth: LayerDepth,
+        id: BgTileId,
+        hwx: i32,
+        fy: usize,
+    ) -> Option<[u8; 4]> {
+        let (list, any) = match depth {
+            LayerDepth::Back => (&self.back_idx, self.line_back),
+            LayerDepth::Front => (&self.front_idx, self.line_front),
+        };
+        if !any {
+            return None;
+        }
+        let n = self.scale as usize;
+        list.iter().rev().find_map(|&li| {
+            let i = usize::from(li);
+            let plan = &self.layers[i];
+            let row = self.layer_rows[i * n + fy];
+            if row == NO_ROW {
+                return None;
+            }
+            // A restricted layer needs a known tile; an unfetched slot has none.
+            if plan.restricted {
+                let layer = &pack.layers()[usize::from(plan.index)];
+                if !(id.fetched && layer.covers_tile(id.page, id.tile)) {
+                    return None;
+                }
+            }
+            let mut lx = hwx - plan.left;
+            if plan.repeat_x {
+                lx = lx.rem_euclid(plan.width);
+            } else if lx < 0 || lx >= plan.width {
+                return None;
+            }
+            let at = (row + lx as u32 * 4) as usize;
+            let px = &pack.sheets()[usize::from(plan.sheet)].rgba[at..at + 4];
+            (px[3] != 0).then(|| [px[0], px[1], px[2], px[3]])
+        })
+    }
+
+    /// The background without sprites at output sub-pixel `(fx, fy)` of
+    /// source column `sx`: front layer, HD cell, NES colour, back layer,
+    /// backdrop. Needs [`Compositor::resolve_columns`] and
+    /// [`Compositor::prepare_layer_rows`] for the line.
+    #[allow(clippy::too_many_arguments)]
+    fn background_pixel(
+        &self,
+        rec: &LineRecord,
+        input: &ComposeInput<'_>,
+        pack: &HdPack,
+        cell: Option<CellRef>,
+        step: u32,
+        sx: usize,
+        fx: u32,
+        fy: u32,
+    ) -> [u8; 4] {
+        let ps = pack.scale();
+        let margin_px = (self.src_width.saturating_sub(WIDTH) / 2) as i32;
+        let id = self.col_id[sx];
+        let hwx = (sx as i32 - margin_px) * ps as i32 + (fx * step) as i32;
+        if let Some(px) = self.sample_layers(pack, LayerDepth::Front, id, hwx, fy as usize) {
+            return [px[0], px[1], px[2], 0xFF];
+        }
+        let mut transparent = !self.col_opaque[sx];
+        if let Some(cell) = cell {
+            let px = pack.cell_pixels(cell).pixel(
+                u32::from(self.col_sub[sx]) * ps + fx * step,
+                u32::from(id.fine_y & 7) * ps + fy * step,
+            );
+            if px[3] != 0 {
+                return [px[0], px[1], px[2], 0xFF];
+            }
+            transparent = true;
+        }
+        if !transparent {
+            let sub = chr_sub(input.chr_rom, id, self.col_sub[sx]).unwrap_or(0);
+            return input
+                .palette
+                .rgba(rec.palette_entry(usize::from(id.pal & 3) * 4 + usize::from(sub)));
+        }
+        match self.sample_layers(pack, LayerDepth::Back, id, hwx, fy as usize) {
+            Some(px) => [px[0], px[1], px[2], 0xFF],
+            None => input.palette.rgba(rec.backdrop),
+        }
+    }
+
+    /// HD cell of source column `sx`'s background slot, if the pack has one.
+    fn column_cell(&self, rec: &LineRecord, pack: &HdPack, sx: usize) -> Option<CellRef> {
+        let id = self.col_id[sx];
+        if !id.fetched {
+            return None;
+        }
+        pack.lookup(id.page, id.tile, bg_colors(rec, id.pal))
+    }
+
+    /// Paint the active layers into line `y`. Returns true when a pixel
+    /// changed (the line's sprites then need replaying).
+    fn paint_layers(
+        &mut self,
+        rec: &LineRecord,
+        input: &ComposeInput<'_>,
+        pack: &HdPack,
+        step: u32,
+        y: usize,
+        out: &mut [u8],
+    ) -> bool {
+        let n = self.scale as usize;
+        let any_front = self.line_front;
+        // Skip the line when no layer reaches it.
+        if !any_front && !self.line_back {
+            return false;
+        }
+        let mut painted = false;
+        for sx in 0..self.src_width {
+            let cell = self.column_cell(rec, pack, sx);
+            // A plain opaque NES pixel can only change under a front layer.
+            if !any_front && cell.is_none() && self.col_opaque[sx] {
+                continue;
+            }
+            for fy in 0..n {
+                for fx in 0..n {
+                    let px = self
+                        .background_pixel(rec, input, pack, cell, step, sx, fx as u32, fy as u32);
+                    let dst = ((y * n + fy) * self.out_w + sx * n + fx) * 4;
+                    if out[dst..dst + 4] != px {
+                        out[dst..dst + 4].copy_from_slice(&px);
+                        painted = true;
+                    }
+                }
+            }
+        }
+        painted
+    }
+
+    /// Layers on a line without usable tile identities (a split line): a
+    /// back layer shows where the indexed pixel is the line's backdrop.
+    fn paint_layers_by_index(
+        &self,
+        rec: &LineRecord,
+        input: &ComposeInput<'_>,
+        pack: &HdPack,
+        step: u32,
+        y: usize,
+        out: &mut [u8],
+    ) {
+        let n = self.scale as usize;
+        let ps = pack.scale() as i32;
+        if !self.line_back {
+            return;
+        }
+        let margin_px = (self.src_width.saturating_sub(WIDTH) / 2) as i32;
+        let src = &input.indexed.pixels[y * self.src_width..(y + 1) * self.src_width];
+        for (sx, &idx) in src.iter().enumerate() {
+            if idx != rec.backdrop {
+                continue;
+            }
+            for fy in 0..n {
+                for fx in 0..n {
+                    let hwx = (sx as i32 - margin_px) * ps + (fx as i32) * step as i32;
+                    if let Some(px) =
+                        self.sample_layers(pack, LayerDepth::Back, BgTileId::NONE, hwx, fy)
+                    {
+                        let dst = ((y * n + fy) * self.out_w + sx * n + fx) * 4;
+                        out[dst..dst + 4].copy_from_slice(&[px[0], px[1], px[2], 0xFF]);
+                    }
+                }
+            }
+        }
+    }
+
+    /// Sprite pass for packs with `"sprite_alpha": "art"` or active layers
+    /// (see the module docs). Needs [`Compositor::resolve_columns`].
+    #[allow(clippy::too_many_arguments)]
+    fn replay_sprites_shaped(
+        &mut self,
+        rec: &LineRecord,
+        input: &ComposeInput<'_>,
+        pack: &HdPack,
+        step: u32,
+        y: usize,
+        bg_changed: bool,
+        out: &mut [u8],
+    ) {
+        if rec.mask & PPUMASK_SHOW_SPRITES == 0 {
+            return;
+        }
+        let art = pack.sprite_alpha_art();
+        let reach = if art {
+            usize::from(pack.max_bleed_v())
+        } else {
+            0
+        };
+        let sprites = input.record.sprites_on(y);
+        let hd_cell = |s: &SpriteRef, line: &LineRecord| {
+            (s.page != NO_PAGE)
+                .then(|| pack.lookup(s.page, s.tile, sprite_colors(line, s.pal)))
+                .flatten()
+        };
+        let own = sprites.iter().any(|s| hd_cell(s, rec).is_some());
+        // A neighbouring line's sprite whose bleed reaches this line.
+        let reaching = |d: usize, below: bool| {
+            let ly = if below { y + d } else { y.wrapping_sub(d) };
+            (ly < HEIGHT).then(|| (ly, input.record.line(ly)))
+        };
+        let mut neighbour = false;
+        for d in 1..=reach {
+            for below in [true, false] {
+                let Some((ly, line)) = reaching(d, below) else {
+                    continue;
+                };
+                let edge_row = if below { 0 } else { 7 };
+                neighbour |= input.record.sprites_on(ly).iter().any(|s| {
+                    s.row_in_sprite % 8 == edge_row
+                        && hd_cell(s, line).is_some_and(|c| {
+                            let [_, t, _, b] = c.bleed;
+                            let (top, bottom) = if s.flip_v { (b, t) } else { (t, b) };
+                            usize::from(if below { top } else { bottom }) >= d
+                        })
+                });
+            }
+        }
+        if !bg_changed && !own && !neighbour {
+            return;
+        }
+
+        self.resolve_background_layer(rec, input, y);
+        let n = self.scale as usize;
+        let ps = pack.scale();
+        let margin_px = self.src_width.saturating_sub(WIDTH) / 2;
+        let show_left_spr = rec.mask & PPUMASK_SHOW_LEFT_SPRITES != 0;
+        let right_fill = input.margins.is_some_and(|m| m.fill_right_clip)
+            && right_edge_masked(input.record, y, input.chr_rom);
+        // Columns a sprite may reach on this line: inside the window, not in a
+        // clipped left edge, not in a right edge the margins recovered.
+        let drawable =
+            |x: usize| x < WIDTH && (x >= 8 || show_left_spr) && !(right_fill && x >= WIDTH - 8);
+
+        // 1. Take the baked NES sprites off the line.
+        for s in sprites {
+            let id = sprite_tile_id(s);
+            for dx in 0..8usize {
+                let x = usize::from(s.x) + dx;
+                if !drawable(x) {
+                    continue;
+                }
+                let col = if s.flip_h { 7 - dx } else { dx };
+                if chr_sub(input.chr_rom, id, col as u8).unwrap_or(0) == 0 {
+                    continue;
+                }
+                let sx = x + margin_px;
+                let cell = self.column_cell(rec, pack, sx);
+                for fy in 0..n {
+                    for fx in 0..n {
+                        let px = self.background_pixel(
+                            rec, input, pack, cell, step, sx, fx as u32, fy as u32,
+                        );
+                        let dst = ((y * n + fy) * self.out_w + sx * n + fx) * 4;
+                        out[dst..dst + 4].copy_from_slice(&px);
+                    }
+                }
+            }
+        }
+
+        // 2. Sprite cores, front to back, claiming output pixels.
+        for c in self.claimed_out[..WIDTH * n * n].iter_mut() {
+            *c = false;
+        }
+        for s in sprites {
+            let hd = hd_cell(s, rec);
+            let id = sprite_tile_id(s);
+            for dx in 0..8usize {
+                let x = usize::from(s.x) + dx;
+                if !drawable(x) {
+                    continue;
+                }
+                let col = if s.flip_h { 7 - dx } else { dx };
+                let sub = chr_sub(input.chr_rom, id, col as u8).unwrap_or(0);
+                if sub == 0 && !(art && hd.is_some()) {
+                    continue;
+                }
+                let hidden = s.behind && self.bg_opaque[x];
+                let nes_rgba = input
+                    .palette
+                    .rgba(rec.palette_entry(0x10 + usize::from(s.pal & 3) * 4 + usize::from(sub)));
+                let cellpx = hd.map(|c| pack.cell_pixels(c));
+                // Without art alpha the NES pixel claims its whole block.
+                let block_claim = !(art && hd.is_some());
+                for fy in 0..n {
+                    for fx in 0..n {
+                        let claim = (fy * WIDTH + x) * n + fx;
+                        if self.claimed_out[claim] {
+                            continue;
+                        }
+                        let rgba = match &cellpx {
+                            None => Some(nes_rgba),
+                            Some(cp) => {
+                                let sub_col = fx as u32 * step;
+                                let sub_row = fy as u32 * step;
+                                let hx = col as u32 * ps
+                                    + if s.flip_h { ps - 1 - sub_col } else { sub_col };
+                                let hy = u32::from(s.fine_row & 7) * ps
+                                    + if s.flip_v { ps - 1 - sub_row } else { sub_row };
+                                let px = cp.pixel(hx, hy);
+                                (px[3] != 0).then_some([px[0], px[1], px[2], 0xFF])
+                            }
+                        };
+                        if block_claim || rgba.is_some() {
+                            self.claimed_out[claim] = true;
+                        }
+                        if let (Some(rgba), false) = (rgba, hidden) {
+                            let dst = ((y * n + fy) * self.out_w + (x + margin_px) * n + fx) * 4;
+                            out[dst..dst + 4].copy_from_slice(&rgba);
+                        }
+                    }
+                }
+            }
+        }
+        if !art {
+            return;
+        }
+
+        // 3. Bleed: art around a sprite's box, where nothing claimed the pixel.
+        // A box is found once per line: on the line itself when `y` is inside
+        // it, else on its first row (box below `y`) or last row (box above).
+        let p = ps as i32;
+        for d in 0..=reach {
+            for below in [true, false] {
+                if d == 0 && !below {
+                    continue;
+                }
+                let Some((ly, line)) = reaching(d, below) else {
+                    continue;
+                };
+                for s in input.record.sprites_on(ly) {
+                    let row_in_box = i32::from(s.row_in_sprite % 8);
+                    if d > 0 && row_in_box != if below { 0 } else { 7 } {
+                        continue;
+                    }
+                    let Some(cell) = hd_cell(s, line) else {
+                        continue;
+                    };
+                    if cell.bleed == [0; 4] {
+                        continue;
+                    }
+                    // Screen row of line `y` in the box, then the pattern row.
+                    let q = y as i32 - (ly as i32 - row_in_box);
+                    let prow = if s.flip_v { 7 - q } else { q };
+                    let [bl, bt, br, bb] = cell.bleed.map(i32::from);
+                    if prow < -bt || prow >= 8 + bb {
+                        continue;
+                    }
+                    let (left, right) = if s.flip_h { (br, bl) } else { (bl, br) };
+                    let cp = pack.cell_pixels(cell);
+                    let box_x = i32::from(s.x);
+                    for xi in box_x - left..box_x + 8 + right {
+                        let core = (0..8).contains(&q) && (box_x..box_x + 8).contains(&xi);
+                        if core || xi < 0 || !drawable(xi as usize) {
+                            continue;
+                        }
+                        let x = xi as usize;
+                        if s.behind && self.bg_opaque[x] {
+                            continue;
+                        }
+                        let qx = xi - box_x;
+                        let pcol = if s.flip_h { 7 - qx } else { qx };
+                        for fy in 0..n {
+                            for fx in 0..n {
+                                let claim = (fy * WIDTH + x) * n + fx;
+                                if self.claimed_out[claim] {
+                                    continue;
+                                }
+                                let sub_col = (fx as u32 * step) as i32;
+                                let sub_row = (fy as u32 * step) as i32;
+                                let hx =
+                                    pcol * p + if s.flip_h { p - 1 - sub_col } else { sub_col };
+                                let hy =
+                                    prow * p + if s.flip_v { p - 1 - sub_row } else { sub_row };
+                                let Some(px) = cp.pixel_rel(hx, hy) else {
+                                    continue;
+                                };
+                                if px[3] == 0 {
+                                    continue;
+                                }
+                                self.claimed_out[claim] = true;
+                                let dst =
+                                    ((y * n + fy) * self.out_w + (x + margin_px) * n + fx) * 4;
+                                out[dst..dst + 4].copy_from_slice(&[px[0], px[1], px[2], 0xFF]);
+                            }
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// Fill one NES pixel's `scale x scale` output block with `rgba`.

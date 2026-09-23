@@ -17,6 +17,15 @@
 //!   `8 * scale` square cell in **sheet pixel coordinates**. Explicit entries
 //!   are always registered, even when fully transparent (hides the tile).
 //!
+//! Three optional extensions ride on the same version 1 manifest (older
+//! builds ignore the keys and still show the pack, without them):
+//! - `"sprite_alpha": "art"`: a replaced sprite's silhouette is the cell's own
+//!   alpha instead of the NES sprite's opaque pixels;
+//! - `bleed` on a `tiles[]` entry: art around the cell, for a sprite drawn
+//!   larger than its 8x8 box (needs `"sprite_alpha": "art"`);
+//! - `layers[]`: whole images behind or over the background tiles of one
+//!   scene, anchored to the level or to the screen ([`Layer`]).
+//!
 //! The loader never touches the filesystem: [`HdPack::load`] takes a reader
 //! closure and [`HdPack::from_files`] an in-memory file list (web directory
 //! picker); `crate::fs::load_pack_dir` wraps a native directory.
@@ -68,6 +77,13 @@ pub struct PackManifest {
     pub sheets: Vec<SheetEntry>,
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub tiles: Vec<TileEntry>,
+    /// `"nes"` (default): replaced sprites keep the NES silhouette. `"art"`:
+    /// the cell's own alpha is the silhouette.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sprite_alpha: Option<String>,
+    /// Scene layers, drawn in order (later entries over earlier ones).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub layers: Vec<LayerEntry>,
     /// Free-form artist notes (any JSON object); not interpreted.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub groups: Option<serde_json::Value>,
@@ -108,6 +124,63 @@ pub struct TileEntry {
     /// Reserved for a future brightness hint; accepted and ignored in v1.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub brightness: Option<serde_json::Value>,
+    /// `[left, top, right, bottom]` NES pixels (0..=8 each) of art around the
+    /// cell on the sheet, drawn when the tile is a sprite and the pack sets
+    /// `"sprite_alpha": "art"`. `x`, `y` stay the corner of the 8x8 core.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bleed: Option<Vec<u64>>,
+}
+
+/// One scene layer: a PNG at the pack scale behind or over the background.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerEntry {
+    /// Path relative to `pack.json` (`/` separators, no `..`).
+    pub file: String,
+    /// Scene filter; an absent key matches any value.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub when: Option<LayerWhen>,
+    /// `"back"` (default): shows where the background is transparent.
+    /// `"front"`: covers the background tiles. Sprites are over both.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub depth: Option<String>,
+    /// Left edge in NES pixels: a level position at `scroll` 100, a position
+    /// relative to the NES window's left edge at `scroll` 0.
+    #[serde(default)]
+    pub x: i64,
+    /// Top edge in NES pixels from the top of the screen.
+    #[serde(default)]
+    pub y: i64,
+    /// Percent of the camera's horizontal movement the layer follows,
+    /// 0..=100 (default 100 = fixed to the level).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scroll: Option<u64>,
+    /// Tile the image horizontally.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub repeat_x: bool,
+    /// Front layers only: cover these background tiles and nothing else.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub over_tiles: Vec<OverTile>,
+}
+
+/// `layers[].when`: the scene a layer belongs to.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LayerWhen {
+    /// `$0707`: 0 caves and fields, 1 West towns, 2 East towns, 3-5 palaces.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub world: Option<u64>,
+    /// `$0706`: 0 West, 1 Death Mountain and Maze Island, 2 East.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<u64>,
+    /// `$0561`: scene layout index inside the world.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scene: Option<u64>,
+}
+
+/// `layers[].over_tiles[]` entry.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct OverTile {
+    pub page: u64,
+    pub tile: u64,
 }
 
 /// Reference from a tile entry to a sheet.
@@ -210,6 +283,17 @@ pub enum PackError {
     Palette {
         msg: String,
     },
+    SpriteAlpha {
+        got: String,
+    },
+    Bleed {
+        entry: String,
+        msg: String,
+    },
+    Layer {
+        entry: String,
+        msg: String,
+    },
 }
 
 fn fmt_colors(c: Option<[u8; 3]>) -> String {
@@ -303,6 +387,12 @@ impl fmt::Display for PackError {
                 fmt_colors(*colors)
             ),
             E::Palette { msg } => write!(f, "pack.json palette: {msg}"),
+            E::SpriteAlpha { got } => write!(
+                f,
+                "pack.json: \"sprite_alpha\" is \"{got}\", expected \"nes\" or \"art\""
+            ),
+            E::Bleed { entry, msg } => write!(f, "pack.json {entry}: bleed {msg}"),
+            E::Layer { entry, msg } => write!(f, "pack.json {entry}: {msg}"),
         }
     }
 }
@@ -323,6 +413,74 @@ pub struct CellRef {
     pub solid: bool,
     /// Every pixel is transparent (only possible for explicit `tiles[]` entries).
     pub blank: bool,
+    /// Art around the core, `[left, top, right, bottom]` in NES pixels.
+    pub bleed: [u8; 4],
+}
+
+/// Largest `bleed` value, in NES pixels.
+pub const MAX_BLEED: u8 = 8;
+
+/// Where a [`Layer`] sits relative to the background tiles.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LayerDepth {
+    /// Shows where the background is transparent.
+    Back,
+    /// Covers the background tiles; sprites stay on top.
+    Front,
+}
+
+/// The scene the frontend says is on screen (see README.md).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SceneView {
+    /// `$0707`.
+    pub world: u8,
+    /// `$0706`.
+    pub region: u8,
+    /// `$0561`.
+    pub scene: u8,
+    /// Level pixel at the NES window's left edge.
+    pub camera_x: i32,
+}
+
+/// A validated `layers[]` entry.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer {
+    /// Index into [`HdPack::sheets`].
+    pub sheet: u16,
+    pub depth: LayerDepth,
+    /// Left / top edge in NES pixels.
+    pub x: i32,
+    pub y: i32,
+    /// Percent of the camera movement followed, 0..=100.
+    pub scroll: u8,
+    pub repeat_x: bool,
+    pub world: Option<u8>,
+    pub region: Option<u8>,
+    pub scene: Option<u8>,
+    /// Sorted `(page, tile)` list; empty = no tile restriction.
+    pub over_tiles: Vec<(u8, u8)>,
+}
+
+impl Layer {
+    /// Whether the layer belongs to `scene`. With no scene known only a
+    /// layer without any `when` key matches.
+    #[must_use]
+    pub fn matches(&self, scene: Option<&SceneView>) -> bool {
+        match scene {
+            Some(s) => {
+                self.world.is_none_or(|w| w == s.world)
+                    && self.region.is_none_or(|r| r == s.region)
+                    && self.scene.is_none_or(|c| c == s.scene)
+            }
+            None => self.world.is_none() && self.region.is_none() && self.scene.is_none(),
+        }
+    }
+
+    /// Whether a front layer may cover background tile `(page, tile)`.
+    #[must_use]
+    pub fn covers_tile(&self, page: u8, tile: u8) -> bool {
+        self.over_tiles.is_empty() || self.over_tiles.binary_search(&(page, tile)).is_ok()
+    }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -339,6 +497,8 @@ pub struct CellPixels<'a> {
     x0: u32,
     y0: u32,
     size: u32,
+    /// `[left, top, right, bottom]` bleed in sheet pixels.
+    bleed_px: [u32; 4],
 }
 
 impl<'a> CellPixels<'a> {
@@ -364,6 +524,22 @@ impl<'a> CellPixels<'a> {
         self.sheet.pixel(self.x0 + x, self.y0 + y)
     }
 
+    /// Pixel at `(x, y)` relative to the core's corner, reaching into the
+    /// bleed; `None` outside the cell's art.
+    #[inline]
+    #[must_use]
+    pub fn pixel_rel(&self, x: i32, y: i32) -> Option<[u8; 4]> {
+        let [l, t, r, b] = self.bleed_px;
+        let (w, h) = ((self.size + r) as i32, (self.size + b) as i32);
+        if x < -(l as i32) || y < -(t as i32) || x >= w || y >= h {
+            return None;
+        }
+        Some(
+            self.sheet
+                .pixel((self.x0 as i32 + x) as u32, (self.y0 as i32 + y) as u32),
+        )
+    }
+
     /// Copy the cell out as `size * size * 4` row-major RGBA bytes.
     #[must_use]
     pub fn to_vec(&self) -> Vec<u8> {
@@ -386,6 +562,10 @@ pub struct HdPack {
     groups: Option<serde_json::Value>,
     tile_count: usize,
     variant_count: usize,
+    sprite_alpha_art: bool,
+    layers: Vec<Layer>,
+    /// Largest vertical bleed of any cell, in NES pixels.
+    max_bleed_v: u8,
 }
 
 impl HdPack {
@@ -485,6 +665,16 @@ impl HdPack {
             }
         }
 
+        let sprite_alpha_art = match m.sprite_alpha.as_deref() {
+            None | Some("nes") => false,
+            Some("art") => true,
+            Some(other) => {
+                return Err(PackError::SpriteAlpha {
+                    got: other.to_string(),
+                })
+            }
+        };
+
         let mut images: Vec<RgbaImage> = Vec::new();
         let mut image_files: Vec<String> = Vec::new();
         let mut file_to_image: BTreeMap<String, usize> = BTreeMap::new();
@@ -580,6 +770,7 @@ impl HdPack {
                         y0,
                         solid,
                         blank,
+                        bleed: [0; 4],
                     };
                     let src = format!("{entry} cell {t} (col {}, row {})", t % 16, t / 16);
                     register(&mut reg, (page, t, colors), cref, src)?;
@@ -639,6 +830,18 @@ impl HdPack {
                 });
             }
             let (x0, y0) = (t.x as u32, t.y as u32);
+            let bleed = parse_bleed(t.bleed.as_deref(), &entry)?;
+            let [bl, bt, br, bb] = bleed.map(|v| u32::from(v) * scale);
+            if bl > x0 || bt > y0 || x0 + cell + br > img.width || y0 + cell + bb > img.height {
+                return Err(PackError::Bleed {
+                    entry,
+                    msg: format!(
+                        "{bleed:?} around the cell at x={x0}, y={y0} does not fit inside \"{path}\" \
+                         ({}x{} px)",
+                        img.width, img.height
+                    ),
+                });
+            }
             let (solid, blank) = scan_cell(img, x0, y0, cell);
             let cref = CellRef {
                 sheet: img_idx as u16,
@@ -646,15 +849,107 @@ impl HdPack {
                 y0,
                 solid,
                 blank,
+                bleed,
             };
             let src = format!("{entry} (\"{path}\" x={x0}, y={y0})");
             register(&mut reg, (page, tile, colors), cref, src)?;
         }
 
+        let mut layers = Vec::with_capacity(m.layers.len());
+        for (i, l) in m.layers.iter().enumerate() {
+            let entry = format!("layers[{i}] (\"{}\")", l.file);
+            let path = normalize_rel_path(&l.file).ok_or_else(|| PackError::Path {
+                entry: entry.clone(),
+                path: l.file.clone(),
+            })?;
+            let bad = |msg: String| PackError::Layer {
+                entry: entry.clone(),
+                msg,
+            };
+            let depth = match l.depth.as_deref() {
+                None | Some("back") => LayerDepth::Back,
+                Some("front") => LayerDepth::Front,
+                Some(other) => {
+                    return Err(bad(format!(
+                        "unknown depth \"{other}\" (expected \"back\" or \"front\")"
+                    )))
+                }
+            };
+            let scroll = match l.scroll {
+                None => 100,
+                Some(v) => u8::try_from(v)
+                    .ok()
+                    .filter(|v| *v <= 100)
+                    .ok_or_else(|| bad(format!("scroll {v} out of range (0..=100)")))?,
+            };
+            let coord = |v: i64, name: &str| {
+                i32::try_from(v)
+                    .ok()
+                    .filter(|v| (-65_536..=65_536).contains(v))
+                    .ok_or_else(|| bad(format!("{name} {v} out of range")))
+            };
+            let byte = |v: Option<u64>, name: &str| {
+                v.map(|v| {
+                    u8::try_from(v)
+                        .map_err(|_| bad(format!("when.{name} {v} out of range (0..=255)")))
+                })
+                .transpose()
+            };
+            let when = l.when.unwrap_or_default();
+            if depth == LayerDepth::Back && !l.over_tiles.is_empty() {
+                return Err(bad("\"over_tiles\" needs depth \"front\"".to_string()));
+            }
+            let mut over_tiles = Vec::with_capacity(l.over_tiles.len());
+            for o in &l.over_tiles {
+                let page = check_page(o.page, &entry)?;
+                let tile = u8::try_from(o.tile).map_err(|_| PackError::Tile {
+                    entry: entry.clone(),
+                    got: o.tile,
+                })?;
+                over_tiles.push((page, tile));
+            }
+            over_tiles.sort_unstable();
+            over_tiles.dedup();
+            let img_idx = if let Some(&k) = file_to_image.get(&path) {
+                k
+            } else {
+                if images.len() >= usize::from(u16::MAX) {
+                    return Err(bad("too many distinct image files".to_string()));
+                }
+                let bytes = read(&path).map_err(|reason| PackError::MissingFile {
+                    file: path.clone(),
+                    reason,
+                })?;
+                let mut img = decode_png_rgba(&bytes).map_err(|err| PackError::Png {
+                    file: path.clone(),
+                    err,
+                })?;
+                threshold_alpha(&mut img, alpha_threshold);
+                images.push(img);
+                image_files.push(path.clone());
+                file_to_image.insert(path.clone(), images.len() - 1);
+                images.len() - 1
+            };
+            layers.push(Layer {
+                sheet: img_idx as u16,
+                depth,
+                x: coord(l.x, "x")?,
+                y: coord(l.y, "y")?,
+                scroll,
+                repeat_x: l.repeat_x,
+                world: byte(when.world, "world")?,
+                region: byte(when.region, "region")?,
+                scene: byte(when.scene, "scene")?,
+                over_tiles,
+            });
+        }
+
         let mut index = vec![TileSlot::default(); CHR_PAGES * TILES_PER_PAGE];
         let (mut tile_count, mut variant_count) = (0, 0);
+        let mut max_bleed_v = 0u8;
         // BTreeMap order: None before Some, variants ascending -> already sorted.
         for ((page, tile, colors), (cref, _)) in reg {
+            max_bleed_v = max_bleed_v.max(cref.bleed[1]).max(cref.bleed[3]);
             let slot = &mut index[usize::from(page) * TILES_PER_PAGE + usize::from(tile)];
             match colors {
                 None => {
@@ -680,7 +975,29 @@ impl HdPack {
             groups: m.groups.clone(),
             tile_count,
             variant_count,
+            sprite_alpha_art,
+            layers,
+            max_bleed_v,
         })
+    }
+
+    /// `"sprite_alpha": "art"`: replaced sprites take their silhouette from
+    /// the cell's alpha, and cell `bleed` is drawn.
+    #[must_use]
+    pub fn sprite_alpha_art(&self) -> bool {
+        self.sprite_alpha_art
+    }
+
+    /// Scene layers in drawing order.
+    #[must_use]
+    pub fn layers(&self) -> &[Layer] {
+        &self.layers
+    }
+
+    /// Largest top or bottom `bleed` of any cell, in NES pixels.
+    #[must_use]
+    pub fn max_bleed_v(&self) -> u8 {
+        self.max_bleed_v
     }
 
     #[must_use]
@@ -795,6 +1112,7 @@ impl HdPack {
             x0: cell.x0,
             y0: cell.y0,
             size: 8 * self.scale,
+            bleed_px: cell.bleed.map(|v| u32::from(v) * self.scale),
         }
     }
 }
@@ -826,6 +1144,29 @@ fn check_page(p: u64, entry: &str) -> Result<u8, PackError> {
             entry: entry.to_string(),
             got: p,
         })
+}
+
+/// `bleed`: absent = none, else four values 0..=[`MAX_BLEED`].
+fn parse_bleed(b: Option<&[u64]>, entry: &str) -> Result<[u8; 4], PackError> {
+    let Some(b) = b else { return Ok([0; 4]) };
+    let bad = |msg: String| PackError::Bleed {
+        entry: entry.to_string(),
+        msg,
+    };
+    if b.len() != 4 {
+        return Err(bad(format!(
+            "has {} values, expected [left, top, right, bottom]",
+            b.len()
+        )));
+    }
+    let mut out = [0u8; 4];
+    for (o, &v) in out.iter_mut().zip(b) {
+        *o = u8::try_from(v)
+            .ok()
+            .filter(|v| *v <= MAX_BLEED)
+            .ok_or_else(|| bad(format!("value {v} out of range (0..={MAX_BLEED})")))?;
+    }
+    Ok(out)
 }
 
 fn parse_colors(c: Option<&[u64]>, entry: &str) -> Result<Option<[u8; 3]>, PackError> {

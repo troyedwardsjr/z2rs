@@ -149,6 +149,7 @@ fn compose(
             pack,
             margins,
             palette: &MasterPalette::NES,
+            scene: None,
         },
         &mut out,
     )
@@ -207,15 +208,27 @@ fn pack_reproducing_nes_art_is_pixel_identical() {
     let chr_bg = chr[usize::from(BG_PAGE) * CHR_BANK_LEN..].to_vec();
     let chr_spr = chr[usize::from(SPR_PAGE) * CHR_BANK_LEN..].to_vec();
 
-    for scale in [1u32, 2] {
+    // The plain pack takes the original sprite pass; `"sprite_alpha": "art"`
+    // and a layer that draws nothing each send every line through the shaped
+    // pass instead, which must reproduce the same hardware mux.
+    let variants = [
+        "",
+        ",\"sprite_alpha\":\"art\"",
+        ",\"layers\":[{\"file\":\"none.png\"}]",
+    ];
+    for (scale, extra) in [1u32, 2].into_iter().flat_map(|s| variants.map(|v| (s, v))) {
         let bg_sheet = paint_page_sheet(&chr_bg, scale, |_| Some(bg3));
         let spr_sheet = paint_page_sheet(&chr_spr, scale, |_| Some(spr3));
         let json = format!(
             "{{\"version\":1,\"name\":\"nes\",\"scale\":{scale},\"sheets\":[\
-             {{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\",\"page\":{SPR_PAGE}}}]}}"
+             {{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\",\"page\":{SPR_PAGE}}}]{extra}}}"
         );
         let pack = HdPack::from_files(&[
             ("pack.json".to_string(), json.into_bytes()),
+            (
+                "none.png".to_string(),
+                common::solid_png(4, 4, [0, 0, 0, 0]),
+            ),
             (
                 "bg.png".to_string(),
                 encode_png_rgba(bg_sheet.width, bg_sheet.height, &bg_sheet.rgba, &[]).unwrap(),
@@ -243,7 +256,10 @@ fn pack_reproducing_nes_art_is_pixel_identical() {
             .enumerate()
             .find(|(_, (a, b))| a != b)
             .map(|(i, _)| (i % (WIDTH * scale as usize), i / (WIDTH * scale as usize)));
-        assert_eq!(bad, None, "scale {scale}: first differing pixel (x, y)");
+        assert_eq!(
+            bad, None,
+            "scale {scale}, pack extra '{extra}': first differing pixel (x, y)"
+        );
     }
 }
 
@@ -460,8 +476,11 @@ fn greyscale_and_split_lines_keep_nes_art() {
     let (frame, rec) = frame_and_record(&mut p);
     let mut grey = rec.clone();
     grey.lines[50].mask |= PPUMASK_GRAYSCALE;
+    // A split only costs the line its HD art when fine X moved with it.
     let mut split = rec.clone();
     split.lines[51].split = true;
+    split.lines[51].fine_x_end = split.lines[51].fine_x ^ 3;
+    split.lines[52].split = true;
     const RED: [u8; 4] = [255, 0, 0, 255];
     let pack = build_pack(1, vec![(BG_PAGE, None, Box::new(|_, _, _| RED))]);
     for (label, record) in [("greyscale", &grey), ("split", &split)] {
@@ -483,6 +502,14 @@ fn greyscale_and_split_lines_keep_nes_art() {
         );
         let j = (60 * WIDTH + 100) * 4;
         assert_eq!(&got[j..j + 4], RED.as_slice(), "other lines still get HD");
+        if label == "split" {
+            let k = (52 * WIDTH + 100) * 4;
+            assert_eq!(
+                &got[k..k + 4],
+                RED.as_slice(),
+                "a split that leaves fine X alone still gets HD"
+            );
+        }
     }
 }
 
@@ -576,6 +603,7 @@ fn geometry_and_scale_errors() {
         pack: Some(&pack),
         margins: None,
         palette: &MasterPalette::NES,
+        scene: None,
     };
     assert_eq!(
         c.compose(input, &mut out).unwrap_err(),
@@ -891,4 +919,370 @@ fn widescreen_left_edge_is_hd_with_fine_x() {
             );
         }
     }
+}
+
+// ---------------------------------------------------------------------------
+// Pack extensions: art-shaped sprites, bleed, layers
+// ---------------------------------------------------------------------------
+
+const GREEN: [u8; 4] = [0, 255, 0, 255];
+const BLUE: [u8; 4] = [0, 0, 255, 255];
+const YELLOW: [u8; 4] = [255, 255, 0, 255];
+const PINK: [u8; 4] = [255, 0, 255, 255];
+const CLEAR: [u8; 4] = [0, 0, 0, 0];
+
+/// A `w` x `h` PNG painted per pixel.
+fn png(w: u32, h: u32, paint: impl Fn(u32, u32) -> [u8; 4]) -> Vec<u8> {
+    let rgba: Vec<u8> = (0..h)
+        .flat_map(|y| (0..w).map(move |x| (x, y)))
+        .flat_map(|(x, y)| paint(x, y))
+        .collect();
+    encode_png_rgba(w, h, &rgba, &[]).unwrap()
+}
+
+/// A scale-1 pack from a manifest body (everything after `"scale":1,`).
+fn pack_from(body: &str, files: Vec<(&str, Vec<u8>)>) -> HdPack {
+    let json = format!("{{\"version\":1,\"name\":\"t\",\"scale\":1,{body}}}");
+    let mut list = vec![("pack.json".to_string(), json.into_bytes())];
+    list.extend(files.into_iter().map(|(n, b)| (n.to_string(), b)));
+    HdPack::from_files(&list).expect("pack loads")
+}
+
+fn compose_scene(
+    frame: &z2_ppu::IndexedFrame,
+    record: &FrameRecord,
+    chr: &[u8],
+    pack: &HdPack,
+    scene: Option<z2_render::SceneView>,
+) -> Vec<u8> {
+    let mut c = Compositor::new(1).unwrap();
+    let mut out = vec![0u8; c.rgba_len()];
+    c.compose(
+        ComposeInput {
+            indexed: IndexedView::frame(frame),
+            record,
+            chr_rom: chr,
+            pack: Some(pack),
+            margins: None,
+            palette: &MasterPalette::NES,
+            scene,
+        },
+        &mut out,
+    )
+    .expect("compose");
+    out
+}
+
+fn px(img: &[u8], x: usize, y: usize) -> [u8; 4] {
+    let i = (y * WIDTH + x) * 4;
+    [img[i], img[i + 1], img[i + 2], img[i + 3]]
+}
+
+fn saria(camera_x: i32) -> Option<z2_render::SceneView> {
+    Some(z2_render::SceneView {
+        world: 1,
+        region: 0,
+        scene: 7,
+        camera_x,
+    })
+}
+
+/// `"sprite_alpha": "art"`: the cell's alpha is the silhouette. Art may
+/// cover NES-transparent pixels, and where the art is clear over a NES-opaque
+/// pixel the true background shows, HD cell included.
+#[test]
+fn art_alpha_lets_the_cell_shape_the_sprite() {
+    let chr = chr_image();
+    let mut p = scene(&chr);
+    // SPR_EDGE is opaque in column 0 only.
+    p.set_oam_entry(
+        0,
+        OamEntry {
+            y: 99,
+            tile: SPR_EDGE,
+            attr: 0,
+            x: 100,
+        },
+    );
+    let (frame, rec) = frame_and_record(&mut p);
+    // Art: column 0 clear, columns 1 and 2 green. The background is red.
+    let sprite = png(
+        8,
+        8,
+        |x, _| if (1..=2).contains(&x) { GREEN } else { CLEAR },
+    );
+    let files = |s: &[u8]| {
+        vec![
+            (
+                "bg.png",
+                common::page_sheet_png(1, |_, _, _| [255, 0, 0, 255]),
+            ),
+            ("spr.png", s.to_vec()),
+        ]
+    };
+    let body = |alpha: &str| {
+        format!(
+            "{alpha}\"sheets\":[{{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\"}}],\
+             \"tiles\":[{{\"page\":{SPR_PAGE},\"tile\":{SPR_EDGE},\"sheet\":\"spr.png\",\"x\":0,\"y\":0}}]"
+        )
+    };
+    let red = [255, 0, 0, 255];
+
+    let art = pack_from(&body("\"sprite_alpha\":\"art\","), files(&sprite));
+    assert!(art.sprite_alpha_art());
+    let got = compose_scene(&frame, &rec, &chr, &art, None);
+    assert_eq!(
+        px(&got, 100, 100),
+        red,
+        "clear art over a NES pixel shows the HD background"
+    );
+    assert_eq!(
+        px(&got, 101, 100),
+        GREEN,
+        "art covers a NES-transparent pixel"
+    );
+    assert_eq!(px(&got, 102, 107), GREEN);
+    assert_eq!(px(&got, 103, 100), red);
+    assert_eq!(
+        px(&got, 101, 99),
+        red,
+        "nothing above the box without bleed"
+    );
+
+    let nes = pack_from(&body(""), files(&sprite));
+    assert!(!nes.sprite_alpha_art());
+    let got = compose_scene(&frame, &rec, &chr, &nes, None);
+    assert_eq!(
+        px(&got, 101, 100),
+        red,
+        "default: art stays inside the NES silhouette"
+    );
+}
+
+/// `bleed`: art around the 8x8 box, mirrored with the sprite, and never over
+/// a pixel another sprite's core claimed.
+#[test]
+fn bleed_draws_around_the_box() {
+    let chr = chr_image();
+    // Core green at (2, 1) of a 10x9 sheet; two columns left and one row
+    // above it are blue.
+    let sheet = png(10, 9, |x, y| if x >= 2 && y >= 1 { GREEN } else { BLUE });
+    let body = format!(
+        "\"sprite_alpha\":\"art\",\"sheets\":[{{\"file\":\"spr.png\"}}],\
+         \"tiles\":[{{\"page\":{SPR_PAGE},\"tile\":{SPR_SOLID},\"sheet\":0,\"x\":2,\"y\":1,\
+         \"bleed\":[2,1,0,0]}}]"
+    );
+    let pack = pack_from(&body, vec![("spr.png", sheet)]);
+    assert_eq!(pack.max_bleed_v(), 1);
+
+    let shot = |attr: u8, second: Option<u8>| {
+        let mut p = scene(&chr);
+        p.set_oam_entry(
+            0,
+            OamEntry {
+                y: 99,
+                tile: SPR_SOLID,
+                attr,
+                x: 100,
+            },
+        );
+        if let Some(x) = second {
+            // Lower priority, plain NES art (SPR_EDGE has no cell).
+            p.set_oam_entry(
+                1,
+                OamEntry {
+                    y: 99,
+                    tile: SPR_EDGE,
+                    attr: 0,
+                    x,
+                },
+            );
+        }
+        let (frame, rec) = frame_and_record(&mut p);
+        let bg = px(&upscale(frame.as_slice(), WIDTH, 1), 50, 100);
+        (compose_scene(&frame, &rec, &chr, &pack, None), bg)
+    };
+
+    let (got, bg) = shot(0, None);
+    assert_eq!(px(&got, 100, 100), GREEN);
+    assert_eq!(px(&got, 107, 107), GREEN);
+    assert_eq!(
+        (px(&got, 98, 100), px(&got, 99, 107)),
+        (BLUE, BLUE),
+        "left bleed"
+    );
+    assert_eq!(px(&got, 97, 100), bg);
+    assert_eq!(px(&got, 108, 100), bg, "no right bleed");
+    assert_eq!(
+        (px(&got, 98, 99), px(&got, 107, 99)),
+        (BLUE, BLUE),
+        "top bleed row"
+    );
+    assert_eq!(px(&got, 100, 98), bg, "one row only");
+    assert_eq!(px(&got, 100, 108), bg, "no bottom bleed");
+
+    let (got, bg) = shot(0x40, None);
+    assert_eq!(
+        (px(&got, 108, 100), px(&got, 109, 100)),
+        (BLUE, BLUE),
+        "flip_h moves it right"
+    );
+    assert_eq!(px(&got, 99, 100), bg);
+
+    let (got, bg) = shot(0xC0, None);
+    assert_eq!(
+        px(&got, 100, 108),
+        BLUE,
+        "flip_v moves the top bleed under the box"
+    );
+    assert_eq!(px(&got, 100, 99), bg, "and off the row above it");
+
+    // The second sprite's opaque column sits at x = 99, inside the bleed.
+    let (got, bg) = shot(0, Some(99));
+    assert_ne!(
+        px(&got, 99, 100),
+        BLUE,
+        "a core beats another sprite's bleed"
+    );
+    assert_ne!(px(&got, 99, 100), bg);
+    assert_eq!(px(&got, 98, 100), BLUE);
+}
+
+/// Layers: back shows through transparent background only, front covers
+/// tiles but not sprites, `over_tiles` restricts a front layer, and the
+/// camera, `scroll`, `repeat_x` and `when` place and gate them.
+#[test]
+fn layers_sit_behind_and_over_the_background() {
+    let chr = chr_image();
+    let mut p = scene(&chr);
+    // Transparent background over x 80..104; one TILE_FLAT1 at x 112..120.
+    for row in 0..30u8 {
+        for col in 10..13u8 {
+            p.set_tile(0, col, row, TILE_CLEAR);
+        }
+    }
+    p.set_tile(0, 14, 12, TILE_FLAT1);
+    p.set_oam_entry(
+        0,
+        OamEntry {
+            y: 99,
+            tile: SPR_SOLID,
+            attr: 0,
+            x: 110,
+        },
+    );
+    let (frame, rec) = frame_and_record(&mut p);
+    let flat = upscale(frame.as_slice(), WIDTH, 1);
+    let (solid, backdrop, sprite) = (px(&flat, 50, 50), px(&flat, 90, 50), px(&flat, 112, 102));
+    assert_ne!(solid, backdrop);
+
+    let files = || {
+        vec![
+            ("back.png", common::solid_png(32, 240, YELLOW)),
+            ("front.png", common::solid_png(16, 8, PINK)),
+            (
+                "stripes.png",
+                png(4, 240, |x, _| if x < 2 { BLUE } else { CLEAR }),
+            ),
+        ]
+    };
+    let when = "\"when\":{\"world\":1,\"scene\":7}";
+    let back = |extra: &str| {
+        pack_from(
+            &format!("\"layers\":[{{\"file\":\"back.png\",\"x\":80,{when}{extra}}}]"),
+            files(),
+        )
+    };
+
+    // Back layer, locked to the level.
+    let pack = back("");
+    let got = compose_scene(&frame, &rec, &chr, &pack, saria(0));
+    assert_eq!(
+        px(&got, 90, 50),
+        YELLOW,
+        "shows through transparent background"
+    );
+    assert_eq!(px(&got, 108, 50), solid, "not over an opaque tile");
+    assert_eq!(px(&got, 79, 50), solid);
+    let got = compose_scene(&frame, &rec, &chr, &pack, saria(8));
+    assert_eq!(
+        px(&got, 103, 50),
+        YELLOW,
+        "the camera moved it 8 px left: x 72..104"
+    );
+    let moved = back(",\"scroll\":50");
+    let got = compose_scene(&frame, &rec, &chr, &moved, saria(-40));
+    assert_eq!(px(&got, 99, 50), backdrop, "half speed: x 100..132");
+    assert_eq!(px(&got, 100, 50), YELLOW);
+
+    // `when` gates it.
+    let other = Some(z2_render::SceneView {
+        scene: 8,
+        ..saria(0).unwrap()
+    });
+    for scene in [other, None] {
+        let got = compose_scene(&frame, &rec, &chr, &pack, scene);
+        assert_eq!(
+            px(&got, 90, 50),
+            backdrop,
+            "{scene:?} is not this layer's scene"
+        );
+    }
+    let always = pack_from("\"layers\":[{\"file\":\"back.png\",\"x\":80}]", files());
+    let got = compose_scene(&frame, &rec, &chr, &always, None);
+    assert_eq!(
+        px(&got, 90, 50),
+        YELLOW,
+        "no `when`: shown with no scene known"
+    );
+
+    // repeat_x tiles a 4 px image; its clear half leaves the backdrop.
+    let stripes = pack_from(
+        "\"layers\":[{\"file\":\"stripes.png\",\"repeat_x\":true}]",
+        files(),
+    );
+    let got = compose_scene(&frame, &rec, &chr, &stripes, None);
+    assert_eq!((px(&got, 84, 50), px(&got, 85, 50)), (BLUE, BLUE));
+    assert_eq!((px(&got, 86, 50), px(&got, 87, 50)), (backdrop, backdrop));
+    assert_eq!(px(&got, 88, 50), BLUE);
+
+    // Front layer over x 104..120, y 96..104: covers tiles, not the sprite.
+    let front = |extra: &str| {
+        pack_from(
+            &format!(
+                "\"layers\":[{{\"file\":\"front.png\",\"depth\":\"front\",\"x\":104,\"y\":96{extra}}}]"
+            ),
+            files(),
+        )
+    };
+    let got = compose_scene(&frame, &rec, &chr, &front(""), None);
+    assert_eq!(px(&got, 105, 97), PINK, "covers an opaque tile");
+    assert_eq!(px(&got, 112, 102), sprite, "sprites stay on top");
+    assert_eq!(px(&got, 105, 104), solid, "8 px tall");
+    let over = format!(",\"over_tiles\":[{{\"page\":{BG_PAGE},\"tile\":{TILE_FLAT1}}}]");
+    let got = compose_scene(&frame, &rec, &chr, &front(&over), None);
+    assert_eq!(px(&got, 105, 97), solid, "not over other tiles");
+    assert_eq!(px(&got, 119, 97), PINK, "over the named tile");
+}
+
+/// A split line that moved fine X has no tile identities to trust: a back
+/// layer still shows where the indexed pixel is the backdrop.
+#[test]
+fn back_layer_reaches_split_lines_by_colour() {
+    let chr = chr_image();
+    let mut p = scene(&chr);
+    for row in 0..30u8 {
+        p.set_tile(0, 10, row, TILE_CLEAR);
+    }
+    let (frame, mut rec) = frame_and_record(&mut p);
+    rec.lines[60].split = true;
+    rec.lines[60].fine_x_end = rec.lines[60].fine_x ^ 5;
+    let pack = pack_from(
+        "\"layers\":[{\"file\":\"back.png\"}]",
+        vec![("back.png", common::solid_png(256, 240, YELLOW))],
+    );
+    let got = compose_scene(&frame, &rec, &chr, &pack, None);
+    let flat = upscale(frame.as_slice(), WIDTH, 1);
+    assert_eq!(px(&got, 84, 60), YELLOW);
+    assert_eq!(px(&got, 50, 60), px(&flat, 50, 60));
 }

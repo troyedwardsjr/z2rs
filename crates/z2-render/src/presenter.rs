@@ -24,7 +24,7 @@ use z2_ppu::wide::{render_wide_indexed, wide_width, Margins, WideFrame};
 use z2_ppu::{IndexedFrame, HEIGHT};
 
 use crate::compositor::{ComposeError, ComposeInput, Compositor, IndexedView};
-use crate::pack::HdPack;
+use crate::pack::{HdPack, SceneView};
 use crate::palette::MasterPalette;
 
 /// Presenter configuration.
@@ -65,6 +65,7 @@ pub struct Presenter {
     margins: Margins,
     pack: Option<HdPack>,
     palette: MasterPalette,
+    scene: Option<SceneView>,
     rgba: Vec<u8>,
 }
 
@@ -85,6 +86,7 @@ impl Presenter {
             margins,
             pack: None,
             palette: MasterPalette::NES,
+            scene: None,
             cfg,
         };
         me.resize_buffers();
@@ -142,6 +144,19 @@ impl Presenter {
     /// Override the display palette (a pack's own palette wins when set).
     pub fn set_palette(&mut self, palette: MasterPalette) {
         self.palette = palette;
+    }
+
+    /// Tell the pack's layers which scene is on screen and where the camera
+    /// is, before [`Presenter::present`]. `None` (the default) hides every
+    /// layer that names a scene. Only a pack with `layers` reads it.
+    pub fn set_scene(&mut self, scene: Option<SceneView>) {
+        self.scene = scene;
+    }
+
+    /// Whether the loaded pack has layers, so [`Presenter::set_scene`] matters.
+    #[must_use]
+    pub fn needs_scene(&self) -> bool {
+        self.pack.as_ref().is_some_and(|p| !p.layers().is_empty())
     }
 
     /// Configuration in force.
@@ -237,6 +252,7 @@ impl Presenter {
                     None
                 },
                 palette: &palette,
+                scene: self.scene,
             },
             &mut self.rgba,
         )?;

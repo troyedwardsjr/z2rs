@@ -16,13 +16,23 @@
 //! ```text
 //! article_shots [--rom R] [--movie M] --out DIR [--spec FILE] [--scale S]
 //!               [--main VARIANT] [--survey STEP] [--from F] [--to F]
-//!               [--hd-pack DIR] [--record DIR] [--chrbug]
+//!               [--hd-pack DIR] [--record DIR] [--tilemap] [--states] [--chrbug]
 //! ```
 //!
 //! * `--survey STEP` dumps a plain 256x240 PNG plus a `survey.tsv` row every
 //!   `STEP` reference frames (scouting).
 //! * `--main` picks the variant written as `<name>.png` (default `wide`).
 //! * `--hd-pack` / `--record` load / record an HD pack on the present path.
+//! * `--tilemap` writes `<name>.tilemap.tsv` beside each main capture: which
+//!   `(page, tile, colours)` every presented pixel run and sprite row came
+//!   from, plus `<name>.scene.json` (scene identity and camera) in sideview and
+//!   one `palette.png` (the 64 display colours) for the directory.
+//!   `tools/hd-sheets/paint_sheets.py` lays many of these out as paintable
+//!   spritesheets (`make hd-sheets`).
+//! * `--states` writes each graft's RAM once its frame-0 pokes are in, before
+//!   the scene loads: `<name>.ram` (raw, for `z2-native --headless --snapshot`)
+//!   and `<name>.z2snap` (copy to `<data-dir>/savestateN.z2snap`, then `F7`).
+//!   Loading either makes the game run its own load of that scene.
 //! * `--chrbug` truncates CHR to 64 KiB before the first frame (recreates the
 //!   short-iNES-header "black overworld" bug).
 //!
@@ -46,6 +56,9 @@
 //!   player 1 is hurt);
 //! * `poke=AAAA:VV/@N:AAAA:VV` RAM/WRAM writes at window frame 0 or `N`;
 //!   `dump=AAAA:LEN` hex dump in the log;
+//! * `snap=FILE` loads a `.z2snap` over the graft at window frame 0 exactly
+//!   as `F7` does (RAM and WRAM only), to prove a `--states` file works from
+//!   wherever the reference happens to be;
 //! * `find=edge` / `find=dialog:DELAY` extra captures when a non-Link sprite
 //!   straddles the window's right edge / a dialogue is open;
 //! * `v=a+b` extra variants: `native` (4:3), `w1610`, `w16`, `noclip`.
@@ -184,6 +197,8 @@ struct Shot {
     find: Option<(String, usize)>,
     /// Defer each capture (up to 16 frames) until both Links are drawn.
     need_both: bool,
+    /// `.z2snap` applied at window frame 0, the way `F7` applies one.
+    snap: Option<PathBuf>,
 }
 
 /// RAM (`$0000-$07FF`) or battery WRAM (`$6000-$7FFF`), the two images a
@@ -226,6 +241,7 @@ fn parse_spec(text: &str) -> Result<Vec<Shot>, String> {
             ghost: false,
             burst: (1, 1),
             variants: Vec::new(),
+            snap: None,
             pokes: Vec::new(),
             dumps: Vec::new(),
             find: None,
@@ -287,6 +303,8 @@ fn parse_spec(text: &str) -> Result<Vec<Shot>, String> {
                         k.to_string(),
                         d.parse().map_err(|_| err("bad find delay".into()))?,
                     ));
+                } else if let Some(v) = o.strip_prefix("snap=") {
+                    shot.snap = Some(PathBuf::from(v));
                 } else if let Some(v) = o.strip_prefix("v=") {
                     shot.variants = v.split('+').map(str::to_string).collect();
                 } else {
@@ -302,6 +320,7 @@ fn parse_spec(text: &str) -> Result<Vec<Shot>, String> {
 struct Displays {
     pack: Option<PathBuf>,
     record: Option<PathBuf>,
+    tilemap: bool,
     scale: u32,
     map: HashMap<String, Display>,
 }
@@ -334,6 +353,50 @@ impl Displays {
         Ok(self.map.get_mut(variant).expect("just inserted"))
     }
 
+    /// `dump`, plus the `--tilemap` sidecar for the main capture.
+    fn dump_main(
+        &mut self,
+        variant: &str,
+        emu: &Emu,
+        path: &Path,
+        out: &Path,
+    ) -> Result<(), String> {
+        self.dump(variant, emu, path)?;
+        if self.tilemap {
+            let tiles = self.get(variant)?.settings().wide_tiles;
+            let tsv = path.with_extension("tilemap.tsv");
+            std::fs::write(&tsv, tilemap_tsv(emu, tiles)?)
+                .map_err(|e| format!("write {}: {e}", tsv.display()))?;
+            // The display palette, so tools can redraw CHR art in real colours.
+            let pal = out.join("palette.png");
+            if !pal.exists() {
+                let rgba: Vec<u8> = z2_ppu::NES_PALETTE_RGB
+                    .iter()
+                    .flat_map(|c| [c[0], c[1], c[2], 0xFF])
+                    .collect();
+                let png = z2_render::encode_png_rgba(64, 1, &rgba, &[])
+                    .map_err(|e| format!("palette png: {e}"))?;
+                std::fs::write(&pal, png).map_err(|e| format!("write {}: {e}", pal.display()))?;
+            }
+            // Where a pack layer painted over this capture belongs.
+            if let Some(sc) = emu.game.sideview_scene() {
+                let json = format!(
+                    "{{\"world\": {}, \"region\": {}, \"scene\": {}, \"camera_x\": {}, \
+                     \"margin_px\": {}}}\n",
+                    sc.world,
+                    sc.region,
+                    sc.scene,
+                    sc.camera_x,
+                    u32::from(tiles) * 8
+                );
+                let file = path.with_extension("scene.json");
+                std::fs::write(&file, json)
+                    .map_err(|e| format!("write {}: {e}", file.display()))?;
+            }
+        }
+        Ok(())
+    }
+
     fn dump(&mut self, variant: &str, emu: &Emu, path: &Path) -> Result<(), String> {
         let d = self.get(variant)?;
         let (w, h) = d.size();
@@ -341,6 +404,120 @@ impl Displays {
         let png = z2_render::encode_png_rgba(w, h, &rgba, &[]).map_err(|e| format!("png: {e}"))?;
         std::fs::write(path, png).map_err(|e| format!("write {}: {e}", path.display()))
     }
+}
+
+/// `--tilemap`: the identity of everything the presenter drew, in presented
+/// pixel coordinates at 1x. Background rows are runs of one tile's columns
+/// (`a` = pattern row, `b` = first pattern column, `c` = run length); sprite
+/// rows are one 8-px sprite row each (`a` = pattern row, `b` = row within the
+/// sprite, `c`/`d`/`e` = flip_h / flip_v / tall); a `split` row marks a line
+/// with a mid-line register write. Mirrors `Compositor`'s
+/// region rules, so a straddling slot is split where the compositor splits it.
+fn tilemap_tsv(emu: &Emu, tiles: u8) -> Result<String, String> {
+    use z2_ppu::{BgTileId, MarginFill, Margins, NO_PAGE, RECORD_TILES_PER_LINE};
+    let record = emu
+        .game
+        .frame_record()
+        .ok_or("tilemap: the PPU render record is off")?;
+    let mut margins = Margins::new(tiles);
+    let have_margins = tiles > 0 && emu.game.wide_margins(tiles, &mut margins);
+    let margin_px = i32::from(tiles) * 8;
+    let mut out = String::from("kind\ty\tx\tpage\ttile\tc1\tc2\tc3\ta\tb\tc\td\te\n");
+    for y in 0..240usize {
+        let rec = record.line(y);
+        if !rec.valid {
+            continue;
+        }
+        let fine_x = i32::from(rec.fine_x & 7);
+        // Same rule as `Compositor::line_uses_hd` (greyscale aside).
+        let hd_line = !rec.pixel_split && (!rec.split || rec.fine_x == rec.fine_x_end);
+        if rec.split || rec.pixel_split {
+            // x = 1 when the line still takes HD art; a/b = fine X at the
+            // line's start and end, c/d = split / pixel_split.
+            out.push_str(&format!(
+                "split\t{y}\t{}\t\t\t\t\t\t{}\t{}\t{}\t{}\t\n",
+                u8::from(hd_line),
+                rec.fine_x,
+                rec.fine_x_end,
+                u8::from(rec.split),
+                u8::from(rec.pixel_split)
+            ));
+        }
+        let mut run: Option<(i32, BgTileId, u8, i32)> = None; // (x, id, first col, len)
+        let flush = |run: &mut Option<(i32, BgTileId, u8, i32)>, out: &mut String| {
+            if let Some((x, id, col, len)) = run.take() {
+                let c = z2_render::bg_colors(rec, id.pal);
+                out.push_str(&format!(
+                    "bg\t{y}\t{x}\t{}\t{}\t{}\t{}\t{}\t{}\t{col}\t{len}\t\t\n",
+                    id.page, id.tile, c[0], c[1], c[2], id.fine_y
+                ));
+            }
+        };
+        for ox in 0..(256 + 2 * margin_px) {
+            let wx = ox - margin_px;
+            let k = (wx + fine_x).div_euclid(8);
+            let col = (wx + fine_x).rem_euclid(8) as u8;
+            let id = if (0..256).contains(&wx) || (wx < 0 && k >= 0) {
+                if (0..RECORD_TILES_PER_LINE as i32).contains(&k) {
+                    rec.tiles[k as usize]
+                } else {
+                    BgTileId::NONE
+                }
+            } else if !have_margins || margins.lines[y].fill != MarginFill::Tiles {
+                BgTileId::NONE
+            } else if wx < 0 {
+                margins.lines[y]
+                    .left
+                    .get((-1 - k) as usize)
+                    .copied()
+                    .unwrap_or(BgTileId::NONE)
+            } else {
+                margins.lines[y]
+                    .right
+                    .get((k - 32) as usize)
+                    .copied()
+                    .unwrap_or(BgTileId::NONE)
+            };
+            let usable = hd_line && id.fetched && id.page != NO_PAGE;
+            let extends = matches!(run, Some((x, rid, rcol, len))
+                if usable && rid == id && x + len == ox && i32::from(rcol) + len == i32::from(col));
+            if extends {
+                if let Some(r) = run.as_mut() {
+                    r.3 += 1;
+                }
+            } else {
+                flush(&mut run, &mut out);
+                if usable {
+                    run = Some((ox, id, col, 1));
+                }
+            }
+        }
+        flush(&mut run, &mut out);
+        if !hd_line {
+            continue;
+        }
+        for s in record.sprites_on(y) {
+            if s.page == NO_PAGE {
+                continue;
+            }
+            let c = z2_render::sprite_colors(rec, s.pal);
+            out.push_str(&format!(
+                "spr\t{y}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}\n",
+                margin_px + i32::from(s.x),
+                s.page,
+                s.tile,
+                c[0],
+                c[1],
+                c[2],
+                s.fine_row,
+                s.row_in_sprite,
+                u8::from(s.flip_h),
+                u8::from(s.flip_v),
+                u8::from(s.tall)
+            ));
+        }
+    }
+    Ok(out)
 }
 
 fn facts_row(emu: &Emu) -> String {
@@ -385,6 +562,8 @@ fn run() -> Result<(), String> {
     let mut chrbug = false;
     let mut pack: Option<PathBuf> = None;
     let mut record: Option<PathBuf> = None;
+    let mut tilemap = false;
+    let mut states = false;
     let mut from = 0usize;
     let mut to = usize::MAX;
     let mut it = argv.iter().skip(1);
@@ -401,6 +580,8 @@ fn run() -> Result<(), String> {
             "--chrbug" => chrbug = true,
             "--hd-pack" => pack = Some(PathBuf::from(val()?)),
             "--record" => record = Some(PathBuf::from(val()?)),
+            "--tilemap" => tilemap = true,
+            "--states" => states = true,
             "--from" => from = val()?.parse().map_err(|_| "bad --from")?,
             "--to" => to = val()?.parse().map_err(|_| "bad --to")?,
             other => return Err(format!("unknown flag {other}")),
@@ -460,6 +641,7 @@ fn run() -> Result<(), String> {
     let mut displays = Displays {
         pack,
         record,
+        tilemap,
         scale,
         map: HashMap::new(),
     };
@@ -528,7 +710,7 @@ fn run() -> Result<(), String> {
                 }
                 if found_now {
                     let base = out.join(format!("{}-f{}.png", shot.name, found_at.len()));
-                    displays.dump(&main_variant, &b, &base)?;
+                    displays.dump_main(&main_variant, &b, &base, &out)?;
                     for v in &shot.variants {
                         let p = out.join(format!("{}-f{}.{v}.png", shot.name, found_at.len()));
                         displays.dump(v, &b, &p)?;
@@ -563,7 +745,7 @@ fn run() -> Result<(), String> {
                     };
                     let src: &Emu = if shot.run == 0 { &a } else { &b };
                     let base = out.join(format!("{}{suffix}.png", shot.name));
-                    displays.dump(&main_variant, src, &base)?;
+                    displays.dump_main(&main_variant, src, &base, &out)?;
                     for v in &shot.variants {
                         let p = out.join(format!("{}{suffix}.{v}.png", shot.name));
                         displays.dump(v, src, &p)?;
@@ -617,6 +799,24 @@ fn run() -> Result<(), String> {
                             _ => b.game.wram[usize::from(addr) - 0x6000] = val,
                         }
                     }
+                }
+                if let (0, Some(path)) = (i, &shot.snap) {
+                    let bytes =
+                        std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+                    let snap = z2_verify::snapshot::Snapshot::decode(&bytes)
+                        .map_err(|e| format!("decode {}: {e}", path.display()))?;
+                    app::apply_snapshot_to_game(&mut b.game, &snap)?;
+                }
+                if states && i == 0 {
+                    let ram = out.join(format!("{}.ram", shot.name));
+                    std::fs::write(&ram, b.game.ram())
+                        .map_err(|e| format!("write {}: {e}", ram.display()))?;
+                    let snap = app::snapshot_from_game(&b.game, Vec::new())?
+                        .encode()
+                        .map_err(|e| format!("encode: {e}"))?;
+                    let path = out.join(format!("{}.z2snap", shot.name));
+                    std::fs::write(&path, snap)
+                        .map_err(|e| format!("write {}: {e}", path.display()))?;
                 }
                 let p1 = script_byte(&shot.p1, &track, shot.graft, i);
                 let p2 = script_byte(&shot.p2, &track, shot.graft, i);

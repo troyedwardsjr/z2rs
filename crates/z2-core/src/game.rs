@@ -709,6 +709,14 @@ impl Game {
         true
     }
 
+    /// Scene identity and camera of the last frame when it was sideview
+    /// play, for HD pack layers. `None` otherwise or with the record off.
+    #[cfg(feature = "interp")]
+    #[must_use]
+    pub fn sideview_scene(&self) -> Option<crate::wide_margins::SideviewScene> {
+        crate::wide_margins::sideview_scene(&self.ram, self.frame_record()?)
+    }
+
     /// Margins plus composition into `wide` (centre = `frame` verbatim).
     /// With the record off, `wide` still gets the centre and backdrop
     /// margins (`margins` cleared to backdrop) and the result is false.
