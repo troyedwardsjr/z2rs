@@ -47,6 +47,8 @@ Besides `--rom`, `--movie` and `--config`:
 | `--fill-right-clip on\|off` | paint the 8 columns the overworld masks at x 248 to 255 (default on) |
 | `--margin-sprites on\|off` | draw side-view enemies, townspeople and items that are outside the NES picture into the margins (default on) |
 | `--wide-gameplay on\|off` | with widescreen, enemies spawn and live out in the margins (default on, off with `--movie`; changes the game, so both online players must match) |
+| `--load-state PATH` | load a `.z2snap` save state at startup, the same way `F7` does, before the first frame and before `--movie` starts |
+| `--p2-follow N` | in local co-op movie playback, player 2 repeats player 1's input N frames later (Start and Select are left out) |
 | `--hd-pack DIR` | HD graphics pack (the directory with `pack.json`); `''` turns it off |
 | `--hd-scale N` | output multiplier 1 to 8 (default 1) |
 | `--hd-record DIR` | on exit, write a template pack of the tiles this session drew |

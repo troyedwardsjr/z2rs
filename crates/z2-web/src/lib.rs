@@ -2863,6 +2863,9 @@ mod tests {
             "the page draws objects in the margins"
         );
         let game = |emu: &WebEmu| emu.game.as_ref().unwrap().margin_sprites_enabled();
+        // Wide gameplay changes the game (and the trap-set id) on purpose;
+        // keep it off so only the display observer is measured.
+        emu.set_wide_gameplay(false).unwrap();
         let id_off = trapset_id(emu.game.as_ref().unwrap());
         assert!(!game(&emu), "no observer without widescreen");
         emu.set_widescreen_preset("16:9").unwrap();

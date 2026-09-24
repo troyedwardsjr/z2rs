@@ -75,6 +75,11 @@ pub struct HeadlessArgs {
     pub wide_gameplay: bool,
     /// Enable two-Link co-op so pad 2 drives a second Link.
     pub coop: bool,
+    /// `.z2snap` save state loaded before the first frame (as `F7` does).
+    pub load_state: Option<String>,
+    /// `--p2-follow N`: pad 2 replays the movie's pad 1 `N` frames late
+    /// (same rule as the windowed flag, [`crate::app::follow_pad`]).
+    pub p2_follow: Option<usize>,
     /// Hold this constant byte on pad 2 every frame (co-op only).
     pub p2_hold: Option<u8>,
     /// Pad 2 mirrors pad 1 every frame (co-op only).
@@ -164,6 +169,9 @@ usage: z2-native --headless [--snapshot S] [--movie M] [--frames N] [--dump fact
   --coop          enable two-Link co-op (pad 2 drives a second Link in side-view)
   --p2-hold MASK  hold this pad-2 byte every frame (decimal or 0x..; with --coop)
   --p2-mirror     pad 2 copies pad 1 every frame (with --coop)
+  --p2-follow N   pad 2 replays the movie's pad 1 N frames late, minus Start and
+                  Select (with --coop and --movie)
+  --load-state P  load this .z2snap save state before the first frame (as F7)
   --dump-coop P   write the co-op status JSON here
   --hd-pack DIR   HD graphics pack directory (the one holding pack.json)
   --hd-scale N    output multiplier 1-8 for --dump-present (default 1)
@@ -267,6 +275,13 @@ pub fn parse_headless_args(argv: &[String]) -> Result<ParseOutcome, String> {
                 })?);
             }
             "--p2-mirror" => args.p2_mirror = true,
+            "--load-state" => args.load_state = Some(value_of(&mut it, "--load-state")?),
+            "--p2-follow" => {
+                let raw = value_of(&mut it, "--p2-follow")?;
+                args.p2_follow = Some(raw.parse().map_err(|_| {
+                    format!("--p2-follow expects a frame delay, got '{raw}'\n{HEADLESS_USAGE}")
+                })?);
+            }
             "--dump-coop" => args.dump_coop = Some(value_of(&mut it, "--dump-coop")?),
             "--hd-pack" => args.hd_pack = Some(value_of(&mut it, "--hd-pack")?),
             "--dump-present" => args.dump_present = Some(value_of(&mut it, "--dump-present")?),
@@ -522,6 +537,10 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
     if let Some(img) = &snapshot_ram {
         emu.game.ram.copy_from_slice(img);
     }
+    if let Some(p) = &args.load_state {
+        crate::app::load_state_at_boot(&mut emu, std::path::Path::new(p))
+            .map_err(HeadlessError::Usage)?;
+    }
     // `--sram` / `--snapshot` replaced memory under a possibly live co-op
     // state, so drop the second Link's parked block: it describes RAM that no
     // longer exists. It re-anchors beside player 1 on the next side-view frame.
@@ -664,10 +683,14 @@ fn step_blank(
 
 /// Step exactly one frame with the scripted pad-2 policy.
 fn step_one_frame(emu: &mut crate::app::Emu, pad: u8, args: &HeadlessArgs) -> usize {
+    step_one_frame_p2(emu, pad, args.pad2_for(pad), args)
+}
+
+fn step_one_frame_p2(emu: &mut crate::app::Emu, pad: u8, pad2: u8, args: &HeadlessArgs) -> usize {
     if args.coop {
         // Deliberately `step2` only under `--coop`: the single-pad path must
         // not touch pad 2 even by writing a zero.
-        crate::app::step_frames2(emu, &[(pad, args.pad2_for(pad))], None)
+        crate::app::step_frames2(emu, &[(pad, pad2)], None)
     } else {
         crate::app::step_frames(emu, &[pad], None)
     }
@@ -681,8 +704,12 @@ fn step_track(
     dumps: &mut FrameDumps,
 ) -> Result<usize, HeadlessError> {
     let mut done = 0;
-    for &p in pads {
-        step_one_frame(emu, p, args);
+    for (i, &p) in pads.iter().enumerate() {
+        let p2 = match args.p2_follow {
+            Some(d) => crate::app::follow_pad(pads, i, d),
+            None => args.pad2_for(p),
+        };
+        step_one_frame_p2(emu, p, p2, args);
         done += 1;
         dumps.observe(done, emu)?;
     }

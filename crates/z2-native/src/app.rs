@@ -638,6 +638,22 @@ pub fn step_one2(emu: &mut Emu, pads: (u8, u8), audio: Option<&SharedAudio>) {
 // Movie track loading (oracle-free demo mode)
 // ---------------------------------------------------------------------------
 
+/// Largest `--p2-follow` delay (10 s of frames).
+pub const MAX_P2_FOLLOW: usize = 600;
+
+/// Pad 2 for `--p2-follow`: the movie's pad-1 byte `delay` frames before
+/// frame `frame`, without Start/Select (pad 2 must not pause the game or open
+/// menus). Idle (`0`) until the delay has elapsed.
+#[must_use]
+pub fn follow_pad(movie: &[u8], frame: usize, delay: usize) -> u8 {
+    frame
+        .checked_sub(delay)
+        .and_then(|i| movie.get(i))
+        .map_or(0, |&b| {
+            b & !(z2_core::game::BTN_START | z2_core::game::BTN_SELECT)
+        })
+}
+
 /// Load the player-1 input track from `.fm2` / `.bk2` (by extension).
 ///
 /// Oracle-free demo mode: the bytes just feed [`step_frames`] — no lockstep
@@ -802,6 +818,26 @@ pub fn apply_snapshot_to_game(
     Ok(())
 }
 
+/// Load a `.z2snap` file into `game` (what `--load-state` and `F7` do).
+pub fn load_state_file(game: &mut Game, path: &Path) -> Result<(), String> {
+    let bytes = std::fs::read(path).map_err(|e| format!("read {}: {e}", path.display()))?;
+    let snap = z2_verify::snapshot::Snapshot::decode(&bytes)
+        .map_err(|e| format!("decode {}: {e}", path.display()))?;
+    apply_snapshot_to_game(game, &snap)
+}
+
+/// Blank frames run before `--load-state` applies its file: the game's reset
+/// code clears RAM on its first frames, which would wipe a state loaded at
+/// power-on.
+pub const LOAD_STATE_WARMUP: usize = 30;
+
+/// `--load-state`: run [`LOAD_STATE_WARMUP`] blank frames past reset, then
+/// load `path` as `F7` would.
+pub fn load_state_at_boot(emu: &mut Emu, path: &Path) -> Result<(), String> {
+    step_frames(emu, &[0; LOAD_STATE_WARMUP], None);
+    load_state_file(&mut emu.game, path)
+}
+
 /// Save-state file path for `slot` in `data_dir`.
 pub fn savestate_path(data_dir: &Path, slot: u8) -> PathBuf {
     data_dir.join(format!("savestate{slot}.z2snap"))
@@ -819,11 +855,7 @@ pub fn save_savestate(game: &Game, data_dir: &Path, slot: u8) -> Result<PathBuf,
 
 /// Load `slot` into `game`.
 pub fn load_savestate(game: &mut Game, data_dir: &Path, slot: u8) -> Result<(), String> {
-    let path = savestate_path(data_dir, slot);
-    let bytes = std::fs::read(&path).map_err(|e| format!("read {}: {e}", path.display()))?;
-    let snap = z2_verify::snapshot::Snapshot::decode(&bytes)
-        .map_err(|e| format!("decode {}: {e}", path.display()))?;
-    apply_snapshot_to_game(game, &snap)
+    load_state_file(game, &savestate_path(data_dir, slot))
 }
 
 /// Battery-RAM file name in the data dir.
@@ -1431,6 +1463,9 @@ pub struct NativeArgs {
     pub ice: Option<String>,
     /// `--p2-pad INDEX`: pin player 2 to this gamepad in connection order.
     pub p2_pad: Option<usize>,
+    /// `--p2-follow N`: during movie playback in local co-op, pad 2 replays
+    /// pad 1's input N frames late (see [`follow_pad`]).
+    pub p2_follow: Option<usize>,
     /// `--hd-pack DIR` (overrides the config key; `""` forces the pack off).
     pub hd_pack: Option<String>,
     /// `--hd-scale N` output multiplier (overrides `hd_scale`).
@@ -1445,6 +1480,9 @@ pub struct NativeArgs {
     pub margin_sprites: Option<bool>,
     /// `--wide-gameplay on|off` (overrides `widescreen_gameplay`).
     pub wide_gameplay: Option<bool>,
+    /// `--load-state PATH.z2snap`: loaded at startup exactly as `F7` does,
+    /// before the first frame (and before `--movie` frame 0).
+    pub load_state: Option<String>,
 }
 
 pub const NATIVE_USAGE: &str = "\
@@ -1456,7 +1494,7 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                  [--hd-pack DIR] [--hd-scale N] [--hd-record DIR]
                  [--coop-local] [--coop-host ROOM | --coop-join ROOM]
                  [--signal URL] [--net-mode rollback|lockstep] [--net-delay N]
-                 [--ice SPEC] [--p2-pad INDEX] [--headless ...]
+                 [--ice SPEC] [--p2-pad INDEX] [--p2-follow N] [--headless ...]
   --rom PATH       Zelda II .nes ROM (else config rom_path / $Z2_ROM). Never stored.
   --movie PATH     .fm2/.bk2 demo playback (oracle-free: steps Game, no verify).
   --config PATH    JSON config override (default: <data-dir>/z2-native.json).
@@ -1492,6 +1530,11 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                    credential=... for TURN; 'none' = same machine / LAN only;
                    default: Google STUN (see README.md)
   --p2-pad INDEX   pin player 2 to gamepad INDEX (0-based, connection order).
+  --p2-follow N    with --movie and --coop-local: player 2 replays player 1's
+                   movie input N frames late (0-600; 0 = exact mirror; Start
+                   and Select are dropped). For demo and trailer captures.
+  --load-state P   load this .z2snap save state before the first frame (as F7
+                   does), so a --movie plays from there.
   --headless ...   windowless CI surface (see --headless --help).
 keys P1: Z=A X=B Enter=Start RightShift=Select arrows=dpad
 keys P2: G=A F=B T=Start R=Select W/A/S/D=dpad (local co-op only; see keys_p2)
@@ -1612,7 +1655,20 @@ pub fn parse_native_args(argv: &[String]) -> Result<NativeArgs, String> {
                     )
                 })?);
             }
+            "--p2-follow" => {
+                let raw = native_arg_value(&mut it, "--p2-follow")?;
+                let n: usize = raw.parse().map_err(|_| {
+                    format!("--p2-follow expects a frame delay, got '{raw}'\n{NATIVE_USAGE}")
+                })?;
+                if n > MAX_P2_FOLLOW {
+                    return Err(format!(
+                        "--p2-follow {n} is out of range (0-{MAX_P2_FOLLOW})\n{NATIVE_USAGE}"
+                    ));
+                }
+                out.p2_follow = Some(n);
+            }
             "--hd-pack" => out.hd_pack = Some(native_arg_value(&mut it, "--hd-pack")?),
+            "--load-state" => out.load_state = Some(native_arg_value(&mut it, "--load-state")?),
             "--hd-record" => out.hd_record = Some(native_arg_value(&mut it, "--hd-record")?),
             "--hd-scale" => {
                 let raw = native_arg_value(&mut it, "--hd-scale")?;
@@ -1698,6 +1754,9 @@ pub fn run_windowed(args: &NativeArgs) -> Result<(), String> {
         margin_sprites: display_settings.features(coop).margin_sprites,
     };
     let coop_local = feats.coop && !args.coop.is_online();
+    if args.p2_follow.is_some() && !coop_local {
+        return Err(format!("--p2-follow needs --coop-local\n{NATIVE_USAGE}"));
+    }
 
     // -- emulator -----------------------------------------------------------
     // No-ROM fallback is VISIBLE, never silent: `has_rom=false` renders the
@@ -1724,6 +1783,10 @@ pub fn run_windowed(args: &NativeArgs) -> Result<(), String> {
     let _ = load_sram(&mut emu.game, &data_dir);
     // `load_sram` replaced WRAM under a possibly live co-op state.
     emu.game.coop_reset_area();
+    if let Some(p) = &args.load_state {
+        load_state_at_boot(&mut emu, Path::new(p))?;
+        eprintln!("loaded save state {p}");
+    }
 
     // -- demo movie ----------------------------------------------------------
     let movie_track: Vec<u8> = match &args.movie {
@@ -1982,6 +2045,8 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         pad_order: Vec<gilrs::GamepadId>,
         /// `--p2-pad INDEX`: pin player 2 to this entry of `pad_order`.
         p2_pad: Option<usize>,
+        /// `--p2-follow N`: pad 2 replays the movie's pad 1 N frames late.
+        p2_follow: Option<usize>,
         /// Size the `pixels` texture currently has, so the present path only
         /// calls `resize_buffer` when it actually changes. `(0, 0)` forces a
         /// re-check on the next redraw (used after a ROM drop or a netplay
@@ -2135,12 +2200,19 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         /// Both players' pads for one frame.
         ///
         /// A demo movie overrides player 1 while frames remain; movie files
-        /// carry one port, so player 2 stays idle during playback.
+        /// carry one port, so player 2 stays idle during playback unless
+        /// `--p2-follow` replays player 1's track late.
         fn current_inputs(&mut self) -> (u8, u8) {
             if self.movie_pos < self.movie.len() {
                 let b = self.movie[self.movie_pos];
+                let p2 = match self.p2_follow {
+                    Some(delay) if self.coop_local => {
+                        follow_pad(&self.movie, self.movie_pos, delay)
+                    }
+                    _ => 0,
+                };
                 self.movie_pos += 1;
-                return (b, 0);
+                return (b, p2);
             }
             let kb1 = self.keyboard.pad(&self.config.keys.map);
             let kb2 = if self.coop_local {
@@ -3273,6 +3345,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         active_pad2: None,
         pad_order: Vec::new(),
         p2_pad: args.p2_pad.or(config_p2_pad),
+        p2_follow: args.p2_follow,
         tex_size: (0, 0),
         #[cfg(feature = "netplay")]
         start: Instant::now(),
@@ -3887,6 +3960,45 @@ mod tests {
         let parsed = parse_native_args(&argv("off")).expect("parses");
         assert_eq!(parsed.wide_gameplay, Some(false));
         assert!(parse_native_args(&argv("maybe")).is_err());
+    }
+
+    #[test]
+    fn p2_follow_parses_and_bounds_the_delay() {
+        let argv = |v: &str| {
+            ["z2-native", "--p2-follow", v]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            parse_native_args(&argv("0")).expect("parses").p2_follow,
+            Some(0)
+        );
+        assert_eq!(
+            parse_native_args(&argv("24")).expect("parses").p2_follow,
+            Some(24)
+        );
+        assert!(parse_native_args(&argv("601")).is_err());
+        assert!(parse_native_args(&argv("-1")).is_err());
+        assert_eq!(
+            parse_native_args(&argv("600")).expect("parses").p2_follow,
+            Some(600)
+        );
+    }
+
+    #[test]
+    fn follow_pad_replays_player_one_late_without_start_or_select() {
+        use z2_core::game::{BTN_A, BTN_RIGHT, BTN_SELECT, BTN_START};
+        let movie = [BTN_RIGHT, BTN_RIGHT | BTN_A, BTN_START, BTN_SELECT | BTN_A];
+        // Idle until the delay has elapsed.
+        assert_eq!(follow_pad(&movie, 0, 2), 0);
+        assert_eq!(follow_pad(&movie, 1, 2), 0);
+        assert_eq!(follow_pad(&movie, 2, 2), BTN_RIGHT);
+        assert_eq!(follow_pad(&movie, 3, 2), BTN_RIGHT | BTN_A);
+        // Delay 0 mirrors the current frame; Start/Select never reach pad 2.
+        assert_eq!(follow_pad(&movie, 1, 0), BTN_RIGHT | BTN_A);
+        assert_eq!(follow_pad(&movie, 2, 0), 0);
+        assert_eq!(follow_pad(&movie, 3, 0), BTN_A);
     }
 
     #[test]
