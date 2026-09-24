@@ -75,8 +75,9 @@ impl Peer {
                 RollbackEvent::Running {
                     coop_flags, wram, ..
                 } => {
-                    self.emu = netplay::session_emu(&self.body, 44_100, false, coop_flags, &wram)
-                        .expect("session emulator");
+                    self.emu =
+                        netplay::session_emu(&self.body, 44_100, false, None, coop_flags, &wram)
+                            .expect("session emulator");
                     self.link.started = true;
                 }
                 RollbackEvent::WaitRecommendation { skip_frames } => {
@@ -135,7 +136,9 @@ fn run_pair(raw: &[u8]) {
     let frames: u32 = if cfg!(debug_assertions) { 120 } else { 600 };
     let feats = Features {
         coop: true,
+        wide_gameplay: None,
         record: false,
+        margin_sprites: false,
     };
     let host_emu = app::emu_from_rom_body_with(&body, 44_100, feats).expect("host emulator");
     let guest_emu = app::emu_from_rom_body_with(&body, 44_100, feats).expect("guest emulator");

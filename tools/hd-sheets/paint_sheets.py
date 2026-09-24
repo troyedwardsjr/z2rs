@@ -60,6 +60,7 @@ import numpy as np
 from PIL import Image
 
 MAX_BLEED = 8           # NES pixels; `z2_render::MAX_BLEED`
+MAX_SHEET_PX = 4096     # largest pack sheet the loader accepts, per side
 GUTTER = 6              # NES pixels of ignored space around every slot
 BACKDROP = (28, 28, 34)  # sheet background, never sampled
 
@@ -334,7 +335,10 @@ def build(args):
         tag = names.get(colour_tag(colors), colour_tag(colors))
         name = f"sheets/fig-{tag}.png"
 
-        def draw(i, canvas, x, y, group=group, b=b):
+        def draw(i, canvas, x, y, group=group, b=b, slots=slots):
+            # The whole slot, bleed margin included, is paintable: transparent.
+            sw, sh = slots[i]
+            canvas[y:y + sh * args.scale, x:x + sw * args.scale] = 0
             for dx, dy, page, tile, cols, fh, fv in group[i][0]:
                 art = tile_rgba(chr_rom, palette, page, tile, cols, fh, fv)
                 blit(canvas, art, x + (dx + b) * args.scale, y + (dy + b) * args.scale, args.scale)
@@ -368,6 +372,8 @@ def build(args):
         name = f"sheets/tile-{names.get(tag, tag)}.png"
 
         def draw(i, canvas, x, y, metas=metas):
+            inner = (GUTTER * args.scale, (GUTTER + 16) * args.scale)
+            canvas[y + inner[0]:y + inner[1], x + inner[0]:x + inner[1]] = 0
             for quad, cell in enumerate(metas[i][0]):
                 if blank(cell):
                     continue
@@ -522,21 +528,27 @@ def cut(args):
     if spr_cells:
         slot_px = (8 + 2 * MAX_BLEED) * scale
         core0 = MAX_BLEED * scale
-        per_row = 8
+        # The loader caps a sheet at 4096x4096: fill rows to that width and
+        # start another sheet when one is full.
+        per_row = MAX_SHEET_PX // slot_px
+        per_sheet = per_row * per_row
         items = sorted(spr_cells.items())
-        sheet = np.zeros((-(-len(items) // per_row) * slot_px,
-                          min(len(items), per_row) * slot_px, 4), np.uint8)
-        name = "sheets/sprites.png"
-        for i, ((page, tile, colors), (art, b, _)) in enumerate(items):
-            ox, oy = (i % per_row) * slot_px, (i // per_row) * slot_px
-            sheet[oy:oy + slot_px, ox:ox + slot_px] = art
-            entry = {"page": page, "tile": tile, "sheet": name,
-                     "x": ox + core0, "y": oy + core0, "colors": list(colors)}
-            if any(b):
-                entry["bleed"] = b
-            tiles_out.append(entry)
-        Image.fromarray(sheet, "RGBA").save(os.path.join(args.out, name))
-        out["sheets"].append({"file": name, "layout": "free"})
+        for first in range(0, len(items), per_sheet):
+            chunk = items[first:first + per_sheet]
+            sheet = np.zeros((-(-len(chunk) // per_row) * slot_px,
+                              min(len(chunk), per_row) * slot_px, 4), np.uint8)
+            name = "sheets/sprites.png" if first == 0 else \
+                "sheets/sprites{}.png".format(first // per_sheet)
+            for i, ((page, tile, colors), (art, b, _)) in enumerate(chunk):
+                ox, oy = (i % per_row) * slot_px, (i // per_row) * slot_px
+                sheet[oy:oy + slot_px, ox:ox + slot_px] = art
+                entry = {"page": page, "tile": tile, "sheet": name,
+                         "x": ox + core0, "y": oy + core0, "colors": list(colors)}
+                if any(b):
+                    entry["bleed"] = b
+                tiles_out.append(entry)
+            Image.fromarray(sheet, "RGBA").save(os.path.join(args.out, name))
+            out["sheets"].append({"file": name, "layout": "free"})
         out["sprite_alpha"] = "art"
 
     # The ROM repeats sprite tiles across CHR pages; a cell must follow.

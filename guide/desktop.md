@@ -45,6 +45,8 @@ Besides `--rom`, `--movie` and `--config`:
 | `--p2-pad INDEX` | pin player 2 to a gamepad by connection order |
 | `--fill-left-clip on\|off` | paint the 8 columns the overworld blanks at x 0 to 7 (default on) |
 | `--fill-right-clip on\|off` | paint the 8 columns the overworld masks at x 248 to 255 (default on) |
+| `--margin-sprites on\|off` | draw side-view enemies, townspeople and items that are outside the NES picture into the margins (default on) |
+| `--wide-gameplay on\|off` | with widescreen, enemies spawn and live out in the margins (default on, off with `--movie`; changes the game, so both online players must match) |
 | `--hd-pack DIR` | HD graphics pack (the directory with `pack.json`); `''` turns it off |
 | `--hd-scale N` | output multiplier 1 to 8 (default 1) |
 | `--hd-record DIR` | on exit, write a template pack of the tiles this session drew |
@@ -53,7 +55,7 @@ Besides `--rom`, `--movie` and `--config`:
 
 ## Config file
 
-The same settings live in `<data-dir>/z2-native.json`: `widescreen`, `widescreen_fill_left_clip`, `widescreen_fill_right_clip`, `hd_pack`, `hd_scale`, `hd_record`, `coop_local`, `keys_p2`, `gamepad`, `gamepad_p2`, `gamepad_p2_index`, and a `netplay` object (`mode`, `signal_url`, `input_delay`, `stall_timeout_ms`, `ice_url`, `ice_username`, `ice_credential`). Command-line flags win over the file. Older config files still load, because every newer key has a default.
+The same settings live in `<data-dir>/z2-native.json`: `widescreen`, `widescreen_fill_left_clip`, `widescreen_fill_right_clip`, `widescreen_margin_sprites`, `widescreen_gameplay`, `hd_pack`, `hd_scale`, `hd_record`, `coop_local`, `keys_p2`, `gamepad`, `gamepad_p2`, `gamepad_p2_index`, and a `netplay` object (`mode`, `signal_url`, `input_delay`, `stall_timeout_ms`, `ice_url`, `ice_username`, `ice_credential`). Command-line flags win over the file. Older config files still load, because every newer key has a default.
 
 The data directory is `$XDG_DATA_HOME/z2rs` when `XDG_DATA_HOME` is set. Otherwise it is `~/Library/Application Support/z2rs` on macOS, `%APPDATA%/z2rs` on Windows and `~/.local/share/z2rs` elsewhere. Save states, battery saves and the config file live there. The ROM is never stored there.
 

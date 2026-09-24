@@ -1587,10 +1587,28 @@ fn sv_facing(game: &mut Game) {
 pub fn sv_enemy_spawn(game: &mut Game) {
     let xin = game.cpu.x;
     // LDA $0732,x : STA $00 : LDA $0734,x : STA $01 : LDX $10 : LDY #$01
-    let screen = bus_read(game, 0x0732u16.wrapping_add(u16::from(xin)));
+    let mut screen = bus_read(game, 0x0732u16.wrapping_add(u16::from(xin)));
+    let mut col = bus_read(game, 0x0734u16.wrapping_add(u16::from(xin)));
+    // The room loader's sweep (`JSR LD625` at `$D132`, return `$D134` on the
+    // stack) walks the left column across the fresh screen; only the
+    // streaming spawns during play (the `$D603` gate) move outwards.
+    let sp = usize::from(game.cpu.sp);
+    let ret = u16::from(game.ram[0x100 + ((sp + 1) & 0xFF)])
+        | (u16::from(game.ram[0x100 + ((sp + 2) & 0xFF)]) << 8);
+    if game.wide_game.enabled && xin < 2 && ret != 0xD134 {
+        // Wide gameplay: compare the list against a column pushed outwards
+        // (left for X = 0, right for X = 1) so enemies spawn outside the
+        // margin. `$0732-$0735` themselves stay the ROM's.
+        let (l, r) = crate::wide_gameplay::sideview_spawn_shift(game.wide_game.margin_px);
+        let delta = if xin == 0 {
+            -i16::from(l)
+        } else {
+            i16::from(r)
+        };
+        (screen, col) = crate::wide_gameplay::shift_column(screen, col, delta);
+    }
     lda(game, screen);
     game.ram[0x00] = screen;
-    let col = bus_read(game, 0x0734u16.wrapping_add(u16::from(xin)));
     lda(game, col);
     game.ram[0x01] = col;
     let x = game.ram[0x10];

@@ -293,6 +293,65 @@ fn build_margins_overworld_end_to_end() {
     assert_eq!(ml.right[0].fine_y, 1);
     // Unrecorded lines are backdrop.
     assert_eq!(m.lines[1].fill, MarginFill::Backdrop);
+
+    // The window's edge slots come from the map as well: slot k = wt 41 + k.
+    let ml = &m.lines[0];
+    for (id, wt) in [
+        (ml.edge_left[0], 41),
+        (ml.edge_left[1], 42),
+        (ml.edge_right[0], 72),
+        (ml.edge_right[1], 73),
+    ] {
+        let t = usize::from(order_at(15, (wt / 2) as usize));
+        assert!(id.fetched, "wt {wt}");
+        assert_eq!(id.tile, TILE_MAPPINGS[t][(wt as usize & 1) * 2], "wt {wt}");
+        assert_eq!(id.pal, PALETTE_CODES[t] & 3, "wt {wt}");
+    }
+    assert_eq!(ml.edge_right[1], ml.right[0], "slot 32 is one tile");
+    assert!(
+        !m.lines[1].edge_left[0].fetched,
+        "backdrop lines carry none"
+    );
+
+    // Before Link is placed on the map ($73 below $1E) there is no world
+    // to extend: every line is backdrop and carries no edge identities.
+    for row in [0u8, 0x1D, 0x1E + 75, 0xF0] {
+        ram[usize::from(ADDR_OW_TILE_Y)] = row;
+        assert!(!overworld_position_live(&ram));
+        build_margins(&ram, &wram, &prg, &rec, 8, &mut m);
+        assert!(m.lines.iter().all(|l| l.fill == MarginFill::Backdrop
+            && !l.edge_left[0].fetched
+            && !l.edge_right[1].fetched));
+    }
+    ram[usize::from(ADDR_OW_TILE_Y)] = 0x1E;
+    assert!(overworld_position_live(&ram));
+}
+
+/// Sideview lines leave the edge identities unset, so the edge strips keep
+/// the record's tiles there (side-view uses a two-nametable ring and does
+/// not alias its edge slots).
+#[test]
+fn build_margins_sideview_sets_no_edge_identities() {
+    let prg = synth_prg();
+    let wram = Box::new([0x40u8; 0x2000]);
+    let mut ram = synth_ram(3, 1);
+    ram[usize::from(ADDR_GAME_MODE)] = MODE_SIDEVIEW;
+    let mut rec = FrameRecord::new();
+    rec.lines[100] = line((4 << 12) | (12 << 5) | 3, 0);
+    let mut m = Margins::new(0);
+    // Stale identities from an earlier frame must be cleared.
+    m.lines[100].edge_left = [BgTileId {
+        fetched: true,
+        ..BgTileId::NONE
+    }; 2];
+    m.lines[100].edge_right = [BgTileId {
+        fetched: true,
+        ..BgTileId::NONE
+    }; 2];
+    build_margins(&ram, &wram, &prg, &rec, 11, &mut m);
+    assert_eq!(m.lines[100].fill, MarginFill::Tiles);
+    assert!(m.lines[100].edge_left.iter().all(|id| !id.fetched));
+    assert!(m.lines[100].edge_right.iter().all(|id| !id.fetched));
 }
 
 /// `sideview_scene`: scene identity from RAM, camera from the first

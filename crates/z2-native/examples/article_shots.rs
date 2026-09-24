@@ -347,6 +347,7 @@ impl Displays {
                 } else {
                     None
                 },
+                margin_sprites: false,
             })?;
             self.map.insert(variant.to_string(), d);
         }
@@ -620,7 +621,9 @@ fn run() -> Result<(), String> {
         44_100,
         Features {
             coop: false,
+            wide_gameplay: None,
             record: true,
+            margin_sprites: false,
         },
     )?;
     // Graft target: co-op registered before reset, as the frontends do.
@@ -629,7 +632,9 @@ fn run() -> Result<(), String> {
         44_100,
         Features {
             coop: true,
+            wide_gameplay: None,
             record: true,
+            margin_sprites: false,
         },
     )?;
     if chrbug {
@@ -820,7 +825,16 @@ fn run() -> Result<(), String> {
                 }
                 let p1 = script_byte(&shot.p1, &track, shot.graft, i);
                 let p2 = script_byte(&shot.p2, &track, shot.graft, i);
+                let errors_before = b.game.exec_errors;
                 app::step_one2(&mut b, (p1, p2), None);
+                if b.game.exec_errors != errors_before {
+                    return Err(format!(
+                        "shot {}: interpreter fault at graft frame {} (total faults={})",
+                        shot.name,
+                        i + 1,
+                        b.game.exec_errors
+                    ));
+                }
             }
         }
         if survey > 0 && f >= from && f.is_multiple_of(survey) {
@@ -833,6 +847,13 @@ fn run() -> Result<(), String> {
             break;
         }
         app::step_one(&mut a, track.get(f).copied().unwrap_or(0), None);
+        if a.game.exec_errors != 0 {
+            return Err(format!(
+                "reference: interpreter fault at frame {} (total faults={})",
+                f + 1,
+                a.game.exec_errors
+            ));
+        }
         f += 1;
     }
     if survey > 0 {

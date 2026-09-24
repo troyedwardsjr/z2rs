@@ -41,6 +41,7 @@
 //! are painted from tile identities ([`Margins`]) supplied by a provider.
 
 pub mod golden;
+pub mod margin_sprite;
 pub mod palette;
 pub mod png;
 pub mod record;
@@ -52,6 +53,7 @@ pub use golden::{
     sample_indices, verify_against_oracle, GoldenMismatch, GoldenReport, OracleFrameSource,
     GOLDEN_EVERY_NTH_MOVIE_FRAME,
 };
+pub use margin_sprite::MarginSprite;
 pub use palette::{indexed_to_rgba, NES_PALETTE_RGB};
 pub use png::{encode_indexed_png, encode_indexed_png_wh};
 pub use record::{BgTileId, FrameRecord, LineRecord, SpriteRef, NO_PAGE, RECORD_TILES_PER_LINE};
@@ -69,8 +71,10 @@ pub use state::{
     SPRITE0_HIT_LATENCY, VBLANK_LINE,
 };
 pub use wide::{
-    chr_row, chr_sub, preset_tiles, render_wide_indexed, right_edge_masked, wide_width, MarginFill,
-    MarginLine, Margins, WideFrame, MARGIN_SLOTS, MAX_MARGIN_TILES,
+    chr_row, chr_sub, edge_fill, left_sprite_fill, margin_sprite_on_line, margin_sprite_paints,
+    margin_sprite_rows, preset_tiles, render_wide_indexed, right_edge_masked, wide_bg_tile,
+    wide_width, window_sprite_opaque, EdgeFill, MarginFill, MarginLine, MarginSpriteRow, Margins,
+    WideFrame, MARGIN_SLOTS, MAX_MARGIN_TILES,
 };
 
 /// Visible frame width in pixels.

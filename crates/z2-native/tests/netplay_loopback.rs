@@ -193,7 +193,9 @@ fn rom_games_stay_in_lockstep_over_loopback() {
     let frames: u32 = if cfg!(debug_assertions) { 400 } else { 3_000 };
     let feats = Features {
         coop: true,
+        wide_gameplay: None,
         record: false,
+        margin_sprites: false,
     };
     let host = app::emu_from_rom_body_with(&body, 44_100, feats).expect("host emulator");
     let guest = app::emu_from_rom_body_with(&body, 44_100, feats).expect("guest emulator");

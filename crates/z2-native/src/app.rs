@@ -249,9 +249,13 @@ pub struct Emu {
     /// NES APU synth (PCM source).
     pub apu: z2_apu::Apu,
     /// Identity of the registered ported-routine set, captured **before** any
-    /// co-op traps are added (see [`trapset_id`]). Netplay refuses a peer
+    /// co-op traps are added (see [`trapset_id`]), with the wide-gameplay
+    /// margin folded in ([`session_trapset_id`]). Netplay refuses a peer
     /// whose value differs, so two builds can never silently desync.
     pub trapset_id: u64,
+    /// [`trapset_id`] of the default groups alone, the base
+    /// [`Emu::trapset_id`] is derived from when wide gameplay changes.
+    pub trapset_base: u64,
 }
 
 impl std::fmt::Debug for Emu {
@@ -277,10 +281,20 @@ impl std::fmt::Debug for Emu {
 pub struct Features {
     /// Two-Link co-op (pad 2 drives a second Link in sideview).
     pub coop: bool,
+    /// Wide gameplay margin in tiles per side (`None` = off, the default):
+    /// enemies spawn and live in the widescreen margins
+    /// ([`Game::set_wide_gameplay`]). Changes gameplay, so it is part of the
+    /// netplay identity ([`session_trapset_id`]).
+    pub wide_gameplay: Option<u8>,
     /// Arm the PPU render record. Required by widescreen margins, by HD art
     /// and by pack recording; off otherwise, so the default single-player run
     /// is byte-for-byte the verification path.
     pub record: bool,
+    /// Draw side-view objects the game keeps alive outside the window into
+    /// the widescreen margins ([`Game::set_margin_sprites`]). Registers a
+    /// display-only observer: the game itself runs byte-identically, and the
+    /// observer stays out of [`trapset_id`], so netplay peers may differ.
+    pub margin_sprites: bool,
 }
 
 /// Arm or disarm the PPU render record on an existing emulator.
@@ -297,11 +311,18 @@ pub fn apply_features(emu: &mut Emu, feats: Features) {
     if emu.game.coop_status().is_some() != feats.coop {
         emu.game.set_coop(feats.coop);
     }
+    if emu.game.wide_gameplay_tiles() != feats.wide_gameplay {
+        emu.game.set_wide_gameplay(feats.wide_gameplay);
+        emu.trapset_id = session_trapset_id(emu.trapset_base, feats.wide_gameplay);
+    }
     arm_record(emu, feats.record);
+    emu.game.set_margin_sprites(feats.margin_sprites);
 }
 
 /// Identity of the registered trap set: FNV-1a over every `(addr, name)`
-/// pair, address-sorted so registration order cannot change it.
+/// pair, address-sorted so registration order cannot change it. Display-only
+/// observers ([`z2_core::wide_sprites::is_display_only_trap`]) are left out:
+/// they never change the game, so they must not split peers.
 ///
 /// Netplay compares this between peers. **The algorithm is duplicated in
 /// `z2-web` (`trapset_id` there) and the two must stay identical**, or a
@@ -310,8 +331,12 @@ pub fn apply_features(emu: &mut Emu, feats: Features) {
 /// each crate.
 #[must_use]
 pub fn trapset_id(game: &Game) -> u64 {
-    let mut entries: Vec<(u16, &'static str)> =
-        game.traps.iter().map(|t| (t.addr, t.name)).collect();
+    let mut entries: Vec<(u16, &'static str)> = game
+        .traps
+        .iter()
+        .filter(|t| !z2_core::wide_sprites::is_display_only_trap(t.name))
+        .map(|t| (t.addr, t.name))
+        .collect();
     entries.sort_unstable();
     let mut h: u64 = 0xcbf2_9ce4_8422_2325;
     for (addr, name) in entries {
@@ -328,6 +353,30 @@ pub fn trapset_id(game: &Game) -> u64 {
     }
     h
 }
+
+/// Session identity: [`trapset_id`] with the wide-gameplay margin folded in
+/// (the same FNV-1a continued over `"wide_gameplay"` and the tile count).
+/// `None` leaves the id untouched, so a peer without wide gameplay keeps the
+/// identity it always had.
+///
+/// **Duplicated in `z2-web` (`session_trapset_id` there)**; both are pinned to
+/// [`WIDE_TRAPSET_PIN_VALUE`].
+#[must_use]
+pub fn session_trapset_id(base: u64, wide_tiles: Option<u8>) -> u64 {
+    let Some(tiles) = wide_tiles else {
+        return base;
+    };
+    let mut h = base;
+    for b in b"wide_gameplay".iter().chain(core::iter::once(&tiles)) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Cross-crate pin for [`session_trapset_id`]:
+/// `session_trapset_id(TRAPSET_PIN_VALUE, Some(11))`.
+pub const WIDE_TRAPSET_PIN_VALUE: u64 = 0x1094_c616_9aeb_24b9;
 
 /// Cross-crate pin for [`trapset_id`]: the value both `z2-native` and
 /// `z2-web` must produce for the entries
@@ -391,6 +440,7 @@ pub fn new_emu(audio_rate: u32) -> Emu {
         game: Game::new(),
         apu: z2_apu::Apu::new(crate::audio::clamp_rate(audio_rate)),
         trapset_id: 0,
+        trapset_base: 0,
     }
 }
 
@@ -459,6 +509,11 @@ pub fn emu_from_rom_body_with(
     if feats.coop {
         game.set_coop(true);
     }
+    // Wide gameplay: its own trap pair and the townsfolk PRG patch, also
+    // before `reset`; the margin goes into the session identity.
+    game.set_wide_gameplay(feats.wide_gameplay);
+    let trapset_base = trapset_id;
+    let trapset_id = session_trapset_id(trapset_base, feats.wide_gameplay);
     game.reset();
     let mut apu = z2_apu::Apu::new(crate::audio::clamp_rate(audio_rate));
     apu.install_dmc_source(Box::new(z2_apu::PrgSource::new(
@@ -468,8 +523,10 @@ pub fn emu_from_rom_body_with(
         game,
         apu,
         trapset_id,
+        trapset_base,
     };
     arm_record(&mut emu, feats.record);
+    emu.game.set_margin_sprites(feats.margin_sprites);
     Ok(emu)
 }
 
@@ -1084,6 +1141,10 @@ pub struct DisplaySettings {
     /// the game masked them with an opaque edge sprite (widescreen only;
     /// removes the overworld's black seam at x 248-255).
     pub fill_right_clip: bool,
+    /// Draw side-view enemies, NPCs and items that are outside the window into
+    /// the margins, and the in-window part of those just left of it
+    /// (widescreen only; [`Features::margin_sprites`]).
+    pub margin_sprites: bool,
     /// HD graphics pack directory (the one holding `pack.json`).
     pub pack_dir: Option<PathBuf>,
     /// Write a recorded template pack here when the app exits.
@@ -1106,7 +1167,9 @@ impl DisplaySettings {
     pub fn features(&self, coop: bool) -> Features {
         Features {
             coop,
+            wide_gameplay: None,
             record: self.needs_record(),
+            margin_sprites: self.wide_tiles > 0 && self.margin_sprites,
         }
     }
 }
@@ -1245,6 +1308,7 @@ impl Display {
             // `PresentConfig` carries both edge flags, but the settings can
             // change between `set_config` calls, so re-apply here each frame.
             self.presenter.margins_mut().fill_right_clip = self.settings.fill_right_clip;
+            self.presenter.margins_mut().fill_left_sprites = self.settings.margin_sprites;
             if !game.wide_margins(tiles, self.presenter.margins_mut()) {
                 self.presenter.margins_mut().clear_backdrop();
             }
@@ -1377,12 +1441,18 @@ pub struct NativeArgs {
     pub fill_left_clip: Option<bool>,
     /// `--fill-right-clip on|off` (overrides `widescreen_fill_right_clip`).
     pub fill_right_clip: Option<bool>,
+    /// `--margin-sprites on|off` (overrides `widescreen_margin_sprites`).
+    pub margin_sprites: Option<bool>,
+    /// `--wide-gameplay on|off` (overrides `widescreen_gameplay`).
+    pub wide_gameplay: Option<bool>,
 }
 
 pub const NATIVE_USAGE: &str = "\
 usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                  [--widescreen off|16:10|16:9|N]
                  [--fill-left-clip on|off] [--fill-right-clip on|off]
+                 [--margin-sprites on|off]
+                 [--wide-gameplay on|off]
                  [--hd-pack DIR] [--hd-scale N] [--hd-record DIR]
                  [--coop-local] [--coop-host ROOM | --coop-join ROOM]
                  [--signal URL] [--net-mode rollback|lockstep] [--net-delay N]
@@ -1391,11 +1461,18 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
   --movie PATH     .fm2/.bk2 demo playback (oracle-free: steps Game, no verify).
   --config PATH    JSON config override (default: <data-dir>/z2-native.json).
   --widescreen P   widescreen margins: off | 16:10 (8 tiles/side) | 16:9 (11) | N (0-16).
-                   Scenery only: no sprites in the margins (see README.md).
+                   See README.md.
   --fill-left-clip on|off
                    paint the 8 columns the overworld blanks at x0-7 (default on).
   --fill-right-clip on|off
                    paint the 8 columns the overworld masks at x248-255 (default on).
+  --margin-sprites on|off
+                   draw side-view enemies, NPCs and items outside the window into
+                   the margins (display only; default on).
+  --wide-gameplay on|off
+                   with widescreen, enemies spawn and live out in the margins
+                   (default on, off with --movie; changes gameplay, both netplay
+                   peers must agree).
   --hd-pack DIR    HD graphics pack directory (the one with pack.json); '' = off.
                    Build one with: cargo xtask hdpack template (see README.md).
   --hd-scale N     output multiplier 1-8 (default 1). A pack whose scale N does
@@ -1554,6 +1631,12 @@ pub fn parse_native_args(argv: &[String]) -> Result<NativeArgs, String> {
             "--fill-right-clip" => {
                 out.fill_right_clip = Some(native_on_off(&mut it, "--fill-right-clip")?);
             }
+            "--margin-sprites" => {
+                out.margin_sprites = Some(native_on_off(&mut it, "--margin-sprites")?);
+            }
+            "--wide-gameplay" => {
+                out.wide_gameplay = Some(native_on_off(&mut it, "--wide-gameplay")?);
+            }
             "--help" | "-h" => return Err(NATIVE_USAGE.to_string()),
             other => return Err(format!("unknown flag '{other}'\n{NATIVE_USAGE}")),
         }
@@ -1610,7 +1693,9 @@ pub fn run_windowed(args: &NativeArgs) -> Result<(), String> {
     let display = Display::new(display_settings.clone())?;
     let feats = Features {
         coop,
+        wide_gameplay: resolve_wide_gameplay(args, &config, display_settings.wide_tiles),
         record: display.needs_record(),
+        margin_sprites: display_settings.features(coop).margin_sprites,
     };
     let coop_local = feats.coop && !args.coop.is_online();
 
@@ -1657,9 +1742,15 @@ pub fn run_windowed(args: &NativeArgs) -> Result<(), String> {
     }
     if display_settings.wide_tiles > 0 {
         eprintln!(
-            "widescreen: {} tiles per side. Margins are scenery only — enemies and \
-             projectiles still appear at the original screen edge.",
-            display_settings.wide_tiles
+            "widescreen: {} tiles per side; side-view objects in the margins {}; \
+             wide gameplay {}.",
+            display_settings.wide_tiles,
+            if feats.margin_sprites { "on" } else { "off" },
+            if feats.wide_gameplay.is_some() {
+                "on"
+            } else {
+                "off"
+            }
         );
     }
     if let Some(note) = display.pack_note() {
@@ -1738,6 +1829,9 @@ pub fn resolve_display(
         fill_right_clip: args
             .fill_right_clip
             .unwrap_or(config.widescreen_fill_right_clip),
+        margin_sprites: args
+            .margin_sprites
+            .unwrap_or(config.widescreen_margin_sprites),
         pack_dir: match &args.hd_pack {
             Some(s) => non_empty(s),
             None => config.hd_pack.as_ref().and_then(non_empty),
@@ -1747,6 +1841,24 @@ pub fn resolve_display(
             None => config.hd_record.as_ref().and_then(non_empty),
         },
     })
+}
+
+/// The wide-gameplay margin for an interactive run: the widescreen margin
+/// whenever widescreen is on and wide gameplay is not turned off
+/// (`--wide-gameplay on|off` wins over the `widescreen_gameplay` config key,
+/// default on). `None` without widescreen. A `--movie` playback defaults it
+/// off (it changes gameplay, so the movie would desync) unless
+/// `--wide-gameplay on` asks for it.
+#[must_use]
+pub fn resolve_wide_gameplay(
+    args: &NativeArgs,
+    config: &NativeConfig,
+    wide_tiles: u8,
+) -> Option<u8> {
+    let on = args
+        .wide_gameplay
+        .unwrap_or(config.widescreen_gameplay && args.movie.is_none());
+    (on && wide_tiles > 0).then_some(wide_tiles)
 }
 
 /// Whether this run gives the game a second Link.
@@ -1759,12 +1871,17 @@ pub fn resolve_coop(args: &NativeArgs, config: &NativeConfig) -> bool {
     args.coop.wants_two_links() || (args.coop == CoopMode::Off && config.coop_local)
 }
 
-/// Effective game-affecting features from the CLI and the config file.
+/// Effective game-affecting features from the CLI and the config file
+/// (the interactive defaults: wide gameplay follows widescreen, see
+/// [`resolve_wide_gameplay`]).
 ///
 /// # Errors
 /// Whatever [`resolve_display`] rejects (the record flag depends on it).
 pub fn resolve_features(args: &NativeArgs, config: &NativeConfig) -> Result<Features, String> {
-    Ok(resolve_display(args, config)?.features(resolve_coop(args, config)))
+    let display = resolve_display(args, config)?;
+    let mut feats = display.features(resolve_coop(args, config));
+    feats.wide_gameplay = resolve_wide_gameplay(args, config, display.wide_tiles);
+    Ok(feats)
 }
 
 /// Everything [`run_event_loop`] needs, bundled so the signature stays
@@ -2062,7 +2179,9 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                     let rate = self.config.effective_audio_rate();
                     let feats = Features {
                         coop: coop_flags & z2_net::COOP_TWO_LINKS != 0,
+                        wide_gameplay: self.feats.wide_gameplay,
                         record: self.feats.record,
+                        margin_sprites: self.feats.margin_sprites,
                     };
                     let Some(body) = self.rom_body.clone() else {
                         eprintln!("netplay: no ROM body available to start a session");
@@ -2230,10 +2349,12 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                         body,
                         rate,
                         self.feats.record,
+                        self.feats.wide_gameplay,
                         coop_flags,
                         &wram,
                     ) {
-                        Ok(fresh) => {
+                        Ok(mut fresh) => {
+                            fresh.game.set_margin_sprites(self.feats.margin_sprites);
                             self.emu = fresh;
                             self.tex_size = (0, 0);
                             self.audio.clear();
@@ -3710,6 +3831,84 @@ mod tests {
     }
 
     #[test]
+    fn session_trapset_id_matches_the_cross_crate_pin() {
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11)),
+            WIDE_TRAPSET_PIN_VALUE,
+            "session_trapset_id changed: update z2-web's WIDE_TRAPSET_PIN_VALUE in \
+             lockstep or native and web peers can no longer connect"
+        );
+        // Off leaves the identity alone; margins differ from each other.
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, None),
+            TRAPSET_PIN_VALUE
+        );
+        assert_ne!(
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(8)),
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11))
+        );
+    }
+
+    #[test]
+    fn wide_gameplay_follows_widescreen_and_the_flag() {
+        let config = NativeConfig::default();
+        assert!(config.widescreen_gameplay, "default on");
+        let mut args = NativeArgs::default();
+        assert_eq!(
+            resolve_wide_gameplay(&args, &config, 0),
+            None,
+            "needs widescreen"
+        );
+        assert_eq!(resolve_wide_gameplay(&args, &config, 11), Some(11));
+        args.wide_gameplay = Some(false);
+        assert_eq!(resolve_wide_gameplay(&args, &config, 11), None, "flag wins");
+        let off = NativeConfig {
+            widescreen_gameplay: false,
+            ..NativeConfig::default()
+        };
+        assert_eq!(resolve_wide_gameplay(&NativeArgs::default(), &off, 8), None);
+        args.wide_gameplay = Some(true);
+        assert_eq!(resolve_wide_gameplay(&args, &off, 8), Some(8));
+        let movie = NativeArgs {
+            movie: Some("run.fm2".into()),
+            ..NativeArgs::default()
+        };
+        assert_eq!(
+            resolve_wide_gameplay(&movie, &config, 11),
+            None,
+            "movies replay vanilla"
+        );
+        let argv = |v: &str| {
+            ["z2-native", "--wide-gameplay", v]
+                .iter()
+                .map(|s| (*s).to_string())
+                .collect::<Vec<_>>()
+        };
+        let parsed = parse_native_args(&argv("off")).expect("parses");
+        assert_eq!(parsed.wide_gameplay, Some(false));
+        assert!(parse_native_args(&argv("maybe")).is_err());
+    }
+
+    #[test]
+    fn apply_features_toggles_wide_gameplay_and_the_identity() {
+        let mut emu = new_emu(44_100);
+        emu.trapset_base = TRAPSET_PIN_VALUE;
+        emu.trapset_id = TRAPSET_PIN_VALUE;
+        apply_features(
+            &mut emu,
+            Features {
+                wide_gameplay: Some(11),
+                ..Features::default()
+            },
+        );
+        assert_eq!(emu.game.wide_gameplay_tiles(), Some(11));
+        assert_eq!(emu.trapset_id, WIDE_TRAPSET_PIN_VALUE);
+        apply_features(&mut emu, Features::default());
+        assert_eq!(emu.game.wide_gameplay_tiles(), None);
+        assert_eq!(emu.trapset_id, TRAPSET_PIN_VALUE);
+    }
+
+    #[test]
     fn coop_suffix_reports_the_second_player() {
         use z2_core::coop::CoopStatus;
         let base = CoopStatus {
@@ -3750,12 +3949,16 @@ mod tests {
             &mut emu,
             Features {
                 coop: false,
+                wide_gameplay: None,
                 record: true,
+                margin_sprites: true,
             },
         );
         assert!(emu.game.record_enabled(), "the decoder needs the record");
+        assert!(emu.game.margin_sprites_enabled());
         apply_features(&mut emu, Features::default());
         assert!(!emu.game.record_enabled());
+        assert!(!emu.game.margin_sprites_enabled());
         assert!(emu.game.coop_status().is_none());
     }
 
@@ -3805,6 +4008,7 @@ mod tests {
                     fill_right_clip: true,
                     pack_dir: None,
                     record_dir: None,
+                    margin_sprites: false,
                 })
                 .expect("no pack: cannot fail");
                 assert_eq!(d.size(), present_size_scaled(tiles, scale));
@@ -3837,6 +4041,7 @@ mod tests {
                         fill_right_clip: tiles > 0,
                         pack_dir: None,
                         record_dir: None,
+                        margin_sprites: false,
                     };
                     let feats = settings.features(coop);
                     let mut emu = new_emu_with(44_100, feats);

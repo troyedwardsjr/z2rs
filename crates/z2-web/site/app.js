@@ -202,12 +202,24 @@ function applyUrlParams() {
     try { emu.set_fill_left_clip(on); syncCanvas(); }
     catch (e) { statusNote += `\nfill left edge: ${e}`; }
   }
+  // `?widegame=0` keeps enemies at the original screen edge in widescreen
+  // (wide gameplay, default on; it only acts while widescreen is on).
+  const widegame = q.get('widegame');
+  if (widegame !== null) setWideGameplay(!(widegame === '0' || widegame === 'false'));
   const rclip = q.get('rclip');
   if (rclip !== null) {
     const on = !(rclip === '0' || rclip === 'false');
     $('rclipChk').checked = on;
     try { emu.set_fill_right_clip(on); syncCanvas(); }
     catch (e) { statusNote += `\nfill right edge: ${e}`; }
+  }
+  // `?msprites=0` keeps side-view objects out of the margins (default on).
+  const msprites = q.get('msprites');
+  if (msprites !== null) {
+    const on = !(msprites === '0' || msprites === 'false');
+    $('mspritesChk').checked = on;
+    try { emu.set_margin_sprites(on); syncCanvas(); }
+    catch (e) { statusNote += `\nobjects in margins: ${e}`; }
   }
   // `?scale=2` picks the HD output multiplier (above 1 needs an `hd` bundle).
   const scale = q.get('scale');
@@ -292,6 +304,17 @@ function publishZ2() {
         syncCanvas();
         return emu.fill_right_clip();
       },
+      setMarginSprites: (on) => {
+        emu.set_margin_sprites(!!on);
+        $('mspritesChk').checked = emu.margin_sprites();
+        syncCanvas();
+        return emu.margin_sprites();
+      },
+      // Wide gameplay: enemies spawn and live in the margins (changes
+      // gameplay; acts only while widescreen is on). Returns the margin in
+      // tiles now in effect (0 = off).
+      setWideGameplay: (on) => { setWideGameplay(!!on); return emu.wide_gameplay_tiles(); },
+      wideGameplayTiles: () => emu.wide_gameplay_tiles(),
       setZoom: (z) => { setZoom(Number(z)); return zoom; },
       // HD graphics packs
       hd: {
@@ -813,6 +836,8 @@ function loadRomBytes(buf) {
     emu.set_widescreen_preset($('wideSel').value);
     emu.set_fill_left_clip($('clipChk').checked);
     emu.set_fill_right_clip($('rclipChk').checked);
+    emu.set_margin_sprites($('mspritesChk').checked);
+    emu.set_wide_gameplay($('wideGameChk').checked);
   } catch (e) {
     statusNote += `\nwidescreen: ${e}`;
   }
@@ -1049,6 +1074,20 @@ $('wideSel').addEventListener('change', () => {
   }
 });
 
+function setWideGameplay(on) {
+  $('wideGameChk').checked = !!on;
+  try {
+    emu.set_wide_gameplay(!!on);
+  } catch (e) {
+    setStatus(` · enemies in the margins: ${e}`);
+  }
+}
+
+$('wideGameChk').addEventListener('change', () => {
+  setWideGameplay($('wideGameChk').checked);
+  setStatus(` · enemies in the margins ${$('wideGameChk').checked ? 'on' : 'off'}`);
+});
+
 $('coopChk').addEventListener('change', () => setCoop($('coopChk').checked));
 
 $('clipChk').addEventListener('change', () => {
@@ -1058,6 +1097,16 @@ $('clipChk').addEventListener('change', () => {
     setStatus(` · fill left edge ${$('clipChk').checked ? 'on' : 'off'}`);
   } catch (e) {
     setStatus(` · fill left edge: ${e}`);
+  }
+});
+
+$('mspritesChk').addEventListener('change', () => {
+  try {
+    emu.set_margin_sprites($('mspritesChk').checked);
+    syncCanvas();
+    setStatus(` · objects in margins ${$('mspritesChk').checked ? 'on' : 'off'}`);
+  } catch (e) {
+    setStatus(` · objects in margins: ${e}`);
   }
 });
 

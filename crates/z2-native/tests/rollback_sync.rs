@@ -54,7 +54,9 @@ fn build(body: &[u8]) -> Emu {
         44_100,
         Features {
             coop: true,
+            wide_gameplay: None,
             record: false,
+            margin_sprites: false,
         },
     )
     .expect("emulator builds from the verified ROM")

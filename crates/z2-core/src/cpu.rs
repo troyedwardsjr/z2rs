@@ -609,6 +609,9 @@ pub(crate) fn bus_write(game: &mut Game, addr: u16, val: u8) {
                 z2_ppu::AccessKind::Line,
             );
             game.ppu.oam_dma(&page);
+            // Display only: latch the widescreen margin sprites drawn since
+            // the last DMA (no effect on the game; see `wide_sprites`).
+            crate::wide_sprites::on_oam_dma(game);
             game.cpu.cycles += if game.cpu.cycles & 1 == 1 { 514 } else { 513 };
         }
         0x4016 => game.set_strobe(val),

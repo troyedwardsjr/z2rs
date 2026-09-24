@@ -200,5 +200,13 @@ pub mod town_traps;
 /// Gated behind `interp` with the interpreter (see `cpu`).
 #[cfg(feature = "interp")]
 pub mod traps;
+/// Wide gameplay: enemies spawn and live in the widescreen margins
+/// (optional, off by default, never part of verification).
+#[cfg(feature = "interp")]
+pub mod wide_gameplay;
 /// Widescreen margin provider (level RAM / overworld map decoders).
 pub mod wide_margins;
+/// Widescreen margin sprites: side-view objects outside the window
+/// (display-only `$EF11` observer).
+#[cfg(feature = "interp")]
+pub mod wide_sprites;

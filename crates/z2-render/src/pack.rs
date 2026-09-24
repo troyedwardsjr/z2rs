@@ -174,6 +174,22 @@ pub struct LayerWhen {
     /// `$0561`: scene layout index inside the world.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub scene: Option<u64>,
+    /// Fetched background tile at a fixed NES screen pixel (ANDed with scene).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub background_tile: Option<BackgroundTileSignature>,
+}
+
+/// Screen signature for `layers[].when.background_tile`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackgroundTileSignature {
+    /// NES window coordinates, x 0..=255 and y 0..=239 (not HD pixels).
+    pub x: u64,
+    pub y: u64,
+    pub page: u64,
+    pub tile: u64,
+    /// Optional sub-palette entries 1..=3, each 0..=63.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub colors: Option<[u64; 3]>,
 }
 
 /// `layers[].over_tiles[]` entry.
@@ -457,13 +473,14 @@ pub struct Layer {
     pub world: Option<u8>,
     pub region: Option<u8>,
     pub scene: Option<u8>,
+    pub background_tile: Option<BackgroundTileSignature>,
     /// Sorted `(page, tile)` list; empty = no tile restriction.
     pub over_tiles: Vec<(u8, u8)>,
 }
 
 impl Layer {
-    /// Whether the layer belongs to `scene`. With no scene known only a
-    /// layer without any `when` key matches.
+    /// Whether the scene filters match. The compositor checks the optional
+    /// background signature separately, including when no scene is known.
     #[must_use]
     pub fn matches(&self, scene: Option<&SceneView>) -> bool {
         match scene {
@@ -896,6 +913,20 @@ impl HdPack {
                 .transpose()
             };
             let when = l.when.unwrap_or_default();
+            if let Some(s) = when.background_tile {
+                if s.x >= 256 || s.y >= 240 {
+                    return Err(bad(
+                        "when.background_tile coordinates require x 0..=255, y 0..=239".to_string(),
+                    ));
+                }
+                let signature_entry = format!("{entry}.when.background_tile");
+                check_page(s.page, &signature_entry)?;
+                u8::try_from(s.tile).map_err(|_| PackError::Tile {
+                    entry: signature_entry.clone(),
+                    got: s.tile,
+                })?;
+                parse_colors(s.colors.as_ref().map(|c| c.as_slice()), &signature_entry)?;
+            }
             if depth == LayerDepth::Back && !l.over_tiles.is_empty() {
                 return Err(bad("\"over_tiles\" needs depth \"front\"".to_string()));
             }
@@ -940,6 +971,7 @@ impl HdPack {
                 world: byte(when.world, "world")?,
                 region: byte(when.region, "region")?,
                 scene: byte(when.scene, "scene")?,
+                background_tile: when.background_tile,
                 over_tiles,
             });
         }

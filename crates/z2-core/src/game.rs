@@ -275,6 +275,13 @@ pub struct Game {
     /// Two-player co-op state (off by default; see [`crate::coop`]).
     #[cfg(feature = "interp")]
     pub coop: crate::coop::CoopState,
+    /// Widescreen margin sprites (display only; off by default; see
+    /// [`crate::wide_sprites`]). Not part of any save state.
+    #[cfg(feature = "interp")]
+    pub margin_sprites: crate::wide_sprites::MarginSpriteState,
+    /// Wide-gameplay state (off by default; see [`crate::wide_gameplay`]).
+    #[cfg(feature = "interp")]
+    pub wide_game: crate::wide_gameplay::WideGameplayState,
     pub(crate) pad1: u8,
     /// Pad-2 latch + controller shift state (interp only; the bus is gone
     /// without it, so these fields compile out too).
@@ -332,6 +339,9 @@ impl Game {
             last_exec_error: None,
             #[cfg(feature = "interp")]
             coop: crate::coop::CoopState::default(),
+            #[cfg(feature = "interp")]
+            margin_sprites: crate::wide_sprites::MarginSpriteState::default(),
+            wide_game: crate::wide_gameplay::WideGameplayState::default(),
             pad1: 0,
             #[cfg(feature = "interp")]
             pad2: 0,
@@ -556,6 +566,9 @@ impl Game {
             if self.coop.enabled {
                 crate::coop::end_of_frame(self);
             }
+            if self.wide_game.enabled {
+                crate::wide_gameplay::end_of_frame(self);
+            }
         }
         self.frame_count += 1;
     }
@@ -706,7 +719,62 @@ impl Game {
             return false;
         };
         crate::wide_margins::build_margins(&self.ram, &self.wram, &self.prg, rec, tiles, out);
+        self.margin_sprites_into(&mut out.sprites);
         true
+    }
+
+    /// Turn widescreen margin sprites for side-view objects on or off
+    /// (default off). On registers the display-only `$EF11` observer
+    /// ([`crate::wide_sprites`]); the game runs byte-identically either way.
+    /// Call after the default trap groups. Never called by verification.
+    #[cfg(feature = "interp")]
+    pub fn set_margin_sprites(&mut self, on: bool) {
+        crate::wide_sprites::set_enabled(self, on);
+    }
+
+    /// Whether the side-view margin-sprite observer is on.
+    #[cfg(feature = "interp")]
+    #[must_use]
+    pub fn margin_sprites_enabled(&self) -> bool {
+        self.margin_sprites.enabled
+    }
+
+    /// Side-view objects outside the window latched for the last frame
+    /// (empty while [`Game::set_margin_sprites`] is off).
+    #[cfg(feature = "interp")]
+    #[must_use]
+    pub fn sideview_margin_sprites(&self) -> &[z2_ppu::MarginSprite] {
+        crate::wide_sprites::shown(self)
+    }
+
+    /// **Hook for other margin-sprite providers.** A list drawn after (below)
+    /// the side-view objects by [`Game::wide_margins`] and
+    /// [`Game::compose_wide`]. The provider owns it: clear and refill it once
+    /// per frame, after [`Game::step`]. Display only — never read by the game
+    /// and not part of any save state.
+    #[cfg(feature = "interp")]
+    pub fn margin_sprites_mut(&mut self) -> &mut Vec<z2_ppu::MarginSprite> {
+        &mut self.margin_sprites.extra
+    }
+
+    /// Every margin sprite of the last frame, in priority order: side-view
+    /// objects, wide-gameplay overworld blobs (drawn whenever that mode
+    /// keeps them alive in a margin, since they are real enemies), then
+    /// [`Game::margin_sprites_mut`]'s list. Replaces `out`.
+    #[cfg(feature = "interp")]
+    pub fn margin_sprites_into(&self, out: &mut Vec<z2_ppu::MarginSprite>) {
+        out.clear();
+        out.extend_from_slice(crate::wide_sprites::shown(self));
+        out.extend_from_slice(self.wide_game.shown());
+        out.extend_from_slice(&self.margin_sprites.extra);
+    }
+
+    /// Shadow runs of the margin-sprite observer that failed (zero when
+    /// healthy; a failure only costs that object's margin sprites).
+    #[cfg(feature = "interp")]
+    #[must_use]
+    pub fn margin_sprite_errors(&self) -> u64 {
+        self.margin_sprites.shadow_errors
     }
 
     /// Scene identity and camera of the last frame when it was sideview
@@ -731,11 +799,13 @@ impl Game {
             crate::wide_margins::build_margins(
                 &self.ram, &self.wram, &self.prg, rec, tiles, margins,
             );
+            self.margin_sprites_into(&mut margins.sprites);
             z2_ppu::render_wide_indexed(&self.frame, rec, margins, &self.chr, wide);
             true
         } else {
             margins.set_tiles(tiles);
             margins.clear_backdrop();
+            margins.sprites.clear();
             let empty = z2_ppu::FrameRecord::new();
             z2_ppu::render_wide_indexed(&self.frame, &empty, margins, &self.chr, wide);
             false
@@ -1051,6 +1121,42 @@ impl Game {
     #[cfg(feature = "interp")]
     pub fn coop_reset_area(&mut self) {
         crate::coop::leave_area(&mut self.coop);
+    }
+
+    /// Turn wide gameplay on with a margin of `Some(tiles)` per side
+    /// (clamped to 16; `8 * tiles` pixels), or off with `None` (the
+    /// default). On registers the two bank-0 overworld traps and patches the
+    /// townsfolk spawn table in the in-memory PRG copy; off unregisters and
+    /// restores both. Never called by verification. It changes gameplay, so
+    /// netplay peers must agree on it (it is part of the trap-set identity
+    /// the frontends exchange, see [`Game::wide_gameplay_tiles`]).
+    #[cfg(feature = "interp")]
+    pub fn set_wide_gameplay(&mut self, margin_tiles: Option<u8>) {
+        crate::wide_gameplay::set(self, margin_tiles);
+    }
+
+    /// Wide-gameplay margin in tiles per side, `None` while off.
+    #[cfg(feature = "interp")]
+    pub fn wide_gameplay_tiles(&self) -> Option<u8> {
+        self.wide_game
+            .enabled
+            .then_some(self.wide_game.margin_px / 8)
+    }
+
+    /// Overworld encounter blobs that live in the widescreen margins, as
+    /// [`z2_ppu::MarginSprite`]s in window coordinates and OAM priority order,
+    /// for the picture the last [`Game::step`] rendered. Empty unless wide
+    /// gameplay is on and blobs are out in a margin.
+    #[cfg(feature = "interp")]
+    pub fn overworld_margin_sprites(&self) -> &[z2_ppu::MarginSprite] {
+        self.wide_game.shown()
+    }
+
+    /// FNV-1a of the wide-gameplay state that influences future frames (mix
+    /// into a netplay desync hash alongside RAM/WRAM).
+    #[cfg(feature = "interp")]
+    pub fn wide_gameplay_hash(&self) -> u64 {
+        crate::wide_gameplay::hash(&self.wide_game)
     }
 
     // ------------------------------------------------ cpu state (tests)

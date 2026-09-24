@@ -36,6 +36,8 @@ fn every_new_flag_parses() {
         "off",
         "--fill-right-clip",
         "off",
+        "--margin-sprites",
+        "off",
     ]))
     .expect("parses");
     assert_eq!(a.rom.as_deref(), Some("/tmp/z2.nes"));
@@ -47,6 +49,7 @@ fn every_new_flag_parses() {
     assert_eq!(a.hd_record.as_deref(), Some("/tmp/rec"));
     assert_eq!(a.fill_left_clip, Some(false));
     assert_eq!(a.fill_right_clip, Some(false));
+    assert_eq!(a.margin_sprites, Some(false));
 
     let h = app::parse_native_args(&argv(&[
         "z2-native",
@@ -84,6 +87,7 @@ fn unknown_flags_still_error_with_usage() {
         vec!["z2-native", "--hd-pack"], // missing value
         vec!["z2-native", "--fill-left-clip", "yes"],
         vec!["z2-native", "--fill-right-clip", "yes"],
+        vec!["z2-native", "--margin-sprites", "yes"],
         vec!["z2-native", "--coop-host", "bad room"], // space is not allowed
         vec!["z2-native", "--coop-host", ""],         // empty room
         vec!["z2-native", "--signal", "http://x"],    // not ws://
@@ -170,6 +174,7 @@ fn help_still_surfaces_usage_and_documents_the_new_flags() {
         "--hd-record",
         "--fill-left-clip",
         "--fill-right-clip",
+        "--margin-sprites",
     ] {
         assert!(err.contains(needle), "usage must mention {needle}");
     }
@@ -191,6 +196,33 @@ fn cli_overrides_config_and_config_supplies_the_default() {
     let f = app::resolve_features(&none, &cfg).unwrap();
     assert!(f.coop, "config coop_local honoured");
     assert!(f.record, "widescreen needs the render record");
+    assert!(
+        f.margin_sprites,
+        "widescreen draws margin sprites by default"
+    );
+
+    // Margin sprites: config key, CLI override, and never without margins.
+    let off = NativeConfig {
+        widescreen_margin_sprites: false,
+        ..cfg.clone()
+    };
+    assert!(!app::resolve_features(&none, &off).unwrap().margin_sprites);
+    let on = app::parse_native_args(&argv(&["z2-native", "--margin-sprites", "on"])).unwrap();
+    assert!(app::resolve_features(&on, &off).unwrap().margin_sprites);
+    let narrow = app::parse_native_args(&argv(&[
+        "z2-native",
+        "--widescreen",
+        "off",
+        "--margin-sprites",
+        "on",
+    ]))
+    .unwrap();
+    assert!(!app::resolve_features(&narrow, &cfg).unwrap().margin_sprites);
+    assert_eq!(
+        f.wide_gameplay,
+        Some(8),
+        "wide gameplay follows widescreen by default"
+    );
 
     // CLI wins over the config for widescreen.
     let cli = app::parse_native_args(&argv(&["z2-native", "--widescreen", "off"])).unwrap();
@@ -198,6 +230,16 @@ fn cli_overrides_config_and_config_supplies_the_default() {
     assert!(
         !app::resolve_features(&cli, &cfg).unwrap().record,
         "no widescreen, no pack: the record stays off"
+    );
+    assert_eq!(
+        app::resolve_features(&cli, &cfg).unwrap().wide_gameplay,
+        None,
+        "no widescreen, no wide gameplay"
+    );
+    let off = app::parse_native_args(&argv(&["z2-native", "--wide-gameplay", "off"])).unwrap();
+    assert_eq!(
+        app::resolve_features(&off, &cfg).unwrap().wide_gameplay,
+        None
     );
 
     // And for the HD keys.
@@ -244,6 +286,7 @@ fn present_size_follows_the_widescreen_preset_and_scale() {
                 fill_right_clip: true,
                 pack_dir: None,
                 record_dir: None,
+                margin_sprites: false,
             })
             .expect("no pack");
             assert_eq!(d.size(), app::present_size_scaled(tiles, scale));
@@ -299,6 +342,7 @@ fn no_rom_start_is_consistent_under_every_feature_combination() {
                     fill_right_clip: tiles > 0,
                     pack_dir: None,
                     record_dir: None,
+                    margin_sprites: false,
                 };
                 let what = format!("tiles={tiles} scale={scale} coop={coop}");
                 let feats = settings.features(coop);
@@ -335,6 +379,7 @@ fn no_rom_two_pad_stepping_and_present_is_safe() {
         fill_right_clip: true,
         pack_dir: None,
         record_dir: None,
+        margin_sprites: false,
     };
     let mut emu = app::new_emu_with(44_100, settings.features(true));
     let mut display = Display::new(settings).expect("no pack");
@@ -358,7 +403,9 @@ fn rom_build_applies_features_and_reports_a_trapset() {
     };
     let feats = Features {
         coop: true,
+        wide_gameplay: None,
         record: true,
+        margin_sprites: false,
     };
     let (emu, body) = app::emu_from_rom_file_with(&path, 44_100, feats).expect("build");
     assert_eq!(
@@ -408,6 +455,7 @@ fn hd_recording_round_trips_into_a_loadable_pack() {
         fill_right_clip: false,
         pack_dir: None,
         record_dir: Some(dir.clone()),
+        margin_sprites: false,
     };
     let feats = settings.features(false);
     assert!(feats.record, "recording needs the PPU render record");
@@ -440,6 +488,7 @@ fn hd_recording_round_trips_into_a_loadable_pack() {
         fill_right_clip: true,
         pack_dir: Some(dir.clone()),
         record_dir: None,
+        margin_sprites: false,
     };
     let mut hd = Display::new(reload).expect("the recorded pack loads");
     assert_eq!(hd.size(), app::present_size_scaled(11, 2));

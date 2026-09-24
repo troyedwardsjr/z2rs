@@ -35,6 +35,7 @@
 //! | `apu` log | frontend-owned | **cleared on load**: audio for re-simulated frames must not be replayed; the frontend drains the log after each step as usual |
 //! | `apu` counters (`reads`, `writes`, `last_write`) | diagnostic | never read back by emulation |
 //! | `coop` | captured | whole [`CoopState`]: flag, options, swap block, contact state, respawn, counters, saved sprite limit |
+//! | `wide_game` | captured | whole [`WideGameplayState`]: flag, margin, per-blob extended X and tracking, both margin-sprite lists, counters. Loading re-registers (or drops) the two wide traps and re-applies (or restores) the townsfolk PRG patch to match |
 //! | `pad1`, `pad2`, `strobe`, `shift1`, `shift2` | captured | controller latches (pad 2 stays latched across frames) |
 //! | `frame_end_dots`, `frame_count` | captured | dot-exact frame clock |
 //! | `exec_errors`, `last_exec_error` | captured | frontends pause on a changed count, so a re-simulated fault must not double count |
@@ -76,12 +77,14 @@ use crate::coop::{CoopOptions, CoopState, ENEMY_SLOTS, SWAP_LEN};
 use crate::cpu::{Cpu, ExecError, Mmc1};
 use crate::game::{Game, FRAME_LEN};
 use crate::ppu_bind::PpuBind;
+use crate::wide_gameplay::{WideGameplayState, DEMON_SLOTS, MAX_MARGIN_SPRITES};
+use z2_ppu::MarginSprite;
 use z2_ppu::SpriteLimit;
 
 /// Magic prefix of [`GameState::to_bytes`].
 pub const STATE_MAGIC: [u8; 4] = *b"Z2GS";
 /// Format version of [`GameState::to_bytes`].
-pub const STATE_VERSION: u16 = 1;
+pub const STATE_VERSION: u16 = 2;
 
 /// Complete snapshot of a [`Game`]'s live emulation state (see the module
 /// docs for the per-field capture table).
@@ -96,6 +99,7 @@ pub struct GameState {
     mmc1: Mmc1,
     ppu: PpuBind,
     coop: CoopState,
+    wide_game: WideGameplayState,
     pad1: u8,
     pad2: u8,
     strobe: bool,
@@ -133,6 +137,7 @@ impl GameState {
             mmc1: Mmc1::new(),
             ppu: PpuBind::new(),
             coop: CoopState::default(),
+            wide_game: WideGameplayState::default(),
             pad1: 0,
             pad2: 0,
             strobe: false,
@@ -193,6 +198,7 @@ impl GameState {
         w.bytes(&[m.shift, m.count, m.ctrl, m.chr0, m.chr1, m.prg]);
         self.ppu.write_state(&mut w);
         write_coop(&mut w, &self.coop);
+        write_wide(&mut w, &self.wide_game);
         w.bytes(&[self.pad1, self.pad2]);
         w.bool(self.strobe);
         w.bytes(&[self.shift1, self.shift2]);
@@ -220,7 +226,9 @@ impl GameState {
             return Err(StateError::BadMagic);
         }
         let version = r.u16()?;
-        if version != STATE_VERSION {
+        // Version 1 predates the wide-gameplay block and decodes with the
+        // mode off.
+        if !(1..=STATE_VERSION).contains(&version) {
             return Err(StateError::Version(version));
         }
         let mut s = GameState::new();
@@ -251,6 +259,9 @@ impl GameState {
         };
         s.ppu.read_state(&mut r)?;
         s.coop = read_coop(&mut r)?;
+        if version >= 2 {
+            s.wide_game = read_wide(&mut r)?;
+        }
         s.pad1 = r.u8()?;
         s.pad2 = r.u8()?;
         s.strobe = r.bool()?;
@@ -343,6 +354,68 @@ fn read_coop(r: &mut Reader) -> Result<CoopState, StateError> {
         _ => return Err(StateError::Invalid("saved sprite limit")),
     };
     Ok(c)
+}
+
+fn write_wide(w: &mut Writer, st: &WideGameplayState) {
+    w.bool(st.enabled);
+    w.u8(st.margin_px);
+    for e in st.ex {
+        w.bytes(&e.to_le_bytes());
+    }
+    w.bytes(&[st.tracked, st.hidden]);
+    w.bytes(&st.shadow_oy);
+    for (list, len) in [(&st.pending, st.pending_len), (&st.shown, st.shown_len)] {
+        w.u8(len);
+        for sp in list {
+            w.bytes(&sp.x.to_le_bytes());
+            w.bytes(&[sp.y, sp.tile, sp.attr]);
+        }
+    }
+    w.bool(st.ran_this_frame);
+    w.u64(st.n_pushed);
+    w.u64(st.n_margin_frames);
+    w.u64(st.n_passes);
+}
+
+fn read_wide(r: &mut Reader) -> Result<WideGameplayState, StateError> {
+    let mut st = WideGameplayState {
+        enabled: r.bool()?,
+        margin_px: r.u8()?,
+        ..WideGameplayState::default()
+    };
+    for e in st.ex.iter_mut() {
+        let b = r.take(2)?;
+        *e = i16::from_le_bytes([b[0], b[1]]);
+    }
+    st.tracked = r.u8()?;
+    st.hidden = r.u8()?;
+    st.shadow_oy.copy_from_slice(r.take(DEMON_SLOTS)?);
+    let mut lists = [[MarginSprite::default(); MAX_MARGIN_SPRITES]; 2];
+    let mut lens = [0u8; 2];
+    for (list, len) in lists.iter_mut().zip(lens.iter_mut()) {
+        *len = r.u8()?;
+        if usize::from(*len) > MAX_MARGIN_SPRITES {
+            return Err(StateError::Invalid("margin sprite count"));
+        }
+        for sp in list.iter_mut() {
+            let b = r.take(5)?;
+            *sp = MarginSprite {
+                x: i16::from_le_bytes([b[0], b[1]]),
+                y: b[2],
+                tile: b[3],
+                attr: b[4],
+            };
+        }
+    }
+    st.pending = lists[0];
+    st.pending_len = lens[0];
+    st.shown = lists[1];
+    st.shown_len = lens[1];
+    st.ran_this_frame = r.bool()?;
+    st.n_pushed = r.u64()?;
+    st.n_margin_frames = r.u64()?;
+    st.n_passes = r.u64()?;
+    Ok(st)
 }
 
 /// Error from [`GameState::from_bytes`].
@@ -472,6 +545,7 @@ impl Game {
         s.mmc1 = self.mmc1;
         s.ppu.copy_state_from(&self.ppu);
         s.coop.clone_from(&self.coop);
+        s.wide_game.clone_from(&self.wide_game);
         s.pad1 = self.pad1;
         s.pad2 = self.pad2;
         s.strobe = self.strobe;
@@ -501,6 +575,8 @@ impl Game {
             crate::coop::register_coop_traps(self);
         }
         self.coop.clone_from(&s.coop);
+        self.wide_game.clone_from(&s.wide_game);
+        crate::wide_gameplay::after_load(self);
         self.pad1 = s.pad1;
         self.pad2 = s.pad2;
         self.strobe = s.strobe;

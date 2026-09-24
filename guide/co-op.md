@@ -18,7 +18,11 @@ The NES draws 256 pixels across because that is all the hardware has: two screen
 
 The centre 256 columns are copied byte for byte from the normal frame. That copy is what keeps widescreen out of the verification path, and the game never learns the screen got wider.
 
-Widescreen also recovers two black strips. The game blanks its leftmost 8 pixels with a mask bit, and on the overworld it hides its rightmost 8 pixels behind a column of opaque black sprites. z2rs repaints both from the same tile data, so the picture runs edge to edge without the seams the original hardware needed.
+Widescreen also recovers two black strips. The game blanks its leftmost 8 pixels with a mask bit, and on the overworld it hides its rightmost 8 pixels behind a column of opaque black sprites. z2rs repaints both from the same tile data, so the picture runs edge to edge without the seams the original hardware needed. On the overworld those strips are taken from the world map rather than from the tiles the game fetched there, because the game streams new columns into exactly those strips and they are often half written.
+
+Enemies, townspeople and items in side-view areas show up in the margins too. The game keeps them alive well past the edge of its 256-pixel picture and only hides them when it draws them. z2rs runs the game's own sprite drawing routine a second time, on a copy of the machine state with that hiding turned off, and draws whatever lands outside the picture into the margins. The copy is then thrown away, so the game runs exactly as it would without it. `--margin-sprites off` turns this off.
+
+Overworld encounters work differently. The game creates them close to Link and deletes them as soon as they reach the edge of the original picture, so there is nothing further out to draw. Wide gameplay (`--wide-gameplay`, on by default with widescreen) changes the game to fix that. Encounters that appear to the left or right of Link start out in the margin and live until they leave it, side-view enemies are created just past the margins, and townspeople walk in from beyond them. Because it changes the game, it is off for movie playback and headless runs, and both players in an online session must use the same setting. With a zero margin it plays exactly like the original.
 
 ## How co-op works
 
@@ -48,10 +52,11 @@ These apply to both the desktop app and the browser build.
 
 Widescreen:
 
-- The margins hold no sprites, so enemies and projectiles still appear at the original screen edge.
+- Projectiles, sword beams and the sprites shown while an enemy dies still appear and disappear at the original screen edge.
+- With wide gameplay on, encounters that appear beside Link start further away, so you meet fewer of them in grass and desert, and one that wanders off the edge of the picture can come back.
 - Dialogue boxes and the pause and spell pane do not extend into the margins, and title and menu screens leave them blank.
 - Where the level data runs out (the west end of a town, for instance) the margin falls back to the backdrop colour.
-- The overworld's own edge blanking (`PPUMASK $18` on the left, a column of opaque black sprites on the right) is repainted by `--fill-left-clip` and `--fill-right-clip`, both on by default. With an HD pack loaded, the right-hand seam remains.
+- The overworld's own edge blanking (`PPUMASK $18` on the left, a column of opaque black sprites on the right) is repainted by `--fill-left-clip` and `--fill-right-clip`, both on by default, with or without an HD pack.
 
 Co-op:
 

@@ -18,6 +18,11 @@
 //!   [`overworld_map::PALETTE_CODES`]). Out-of-map cells are water, or
 //!   mountain left of column 0 in regions `$0706 < 2`.
 //!
+//! On the overworld the window's own edge strips come from the map too
+//! ([`z2_ppu::MarginLine::edge_left`] / `edge_right`): the nametable there is
+//! a single 32-column ring, so slots 0 and 32 alias one column and the ROM
+//! streams new columns into the strips it hides.
+//!
 //! RAM is end-of-frame and can differ from the scroll the PPU actually used
 //! by the frame's scroll delta, so the horizontal position comes from the
 //! record's per-line ring coordinate and RAM only picks the ring instance
@@ -391,6 +396,17 @@ pub fn overworld_row(ram: &[u8; 0x800], line: &LineRecord, y: usize) -> (i32, u8
     (r73 - 0x1E, (stack & 1) as u8)
 }
 
+/// Link's overworld row `$73` lies on the map (`$1E..$1E + 75`). The
+/// overworld never lets him leave it, so anything else is a frame the game
+/// has switched to mode `$05` before placing him (observed on the first
+/// overworld frame after an area exit, with `$73` = 0 and a blank screen):
+/// there is no world to extend, and the margins stay backdrop.
+#[must_use]
+pub fn overworld_position_live(ram: &[u8; 0x800]) -> bool {
+    let row = i32::from(ram[usize::from(ADDR_OW_TILE_Y)]) - 0x1E;
+    (0..overworld_map::ROW_COUNT as i32).contains(&row)
+}
+
 /// Fill `out` for `tiles` per side from the frame `record` and the
 /// post-frame RAM/WRAM/PRG. Pure; `tiles` is clamped by [`Margins`].
 pub fn build_margins(
@@ -407,12 +423,17 @@ pub fn build_margins(
     let mode = ram[usize::from(ADDR_GAME_MODE)];
     let menu = ram[usize::from(ADDR_MENU)];
     let sv = SideviewSource::from_state(ram, wram, prg);
-    // The RLE row table walk is only worth doing on overworld frames.
-    let ow = (mode == MODE_OVERWORLD).then(|| OverworldSource::from_state(ram, wram));
+    // The RLE row table walk is only worth doing on overworld frames, and
+    // only once Link stands on the map: on the frame the game switches into
+    // mode $05 the screen is still the loader's and `$73` is not set yet.
+    let ow = (mode == MODE_OVERWORLD && overworld_position_live(ram))
+        .then(|| OverworldSource::from_state(ram, wram));
     for (y, ml) in out.lines.iter_mut().enumerate() {
         let rec = record.line(y);
         let policy = margin_policy(mode, menu, rec);
         ml.fill = MarginFill::Backdrop;
+        ml.edge_left = [BgTileId::NONE; 2];
+        ml.edge_right = [BgTileId::NONE; 2];
         let page = FrameRecord::bg_page(rec);
         let fine_y = FrameRecord::fine_y(rec);
         match (policy, &ow) {
@@ -434,6 +455,14 @@ pub fn build_margins(
                     ml.left[j] = src.tile_id(wt0 - 1 - ji, r, parity, fine_y, page);
                     ml.right[j] = src.tile_id(wt0 + 32 + ji, r, parity, fine_y, page);
                 }
+                // The overworld nametable is a single 32-column ring, so
+                // window slots 0 and 32 share one nametable column and the
+                // ROM streams each new column into it (and into slot 1 / 31)
+                // while `PPUMASK` and the edge-mask sprites hide them. The
+                // edge strips therefore come from the map too.
+                let at = |k: i32| src.tile_id(wt0 + k, r, parity, fine_y, page);
+                ml.edge_left = [at(0), at(1)];
+                ml.edge_right = [at(31), at(32)];
                 ml.fill = MarginFill::Tiles;
             }
             _ => {}

@@ -69,6 +69,10 @@ pub struct HeadlessArgs {
     pub widescreen: Option<String>,
     /// Where to write the composed widescreen PNG (needs a ROM for CHR).
     pub dump_wide: Option<String>,
+    /// `--wide-gameplay on|off`: enemies spawn and live in the widescreen
+    /// margins. Off unless asked for: headless runs replay movies, and this
+    /// changes gameplay (a movie desyncs once an encounter moves).
+    pub wide_gameplay: bool,
     /// Enable two-Link co-op so pad 2 drives a second Link.
     pub coop: bool,
     /// Hold this constant byte on pad 2 every frame (co-op only).
@@ -84,9 +88,17 @@ pub struct HeadlessArgs {
     /// Where to write the fully composed RGBA PNG (widescreen + HD pack +
     /// scale, exactly what the windowed frontend puts on screen).
     pub dump_present: Option<String>,
+    /// `--margin-sprites on|off`: side-view objects outside the window in the
+    /// widescreen margins (default on, like the windowed frontend).
+    pub margin_sprites_flag: Option<bool>,
 }
 
 impl HeadlessArgs {
+    /// Whether side-view objects are drawn into the margins (default on).
+    fn margin_sprites(&self) -> bool {
+        self.margin_sprites_flag.unwrap_or(true)
+    }
+
     /// Margin tiles per side for this run.
     ///
     /// `--dump-wide` without `--widescreen` implies `16:9`, so the flag is
@@ -109,6 +121,7 @@ impl HeadlessArgs {
             // otherwise leave a black seam on each side of the play field.
             fill_left_clip: true,
             fill_right_clip: true,
+            margin_sprites: self.margin_sprites(),
             pack_dir: self.hd_pack.as_deref().map(std::path::PathBuf::from),
             record_dir: None,
         }
@@ -142,6 +155,12 @@ usage: z2-native --headless [--snapshot S] [--movie M] [--frames N] [--dump fact
   --widescreen P  widescreen margins: off | 16:10 | 16:9 | N tiles per side (0-16)
   --dump-wide P   write the composed widescreen PNG here (needs a ROM for CHR;
                   implies --widescreen 16:9 when that flag is absent)
+  --margin-sprites on|off
+                  side-view enemies, NPCs and items outside the window in the
+                  widescreen margins (display only; default on)
+  --wide-gameplay on|off
+                  enemies spawn and live in the widescreen margins (default off
+                  here: it changes gameplay, so movies desync; needs a margin)
   --coop          enable two-Link co-op (pad 2 drives a second Link in side-view)
   --p2-hold MASK  hold this pad-2 byte every frame (decimal or 0x..; with --coop)
   --p2-mirror     pad 2 copies pad 1 every frame (with --coop)
@@ -212,6 +231,30 @@ pub fn parse_headless_args(argv: &[String]) -> Result<ParseOutcome, String> {
                 args.widescreen = Some(raw);
             }
             "--dump-wide" => args.dump_wide = Some(value_of(&mut it, "--dump-wide")?),
+            "--margin-sprites" => {
+                let raw = value_of(&mut it, "--margin-sprites")?;
+                args.margin_sprites_flag = Some(match raw.as_str() {
+                    "on" => true,
+                    "off" => false,
+                    _ => {
+                        return Err(format!(
+                            "--margin-sprites expects on | off, got '{raw}'\n{HEADLESS_USAGE}"
+                        ))
+                    }
+                });
+            }
+            "--wide-gameplay" => {
+                let raw = value_of(&mut it, "--wide-gameplay")?;
+                args.wide_gameplay = match raw.as_str() {
+                    "on" | "true" | "1" => true,
+                    "off" | "false" | "0" => false,
+                    _ => {
+                        return Err(format!(
+                            "--wide-gameplay expects on|off, got '{raw}'\n{HEADLESS_USAGE}"
+                        ))
+                    }
+                };
+            }
             "--coop" => args.coop = true,
             "--p2-hold" => {
                 let raw = value_of(&mut it, "--p2-hold")?;
@@ -439,7 +482,16 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
     // `Game::reset`, and the widescreen record must be armed before the first
     // stepped frame or there is nothing to compose margins from.
     let display_settings = args.display_settings();
-    let feats = display_settings.features(args.coop);
+    let mut feats = display_settings.features(args.coop);
+    if args.wide_gameplay {
+        if display_settings.wide_tiles == 0 {
+            return Err(HeadlessError::Usage(
+                "--wide-gameplay on needs a widescreen margin (--widescreen P or --dump-wide)"
+                    .into(),
+            ));
+        }
+        feats.wide_gameplay = Some(display_settings.wide_tiles);
+    }
     if args.dump_wide.is_some() && rom_path.is_none() {
         return Err(HeadlessError::Usage(
             "--dump-wide needs a ROM (--rom PATH or $Z2_ROM): margins are decoded from \
@@ -545,6 +597,7 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
         let mut margins = z2_ppu::Margins::new(tiles);
         margins.fill_left_clip = true;
         margins.fill_right_clip = true;
+        margins.fill_left_sprites = args.margin_sprites();
         let mut wide = z2_ppu::WideFrame::new(tiles);
         let armed = emu.game.compose_wide(tiles, &mut margins, &mut wide);
         if !armed {
@@ -839,6 +892,29 @@ mod tests {
         assert_eq!(a.p2_hold, Some(0x11));
         assert_eq!(a.pad2_for(0x00), 0x11, "held byte wins");
         assert_eq!(a.dump_coop.as_deref(), Some("coop.json"));
+        assert!(a.margin_sprites(), "margin sprites default on");
+        assert!(a.display_settings().features(false).margin_sprites);
+    }
+
+    #[test]
+    fn parses_margin_sprites() {
+        let parse = |v: &str| {
+            parse_headless_args(&argv(&["z2-native", "--headless", "--margin-sprites", v]))
+        };
+        let Ok(ParseOutcome::Run(a)) = parse("off") else {
+            panic!("expected a run");
+        };
+        assert!(!a.margin_sprites());
+        assert!(!a.display_settings().features(false).margin_sprites);
+        let Ok(ParseOutcome::Run(a)) = parse("on") else {
+            panic!("expected a run");
+        };
+        assert!(a.margin_sprites());
+        assert!(
+            !a.display_settings().features(false).margin_sprites,
+            "no widescreen: nothing to draw into"
+        );
+        assert!(parse("maybe").is_err());
     }
 
     #[test]

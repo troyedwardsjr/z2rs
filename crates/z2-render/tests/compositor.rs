@@ -921,6 +921,193 @@ fn widescreen_left_edge_is_hd_with_fine_x() {
     }
 }
 
+/// The overworld hides stale nametable columns in both edge strips (its
+/// nametable is one 32-column ring, so slots 0 and 32 alias), and the margin
+/// provider supplies its own identities for slots 0/1 and 31/32. The indexed
+/// wide frame and the HD composite must both use them, in exactly the same
+/// pixels: the strips the fills repaint, plus slot 0's leading `fine_x`
+/// columns in the left margin. Everything else keeps the record's tiles.
+#[test]
+fn widescreen_edge_strips_use_the_providers_identities() {
+    const CENTRE_HD: [u8; 4] = [0, 255, 0, 255];
+    const MARGIN_HD: [u8; 4] = [255, 0, 0, 255];
+    const EDGE_HD: [u8; 4] = [0, 0, 255, 255];
+    const EDGE_PAL: u8 = 2;
+    let chr = chr_image();
+    let fine_x = 3u8;
+    let mut p = scene(&chr);
+    p.write_scroll(fine_x);
+    p.write_scroll(0);
+    // The overworld's PPUMASK: both layers on, left 8 columns clipped.
+    p.write_mask(0x18);
+    // Mask sprites at x 248 over rows 96..104 only.
+    p.set_oam_entry(
+        0,
+        OamEntry {
+            y: 95,
+            tile: SPR_SOLID,
+            attr: 0,
+            x: (WIDTH - 8) as u8,
+        },
+    );
+    let (frame, rec) = frame_and_record(&mut p);
+    let masked_row = 100usize;
+    let open_row = 150usize;
+    assert!(right_edge_masked(&rec, masked_row, &chr));
+    assert!(!right_edge_masked(&rec, open_row, &chr));
+
+    let tiles = 4u8;
+    let id = |pal: u8| BgTileId {
+        page: BG_PAGE,
+        tile: TILE_FLAT1,
+        pal,
+        fine_y: 0,
+        fetched: true,
+        ..BgTileId::NONE
+    };
+    let mut margins = Margins::new(tiles);
+    margins.fill_left_clip = true;
+    margins.fill_right_clip = true;
+    for l in margins.lines.iter_mut() {
+        l.fill = MarginFill::Tiles;
+        l.left = [id(0); MARGIN_SLOTS];
+        l.right = [id(0); MARGIN_SLOTS];
+        l.edge_left = [id(EDGE_PAL); 2];
+        l.edge_right = [id(EDGE_PAL); 2];
+    }
+    let mut wide = WideFrame::new(tiles);
+    render_wide_indexed(&frame, &rec, &margins, &chr, &mut wide);
+    let mp = wide.margin_px();
+    let w = wide.width;
+    let edge_idx = rec.line(masked_row).palette[usize::from(EDGE_PAL) * 4 + 1];
+    let x_left_strip = |wx: i32| (-i32::from(fine_x)..8).contains(&wx);
+
+    // Indexed: the provider's tile in the left strip and slot 0's margin
+    // columns on every line, in the right strip only under the mask.
+    for (row, right_masked) in [(masked_row, true), (open_row, false)] {
+        for wx in -(8 * i32::from(tiles))..WIDTH as i32 + 8 * i32::from(tiles) {
+            let got = wide.row(row)[(wx + mp as i32) as usize];
+            let in_window = (0..WIDTH as i32).contains(&wx);
+            let edge = x_left_strip(wx) || (right_masked && (248..256).contains(&wx));
+            if edge {
+                assert_eq!(got, edge_idx, "row {row} x {wx}: provider's edge tile");
+            } else if in_window {
+                assert_eq!(
+                    got,
+                    frame[row * WIDTH + wx as usize],
+                    "row {row} x {wx}: frame"
+                );
+            } else {
+                assert_ne!(got, edge_idx, "row {row} x {wx}: margin tile");
+            }
+        }
+    }
+
+    // HD: the same pixels take the provider's cell, the rest their own.
+    let colors = |pal| bg_colors(rec.line(masked_row), pal);
+    let pack = build_pack(
+        1,
+        vec![
+            (
+                BG_PAGE,
+                None,
+                Box::new(|t, _, _| match t {
+                    TILE_SOLID => CENTRE_HD,
+                    TILE_FLAT1 => MARGIN_HD,
+                    _ => [0; 4],
+                }),
+            ),
+            (
+                BG_PAGE,
+                Some(colors(EDGE_PAL)),
+                Box::new(|t, _, _| if t == TILE_FLAT1 { EDGE_HD } else { [0; 4] }),
+            ),
+        ],
+    );
+    let out = compose(
+        1,
+        tiles,
+        IndexedView::wide(&wide),
+        &rec,
+        &chr,
+        Some(&pack),
+        Some(&margins),
+    );
+    for (row, right_masked) in [(masked_row, true), (open_row, false)] {
+        let at = |wx: i32| {
+            let i = (row * w + (wx + mp as i32) as usize) * 4;
+            &out[i..i + 4]
+        };
+        for wx in -i32::from(fine_x)..8 {
+            assert_eq!(at(wx), EDGE_HD.as_slice(), "row {row} x {wx}: left strip");
+        }
+        assert_eq!(
+            at(-i32::from(fine_x) - 1),
+            MARGIN_HD.as_slice(),
+            "row {row}"
+        );
+        assert_eq!(
+            at(8),
+            CENTRE_HD.as_slice(),
+            "row {row}: first unclipped column"
+        );
+        assert_eq!(
+            at(247),
+            CENTRE_HD.as_slice(),
+            "row {row}: left of the right strip"
+        );
+        assert_eq!(
+            at(WIDTH as i32),
+            MARGIN_HD.as_slice(),
+            "row {row}: right margin"
+        );
+        if right_masked {
+            for wx in 248..256 {
+                assert_eq!(at(wx), EDGE_HD.as_slice(), "row {row} x {wx}: right strip");
+            }
+        } else {
+            assert_eq!(
+                at(250),
+                CENTRE_HD.as_slice(),
+                "row {row}: unmasked right edge"
+            );
+        }
+    }
+
+    // Fills off: the strips are the frame again (the clipped left strip is
+    // backdrop, the right one the mask), in both paths. Slot 0's margin
+    // columns still come from the provider: they are margin, not window.
+    margins.fill_left_clip = false;
+    margins.fill_right_clip = false;
+    render_wide_indexed(&frame, &rec, &margins, &chr, &mut wide);
+    for wx in 0..WIDTH {
+        assert_eq!(
+            wide.row(masked_row)[mp + wx],
+            frame[masked_row * WIDTH + wx],
+            "fills off: x {wx}"
+        );
+    }
+    assert_eq!(wide.row(masked_row)[mp - 1], edge_idx);
+    let out_off = compose(
+        1,
+        tiles,
+        IndexedView::wide(&wide),
+        &rec,
+        &chr,
+        Some(&pack),
+        Some(&margins),
+    );
+    let i = (masked_row * w + mp) * 4;
+    let backdrop = MasterPalette::NES.rgba(rec.line(masked_row).backdrop);
+    assert_eq!(&out_off[i..i + 4], backdrop.as_slice(), "clipped strip");
+    let i = (masked_row * w + mp - 1) * 4;
+    assert_eq!(
+        &out_off[i..i + 4],
+        EDGE_HD.as_slice(),
+        "slot 0 margin column"
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Pack extensions: art-shaped sprites, bleed, layers
 // ---------------------------------------------------------------------------
@@ -985,6 +1172,94 @@ fn saria(camera_x: i32) -> Option<z2_render::SceneView> {
         scene: 7,
         camera_x,
     })
+}
+
+#[test]
+fn layer_background_signature_is_a_frame_gate() {
+    let chr = chr_image();
+    let mut p = scene(&chr);
+    let (frame, mut rec) = frame_and_record(&mut p);
+    let pack = |when: serde_json::Value| {
+        pack_from(
+            &format!("\"layers\":[{{\"file\":\"gate.png\",\"depth\":\"front\",\"scroll\":0,\"when\":{when}}}]"),
+            vec![("gate.png", common::solid_png(256, 240, PINK))],
+        )
+    };
+    // x=7 with fine X=2 must sample slot 1, not slot 0.
+    rec.lines[232].fine_x = 2;
+    rec.lines[232].fine_x_end = 2;
+    rec.lines[232].tiles[0] = BgTileId::NONE;
+    let id = rec.lines[232].tiles[1];
+    let colors = bg_colors(&rec.lines[232], id.pal);
+    let when = serde_json::json!({"background_tile": {
+        "x":7,"y":232,"page":id.page,"tile":id.tile,"colors":colors
+    }});
+    let signature_pack = pack(when.clone());
+    let visible = |r: &FrameRecord, pack: &HdPack, scene| {
+        px(&compose_scene(&frame, r, &chr, pack, scene), 100, 100) == PINK
+    };
+    assert!(visible(&rec, &signature_pack, None));
+    // Palette-independent signature also works.
+    let mut any_colors = when.clone();
+    any_colors["background_tile"]
+        .as_object_mut()
+        .unwrap()
+        .remove("colors");
+    let any_pack = pack(any_colors);
+    for change in 0..10 {
+        let mut bad = rec.clone();
+        let line = &mut bad.lines[232];
+        match change {
+            0 => line.valid = false,
+            1 => line.tiles[1].fetched = false,
+            2 => line.tiles[1].page = 31,
+            3 => line.tiles[1].tile ^= 1,
+            4 => line.mask &= !0x08,
+            5 => line.mask &= !0x02,
+            6 => line.mask |= PPUMASK_GRAYSCALE,
+            7 => line.pixel_split = true,
+            8 => {
+                line.split = true;
+                line.fine_x_end = 3;
+            }
+            9 => line.palette[usize::from(id.pal) * 4 + 1] ^= 1,
+            _ => unreachable!(),
+        }
+        assert!(!visible(&bad, &signature_pack, None), "case {change}");
+        if change == 9 {
+            assert!(visible(&bad, &any_pack, None));
+        }
+    }
+    rec.lines[232].split = true; // Fetch identity remains usable with stable fine X.
+    assert!(visible(&rec, &signature_pack, None));
+    let mut scene_when = when;
+    scene_when["world"] = 1.into();
+    scene_when["region"] = 0.into();
+    scene_when["scene"] = 7.into();
+    let scene_pack = pack(scene_when);
+    assert!(visible(&rec, &scene_pack, saria(123)));
+    assert!(!visible(&rec, &scene_pack, None));
+    let mut other = saria(0).unwrap();
+    other.scene = 8;
+    assert!(!visible(&rec, &scene_pack, Some(other)));
+    let mut missing = rec.clone();
+    missing.lines[232].tiles[1] = BgTileId::NONE;
+    assert!(!visible(&missing, &scene_pack, saria(0)));
+    for (world, region) in [(2, 0), (1, 1)] {
+        let mut other = saria(0).unwrap();
+        other.world = world;
+        other.region = region;
+        assert!(!visible(&rec, &scene_pack, Some(other)));
+    }
+    // At the right edge, fine X can select fetched spill slot 32.
+    let edge_pack = pack(serde_json::json!({"background_tile": {
+        "x":255,"y":232,"page":id.page,"tile":id.tile
+    }}));
+    rec.lines[232].tiles[31] = BgTileId::NONE;
+    rec.lines[232].tiles[32] = id;
+    assert!(visible(&rec, &edge_pack, None));
+    rec.lines[232].tiles[32].fetched = false;
+    assert!(!visible(&rec, &edge_pack, None));
 }
 
 /// `"sprite_alpha": "art"`: the cell's alpha is the silhouette. Art may
@@ -1285,4 +1560,115 @@ fn back_layer_reaches_split_lines_by_colour() {
     let flat = upscale(frame.as_slice(), WIDTH, 1);
     assert_eq!(px(&got, 84, 60), YELLOW);
     assert_eq!(px(&got, 50, 60), px(&flat, 50, 60));
+}
+
+/// Widescreen margin sprites are baked into the wide indexed frame, so HD
+/// margin art would paint over them: both sprite passes must replay them,
+/// with the window's claim and `behind` rules against the margin tiles.
+#[test]
+fn margin_sprites_replay_over_hd_margins() {
+    use z2_ppu::MarginSprite;
+    let chr = chr_image();
+    let mut p = scene(&chr);
+    let (frame, rec) = frame_and_record(&mut p);
+    let tiles = 4u8;
+    let mut margins = Margins::new(tiles);
+    let bg = |tile: u8| BgTileId {
+        page: BG_PAGE,
+        tile,
+        pal: 0,
+        fine_y: 0,
+        fetched: true,
+        ..BgTileId::NONE
+    };
+    for l in margins.lines.iter_mut() {
+        l.fill = MarginFill::Tiles;
+        l.left = [bg(TILE_FLAT1); MARGIN_SLOTS]; // NES-opaque
+        l.right = [bg(TILE_CLEAR); MARGIN_SLOTS]; // NES-transparent
+    }
+    let spr = |x: i16, attr: u8| MarginSprite {
+        x,
+        y: 99,
+        tile: SPR_SOLID,
+        attr,
+    };
+    margins.sprites = vec![spr(-24, 0), spr(-12, 0x20), spr(260, 0x20)];
+    let mut wide = WideFrame::new(tiles);
+    render_wide_indexed(&frame, &rec, &margins, &chr, &mut wide);
+    let mp = wide.margin_px();
+    let w = wide.width;
+    let sprite_idx = rec.line(100).palette_entry(0x12);
+    assert_eq!(
+        wide.row(100)[mp - 24],
+        sprite_idx,
+        "front sprite in the indexed margin"
+    );
+    assert_ne!(
+        wide.row(100)[mp - 12],
+        sprite_idx,
+        "behind loses to opaque margin"
+    );
+    assert_eq!(
+        wide.row(100)[mp + 260],
+        sprite_idx,
+        "behind shows over clear margin"
+    );
+    let at = |img: &[u8], wx: i32| {
+        let i = (100 * w + (wx + mp as i32) as usize) * 4;
+        [img[i], img[i + 1], img[i + 2], img[i + 3]]
+    };
+    let red = [255, 0, 0, 255];
+    let nes_sprite = indexed_to_rgba(sprite_idx);
+    let run = |pack: &HdPack, margins: &Margins, wide: &WideFrame| {
+        compose(
+            1,
+            tiles,
+            IndexedView::wide(wide),
+            &rec,
+            &chr,
+            Some(pack),
+            Some(margins),
+        )
+    };
+
+    // HD background only: sprites keep their NES colours over red margins.
+    let bg_pack = build_pack(1, vec![(BG_PAGE, None, Box::new(move |_, _, _| red))]);
+    let got = run(&bg_pack, &margins, &wide);
+    assert_eq!(at(&got, -24), nes_sprite, "replayed over HD margin art");
+    assert_eq!(at(&got, -12), red, "behind: HD margin wins");
+    assert_eq!(at(&got, 260), nes_sprite);
+    assert_eq!(at(&got, -25), red, "margin art elsewhere");
+
+    // HD sprite art, in the plain pass and in the art-alpha (shaped) pass.
+    let files = || {
+        vec![
+            ("bg.png", common::page_sheet_png(1, move |_, _, _| red)),
+            ("spr.png", png(8, 8, |_, _| GREEN)),
+        ]
+    };
+    let body = |alpha: &str| {
+        format!(
+            "{alpha}\"sheets\":[{{\"file\":\"bg.png\",\"page\":{BG_PAGE}}},{{\"file\":\"spr.png\"}}],\
+             \"tiles\":[{{\"page\":{SPR_PAGE},\"tile\":{SPR_SOLID},\"sheet\":\"spr.png\",\"x\":0,\"y\":0}}]"
+        )
+    };
+    for alpha in ["", "\"sprite_alpha\":\"art\","] {
+        let pack = pack_from(&body(alpha), files());
+        let got = run(&pack, &margins, &wide);
+        assert_eq!(
+            at(&got, -24),
+            GREEN,
+            "{alpha}: margin sprite takes pack art"
+        );
+        assert_eq!(at(&got, -17), GREEN, "{alpha}: whole row");
+        assert_eq!(at(&got, -12), red, "{alpha}: behind still loses");
+        assert_eq!(at(&got, 260), GREEN, "{alpha}");
+        assert_eq!(at(&got, 268), red, "{alpha}: nothing past the sprite");
+    }
+
+    // Without margin sprites nothing is replayed there.
+    margins.sprites.clear();
+    render_wide_indexed(&frame, &rec, &margins, &chr, &mut wide);
+    let got = run(&bg_pack, &margins, &wide);
+    assert_eq!(at(&got, -24), red);
 }

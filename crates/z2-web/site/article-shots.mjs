@@ -118,7 +118,8 @@ async function pagePart() {
   const srv = await serveSite();
   cleanup.push(() => srv.close());
   const page = await (await (await launch()).newContext(VIEW)).newPage();
-  await page.goto(`${srv.origin}/?widescreen=16:9&coop=1&zoom=2`, { waitUntil: 'load' });
+  // Movie replay: wide gameplay off, or encounters move and the movie desyncs.
+  await page.goto(`${srv.origin}/?widescreen=16:9&widegame=0&coop=1&zoom=2`, { waitUntil: 'load' });
   await page.waitForFunction(() => window.z2 !== undefined, null, { timeout: 30000 });
   await page.screenshot({ path: join(OUT, 'web_drop_rom.png') });
   await loadRomInto(page, romB64);

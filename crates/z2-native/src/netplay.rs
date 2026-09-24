@@ -592,18 +592,22 @@ pub fn rollback_delay(cli: Option<u8>, config: u8) -> Result<u8, String> {
 }
 
 /// Build the game a rollback session starts from on `Running`: power-on with
-/// the session's co-op flags, then the host's WRAM when one was sent. Same
-/// construction as the lockstep `Started` path.
+/// the session's co-op flags (and this peer's wide-gameplay margin, which the
+/// handshake already matched through the trap-set identity), then the host's
+/// WRAM when one was sent. Same construction as the lockstep `Started` path.
 pub fn session_emu(
     body: &[u8],
     audio_rate: u32,
     record: bool,
+    wide_gameplay: Option<u8>,
     coop_flags: u32,
     wram: &[u8],
 ) -> Result<Emu, String> {
     let feats = Features {
         coop: coop_flags & COOP_TWO_LINKS != 0,
+        wide_gameplay,
         record,
+        margin_sprites: false,
     };
     let mut emu = emu_from_rom_body_with(body, audio_rate, feats)?;
     if wram.len() == emu.game.wram.len() {

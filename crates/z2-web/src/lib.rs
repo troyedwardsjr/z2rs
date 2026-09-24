@@ -288,11 +288,23 @@ pub struct WebEmu {
     /// would otherwise leave a black bar between the play field and the right
     /// margin.
     fill_right_clip: bool,
+    /// Draw side-view enemies, NPCs and items outside the window into the
+    /// margins (widescreen only; `Game::set_margin_sprites`). Display only:
+    /// the observer stays out of [`trapset_id`]. Default on.
+    margin_sprites: bool,
     /// Two-Link co-op requested. Re-applied after every ROM load, so the flag
     /// cannot go stale when a second ROM is dropped into the page.
     coop: bool,
-    /// Identity of the registered trap set (see [`trapset_id`]).
+    /// Wide gameplay requested: while widescreen is on, enemies spawn and
+    /// live in the margins ([`Game::set_wide_gameplay`] with the widescreen
+    /// margin). Default on; it changes gameplay, so it is part of the netplay
+    /// identity. Re-applied after every ROM load.
+    wide_gameplay: bool,
+    /// Identity of the registered trap set (see [`trapset_id`]) with the
+    /// wide-gameplay margin folded in ([`session_trapset_id`]).
     trapset_id: u64,
+    /// [`trapset_id`] of the default groups alone.
+    trapset_base: u64,
     /// HD-pack presenter and the staged directory upload (feature `hd`).
     #[cfg(feature = "hd")]
     hd: HdSlot,
@@ -319,7 +331,9 @@ pub const WEB_DEFAULT_MAX_PREDICTION: u8 = 8;
 pub const WEB_MAX_PREDICTION: u8 = 12;
 
 /// Identity of a registered trap set: FNV-1a over every `(addr, name)` pair,
-/// address-sorted so registration order cannot change it.
+/// address-sorted so registration order cannot change it. Display-only
+/// observers ([`z2_core::wide_sprites::is_display_only_trap`]) are left out,
+/// so peers with different widescreen settings still connect.
 ///
 /// **This algorithm is duplicated in `z2-native` (`app::trapset_id`) and the
 /// two must stay byte-identical**, or a native host and a web guest reject
@@ -327,8 +341,12 @@ pub const WEB_MAX_PREDICTION: u8 = 12;
 /// pin it to [`TRAPSET_PIN_VALUE`] for the same input.
 #[must_use]
 pub fn trapset_id(game: &Game) -> u64 {
-    let mut entries: Vec<(u16, &'static str)> =
-        game.traps.iter().map(|t| (t.addr, t.name)).collect();
+    let mut entries: Vec<(u16, &'static str)> = game
+        .traps
+        .iter()
+        .filter(|t| !z2_core::wide_sprites::is_display_only_trap(t.name))
+        .map(|t| (t.addr, t.name))
+        .collect();
     entries.sort_unstable();
     fold_trapset(&entries)
 }
@@ -350,6 +368,29 @@ fn fold_trapset(entries: &[(u16, &str)]) -> u64 {
     }
     h
 }
+
+/// Session identity: [`trapset_id`] with the wide-gameplay margin folded in
+/// (the same FNV-1a continued over `"wide_gameplay"` and the tile count);
+/// `None` leaves the id untouched.
+///
+/// **Duplicated in `z2-native` (`app::session_trapset_id`)**; both are pinned
+/// to [`WIDE_TRAPSET_PIN_VALUE`].
+#[must_use]
+pub fn session_trapset_id(base: u64, wide_tiles: Option<u8>) -> u64 {
+    let Some(tiles) = wide_tiles else {
+        return base;
+    };
+    let mut h = base;
+    for b in b"wide_gameplay".iter().chain(core::iter::once(&tiles)) {
+        h ^= u64::from(*b);
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+
+/// Cross-crate pin for [`session_trapset_id`]:
+/// `session_trapset_id(TRAPSET_PIN_VALUE, Some(11))`.
+pub const WIDE_TRAPSET_PIN_VALUE: u64 = 0x1094_c616_9aeb_24b9;
 
 /// Cross-crate pin for [`trapset_id`]: the value both `z2-web` and
 /// `z2-native` must produce for the entries
@@ -555,8 +596,11 @@ impl WebEmu {
             wide: None,
             fill_left_clip: true,
             fill_right_clip: true,
+            margin_sprites: true,
             coop: false,
+            wide_gameplay: true,
             trapset_id: 0,
+            trapset_base: 0,
             #[cfg(feature = "hd")]
             hd: HdSlot::new(),
             #[cfg(feature = "net")]
@@ -788,6 +832,7 @@ impl WebEmu {
             ));
         }
         self.wide_tiles = tiles;
+        self.apply_wide_gameplay();
         if tiles == 0 {
             self.margins = None;
             self.wide = None;
@@ -795,6 +840,7 @@ impl WebEmu {
             let mut m = z2_ppu::Margins::new(tiles);
             m.fill_left_clip = self.fill_left_clip;
             m.fill_right_clip = self.fill_right_clip;
+            m.fill_left_sprites = self.margin_sprites;
             self.margins = Some(Box::new(m));
             self.wide = Some(Box::new(z2_ppu::WideFrame::new(tiles)));
         }
@@ -834,6 +880,24 @@ impl WebEmu {
         self.fill_right_clip = on;
         if let Some(m) = self.margins.as_mut() {
             m.fill_right_clip = on;
+        }
+        self.sync_present()
+    }
+
+    /// Whether side-view objects outside the window are drawn into the
+    /// margins (widescreen only).
+    pub fn margin_sprites(&self) -> bool {
+        self.margin_sprites
+    }
+
+    /// Set [`WebEmu::margin_sprites`]. The game keeps enemies, NPCs and items
+    /// alive well past the window edge; with this on they are drawn into the
+    /// margins (and the part of one just left of the window that the game
+    /// hides). The game runs byte-identically either way.
+    pub fn set_margin_sprites(&mut self, on: bool) -> Result<(), String> {
+        self.margin_sprites = on;
+        if let Some(m) = self.margins.as_mut() {
+            m.fill_left_sprites = on;
         }
         self.sync_present()
     }
@@ -1022,6 +1086,28 @@ impl WebEmu {
             format!("unknown widescreen preset '{name}' (off | 16:10 | 16:9 | N)")
         })?;
         self.set_widescreen(tiles)
+    }
+
+    /// Whether wide gameplay is requested (it acts only while widescreen is
+    /// on).
+    pub fn wide_gameplay(&self) -> bool {
+        self.wide_gameplay
+    }
+
+    /// Wide-gameplay margin in effect, tiles per side (0 = off).
+    pub fn wide_gameplay_tiles(&self) -> u8 {
+        self.wide_gameplay_margin().unwrap_or(0)
+    }
+
+    /// Request wide gameplay on or off: with widescreen on, overworld blobs,
+    /// side-view enemies and townsfolk spawn and live in the margins instead
+    /// of popping in at the original screen edge. Changes gameplay (and the
+    /// netplay identity); ignored for the running game while a netplay
+    /// session is live, and re-applied after every ROM load.
+    pub fn set_wide_gameplay(&mut self, on: bool) -> Result<(), String> {
+        self.wide_gameplay = on;
+        self.apply_wide_gameplay();
+        Ok(())
     }
 
     /// Enable/disable two-Link co-op (pad 2 drives a second Link in
@@ -1393,8 +1479,10 @@ impl WebEmu {
     /// `load_rom` (which builds a brand-new `Game`).
     fn sync_present(&mut self) -> Result<(), String> {
         let want_record = self.needs_record();
+        let want_sprites = self.wide_tiles > 0 && self.margin_sprites;
         if let Some(g) = self.game.as_mut() {
             g.set_record(want_record);
+            g.set_margin_sprites(want_sprites);
         }
         #[cfg(feature = "hd")]
         {
@@ -1488,13 +1576,16 @@ impl WebEmu {
         // identity between peers, so a web guest could never have joined a
         // native host without it.
         z2_core::boot_traps::register_boot_traps(&mut game);
-        self.trapset_id = trapset_id(&game);
+        self.trapset_base = trapset_id(&game);
         // Re-apply the opt-in features to the NEW game. Without this a second
         // ROM load would silently drop widescreen and co-op while the UI still
         // showed them as on.
         if self.coop {
             game.set_coop(true);
         }
+        let wide = self.wide_gameplay_margin();
+        game.set_wide_gameplay(wide);
+        self.trapset_id = session_trapset_id(self.trapset_base, wide);
 
         let mut assets = Vec::with_capacity(extracted.sections.len());
         for s in &extracted.sections {
@@ -1529,6 +1620,28 @@ impl WebEmu {
         // while the controls still showed them on.
         self.sync_present().map_err(WebError::Rom)?;
         Ok(())
+    }
+
+    /// Wide-gameplay margin the settings ask for.
+    fn wide_gameplay_margin(&self) -> Option<u8> {
+        (self.wide_gameplay && self.wide_tiles > 0).then_some(self.wide_tiles)
+    }
+
+    /// Push the wide-gameplay setting into the running game (not while a
+    /// netplay session is live: both peers started with the margin the
+    /// handshake matched, and changing it would desync them).
+    fn apply_wide_gameplay(&mut self) {
+        #[cfg(feature = "net")]
+        if self.net.is_some() {
+            return;
+        }
+        let want = self.wide_gameplay_margin();
+        if let Some(g) = self.game.as_mut() {
+            if g.wide_gameplay_tiles() != want {
+                g.set_wide_gameplay(want);
+            }
+            self.trapset_id = session_trapset_id(self.trapset_base, want);
+        }
     }
 
     /// Two-pad sibling of [`WebEmu::step_one`] (co-op / netplay).
@@ -1645,10 +1758,12 @@ impl WebEmu {
             rgba,
             wide_tiles,
             fill_right_clip,
+            margin_sprites,
             ..
         } = self;
         let tiles = *wide_tiles;
         let right_clip = *fill_right_clip;
+        let left_sprites = *margin_sprites;
         let game = game.as_ref().ok_or_else(|| WebError::NoRom.to_string())?;
         let p = hd
             .presenter
@@ -1660,6 +1775,7 @@ impl WebEmu {
             // `PresentConfig` carries both edge flags, but the toggles can
             // change between `set_config` calls, so re-apply here each frame.
             p.margins_mut().fill_right_clip = right_clip;
+            p.margins_mut().fill_left_sprites = left_sprites;
             game.wide_margins(tiles, p.margins_mut());
         }
         if p.needs_scene() {
@@ -2604,6 +2720,34 @@ mod tests {
         assert_eq!(emu.coop_status().unwrap(), "null", "off reports null");
     }
 
+    /// The wide-gameplay half of the cross-crate netplay pin (see below).
+    #[test]
+    fn session_trapset_id_matches_the_cross_crate_pin() {
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11)),
+            WIDE_TRAPSET_PIN_VALUE,
+            "session_trapset_id changed: update z2-native's WIDE_TRAPSET_PIN_VALUE in lockstep"
+        );
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, None),
+            TRAPSET_PIN_VALUE
+        );
+    }
+
+    #[test]
+    fn wide_gameplay_defaults_on_and_follows_widescreen() {
+        let mut emu = WebEmu::new();
+        assert!(emu.wide_gameplay(), "the page defaults it on");
+        assert_eq!(emu.wide_gameplay_tiles(), 0, "inactive without widescreen");
+        emu.set_widescreen(11).unwrap();
+        assert_eq!(emu.wide_gameplay_tiles(), 11);
+        emu.set_wide_gameplay(false).unwrap();
+        assert_eq!(emu.wide_gameplay_tiles(), 0);
+        emu.set_wide_gameplay(true).unwrap();
+        emu.set_widescreen(8).unwrap();
+        assert_eq!(emu.wide_gameplay_tiles(), 8);
+    }
+
     /// The cross-crate netplay pin, asserted here as well as in `z2-native`:
     /// the two implementations must agree or a native host and a web guest
     /// reject each other's handshake.
@@ -2707,6 +2851,34 @@ mod tests {
         emu.set_fill_left_clip(true).unwrap();
         emu.set_widescreen_preset("16:9").unwrap();
         assert!(emu.margins.as_ref().unwrap().fill_left_clip);
+    }
+
+    /// Margin sprites: on by default, registered only while widescreen is
+    /// on, and never part of the netplay trap-set identity.
+    #[test]
+    fn margin_sprites_follow_widescreen_and_stay_out_of_the_trapset() {
+        let mut emu = booted();
+        assert!(
+            emu.margin_sprites(),
+            "the page draws objects in the margins"
+        );
+        let game = |emu: &WebEmu| emu.game.as_ref().unwrap().margin_sprites_enabled();
+        let id_off = trapset_id(emu.game.as_ref().unwrap());
+        assert!(!game(&emu), "no observer without widescreen");
+        emu.set_widescreen_preset("16:9").unwrap();
+        assert!(game(&emu));
+        assert!(emu.margins.as_ref().unwrap().fill_left_sprites);
+        assert_eq!(
+            trapset_id(emu.game.as_ref().unwrap()),
+            id_off,
+            "display-only observer must not split netplay peers"
+        );
+        emu.set_margin_sprites(false).unwrap();
+        assert!(!game(&emu));
+        assert!(!emu.margins.as_ref().unwrap().fill_left_sprites);
+        emu.set_margin_sprites(true).unwrap();
+        emu.set_widescreen_preset("off").unwrap();
+        assert!(!game(&emu));
     }
 
     /// The canvas is sized from these four numbers, so they must stay

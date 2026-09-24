@@ -23,7 +23,7 @@ use z2_core::wide_margins::{
     MarginPolicy, ADDR_AREA_PRG_BANK, ADDR_GAME_MODE, ADDR_GROUND_TYPE, ADDR_MENU, MODE_OVERWORLD,
     MODE_SIDEVIEW,
 };
-use z2_ppu::{FrameRecord, MarginFill, Margins, WideFrame, WIDTH};
+use z2_ppu::{edge_fill, wide_bg_tile, FrameRecord, MarginFill, Margins, WideFrame, WIDTH};
 
 fn register_all_groups(g: &mut Game) {
     z2_core::bank7_traps::register_bank7_traps(g);
@@ -359,4 +359,126 @@ fn dump_wide_pngs_when_requested() {
             eprintln!("wrote {}", path.display());
         }
     }
+}
+
+/// The overworld's edge strips (window x 0-7 and 248-255) are what the ROM
+/// hides, and for good reason: its nametable is a single 32-column ring, so
+/// window slots 0 and 32 share one nametable column, and the column being
+/// streamed sits half-written in slot 1 or 31. Painting the strips from the
+/// recorded tiles showed those stale columns as seams. With the fills on,
+/// the strips must show the map instead: every strip pixel's tile identity
+/// is compared with what the NES draws for the same world cell once it has
+/// scrolled into the settled interior (slots 2..=30) — the same scroll
+/// consistency check as the margins — and the recorded identities are
+/// tallied alongside to pin the root cause.
+#[test]
+fn overworld_edge_strips_follow_the_map() {
+    let Some((mut g, pads)) = setup() else {
+        return;
+    };
+    g.set_record(true);
+    let chr = g.chr.clone();
+    let mut margins = Margins::new(11);
+    margins.fill_left_clip = true;
+    margins.fill_right_clip = true;
+    // (world tile column, map row, parity) -> every (frame, strip id, record
+    // id) shown there that has not been checked yet.
+    type Shown = (usize, u8, u8, u8, u8);
+    let mut preds: HashMap<(i32, i32, u8), Vec<Shown>> = HashMap::new();
+    let mut prev_map: Vec<u8> = Vec::new();
+    let (mut strip_lines, mut compared, mut fixed_ok, mut record_ok) = (0u64, 0u64, 0u64, 0u64);
+    let mut first_miss: Vec<String> = Vec::new();
+    for (t, &pad) in pads.iter().enumerate().take(pads.len().min(6000)) {
+        g.step(pad);
+        if g.ram[usize::from(ADDR_GAME_MODE)] != MODE_OVERWORLD {
+            preds.clear();
+            continue;
+        }
+        if g.wram[0x1C00..] != prev_map[..] {
+            preds.clear();
+            prev_map = g.wram[0x1C00..].to_vec();
+        }
+        let rec: FrameRecord = g.frame_record().expect("record on").clone();
+        build_margins(&g.ram, &g.wram, &g.prg, &rec, 11, &mut margins);
+        for y in 0..240 {
+            let line = rec.line(y);
+            if margin_policy(MODE_OVERWORLD, 0, line) != MarginPolicy::Overworld || line.split {
+                continue;
+            }
+            let wt0 = overworld_world_left(&g.ram, line) >> 3;
+            let (r, parity) = overworld_row(&g.ram, line, y);
+            // Settled interior: check earlier strip predictions.
+            for k in 2..=30usize {
+                let actual = line.tiles[k];
+                let key = (wt0 + k as i32, r, parity);
+                if !actual.fetched {
+                    continue;
+                }
+                let Some(shown) = preds.get_mut(&key) else {
+                    continue;
+                };
+                for &(f, tile, pal, rtile, rpal) in shown.iter() {
+                    if f == t || f + MAX_AGE < t {
+                        continue;
+                    }
+                    compared += 1;
+                    if (tile, pal) == (actual.tile, actual.pal) {
+                        fixed_ok += 1;
+                    } else if first_miss.len() < 8 {
+                        first_miss.push(format!(
+                            "frame {t} (strip at {f}) y {y} wt {} pred {tile:02X}/{pal} actual {:02X}/{}",
+                            key.0, actual.tile, actual.pal
+                        ));
+                    }
+                    if (rtile, rpal) == (actual.tile, actual.pal) {
+                        record_ok += 1;
+                    }
+                }
+                shown.retain(|&(f, ..)| f == t);
+            }
+            // Strips shown this frame.
+            let fill = edge_fill(&rec, &margins, y, &chr);
+            assert!(
+                fill.left,
+                "frame {t} line {y}: the overworld clips the left 8 columns"
+            );
+            let ml = &margins.lines[y];
+            let mut any = false;
+            let strips = (0..8).chain(if fill.right { 248..256 } else { 0..0 });
+            for wx in strips {
+                let (id, sub_x) = wide_bg_tile(line, Some(ml), fill, wx);
+                if sub_x != 0 && wx != 0 && wx != 248 {
+                    continue; // one sample per slot
+                }
+                let k = (wx + i32::from(line.fine_x & 7)) >> 3;
+                let rid = line.tiles[k as usize];
+                assert!(id.fetched, "frame {t} line {y} x {wx}: strip has a tile");
+                preds
+                    .entry((wt0 + k, r, parity))
+                    .or_default()
+                    .push((t, id.tile, id.pal, rid.tile, rid.pal));
+                any = true;
+            }
+            strip_lines += u64::from(any);
+        }
+    }
+    let rate = |ok: u64| ok as f64 / compared.max(1) as f64;
+    eprintln!(
+        "overworld strips: {strip_lines} lines; vs later interior: map {fixed_ok}/{compared} = {:.4}, record {record_ok}/{compared} = {:.4}",
+        rate(fixed_ok),
+        rate(record_ok)
+    );
+    for m in &first_miss {
+        eprintln!("  miss: {m}");
+    }
+    assert!(compared > 10_000, "too few strip comparisons ({compared})");
+    assert!(
+        rate(fixed_ok) >= 0.99,
+        "strip/map match rate {:.4}",
+        rate(fixed_ok)
+    );
+    assert!(
+        rate(record_ok) < 0.95,
+        "the recorded strip tiles were expected to be the stale ones"
+    );
 }

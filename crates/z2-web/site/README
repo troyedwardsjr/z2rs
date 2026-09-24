@@ -100,7 +100,7 @@ Keyboard, gamepad and the on-screen controller are OR-ed together every frame (`
 
 Use the Screen select (`off`, 16:10 or 16:9), or `?widescreen=16:9` in the URL. `?wide=` also works, and a bare number up to 16 sets the margin in tiles per side. The canvas is resized from `WebEmu::frame_width()` and `frame_height()`. The 256x240 NES frame itself is untouched.
 
-The margins are scenery only. They hold no sprites, so enemies still appear at the original screen edge, and dialogue boxes and the pause pane do not extend into them.
+Side-view enemies, townspeople and items that are outside the NES picture are drawn in the margins ("objects in margins", `?msprites=0` turns it off). The "enemies in the margins" checkbox (wide gameplay, `?widegame=0` turns it off) makes overworld encounters, side-view enemies and townspeople spawn out past the margins instead of at the original screen edge. It changes the game, so it is part of the netplay identity: both peers must match, and it cannot change during a session. Projectiles still appear at the original edge, and dialogue boxes and the pause pane do not extend into the margins.
 
 The "fill left edge" checkbox (`?clip=0` turns it off) paints the 8 columns the ROM blanks with `PPUMASK $18`. "Fill right edge" (`?rclip=0`) paints the 8 columns the overworld hides behind a column of opaque black sprites at x 248. If you leave either one unpainted, you get a black bar between the play field and that margin. Both are on by default in the page, even though `Margins::fill_left_clip` and `fill_right_clip` default to off in the engine.
 
@@ -168,6 +168,9 @@ The nine members above are the stable contract. Every control added for widescre
 | `ext.setWide(preset)` | `"off"` \| `"16:10"` \| `"16:9"` \| `"N"` → tiles per side; resizes the canvas and the Screen select |
 | `ext.wideTiles()` | → margin tiles per side (0 = off) |
 | `ext.frameSize()` | → `{width, height, logicalWidth, logicalHeight, scale}`; `width == logicalWidth * scale` |
+| `ext.setMarginSprites(on)` | draw side-view objects in the margins; returns the new state |
+| `ext.setWideGameplay(on)` | wide gameplay on or off; returns the margin in tiles now in effect (0 when off or without widescreen) |
+| `ext.wideGameplayTiles()` | wide-gameplay margin in tiles per side (0 when off) |
 | `ext.setFillLeftClip(on)` | paint the window's blanked left 8 columns (widescreen only) |
 | `ext.setZoom(n)` | on-screen CSS pixels per NES pixel, 1 to 4 |
 | `ext.hd.supported()` | → whether this bundle has HD-pack support |
@@ -209,6 +212,8 @@ In rollback mode `net.status()` adds `mode`, `rttMs`, `rollbacks`, `rollbackFram
 | `?widescreen=` (or `?wide=`) | `off` \| `16:10` \| `16:9` \| `1` to `16` tiles per side |
 | `?clip=0` | stop painting the window's blanked left 8 columns |
 | `?rclip=0` | stop painting the window's masked right 8 columns |
+| `?msprites=0` | do not draw side-view objects in the margins |
+| `?widegame=0` | keep enemies at the original screen edge in widescreen (wide gameplay off) |
 | `?scale=` | HD output multiplier 1 to 4 (above 1 needs an `hd` bundle) |
 | `?zoom=` | on-screen CSS pixels per NES pixel, 1 to 4 |
 | `?coop=1` | start with local two-player co-op on |

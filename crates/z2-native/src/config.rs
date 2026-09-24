@@ -326,6 +326,18 @@ pub struct NativeConfig {
     /// touched either way. Default on.
     #[serde(default = "default_true")]
     pub widescreen_fill_right_clip: bool,
+    /// Draw side-view enemies, NPCs and items outside the window into the
+    /// widescreen margins (display only). On by default.
+    #[serde(default = "default_true")]
+    pub widescreen_margin_sprites: bool,
+    /// Wide gameplay: with widescreen on, overworld encounter blobs, side-view
+    /// enemies and townsfolk spawn and live out in the margins instead of
+    /// popping in at the original screen edge. This one **changes gameplay**
+    /// (encounter timing, netplay identity). Only takes effect while
+    /// `widescreen` is on, with the same margin. Default on. See
+    /// README.md, "Wide gameplay".
+    #[serde(default = "default_true")]
+    pub widescreen_gameplay: bool,
     /// HD graphics pack directory (the one holding `pack.json`), or `None` for
     /// the original art.
     #[serde(default)]
@@ -394,6 +406,8 @@ impl Default for NativeConfig {
             widescreen: default_widescreen(),
             widescreen_fill_left_clip: true,
             widescreen_fill_right_clip: true,
+            widescreen_margin_sprites: true,
+            widescreen_gameplay: true,
             hd_pack: None,
             hd_scale: default_hd_scale(),
             hd_record: None,
@@ -577,6 +591,7 @@ mod tests {
         assert_eq!(c.netplay, NetplayConfig::default());
         assert!(c.widescreen_fill_left_clip);
         assert!(c.widescreen_fill_right_clip);
+        assert!(c.widescreen_gameplay);
         assert!(c.hd_pack.is_none());
         assert_eq!(c.hd_scale, 1);
         assert!(c.hd_record.is_none());
@@ -591,6 +606,7 @@ mod tests {
             "widescreen": "16:9",
             "widescreen_fill_left_clip": false,
             "widescreen_fill_right_clip": false,
+            "widescreen_gameplay": false,
             "hd_pack": "/home/me/art/pack",
             "hd_scale": 4,
             "hd_record": "/home/me/art/rec",
@@ -600,6 +616,7 @@ mod tests {
         assert_eq!(c.widescreen_tiles(), 11);
         assert!(!c.widescreen_fill_left_clip);
         assert!(!c.widescreen_fill_right_clip);
+        assert!(!c.widescreen_gameplay);
         assert_eq!(c.hd_pack.as_deref(), Some("/home/me/art/pack"));
         assert_eq!(c.effective_hd_scale(), 4);
         assert_eq!(c.hd_record.as_deref(), Some("/home/me/art/rec"));

@@ -32,7 +32,9 @@ fn coop_emu(test: &str) -> Option<app::Emu> {
     let path = common::rom_path(test)?;
     let feats = Features {
         coop: true,
+        wide_gameplay: None,
         record: false,
+        margin_sprites: false,
     };
     let (emu, _body) = app::emu_from_rom_file_with(&path, 44_100, feats).expect("build ROM emu");
     Some(emu)
@@ -117,7 +119,9 @@ fn coop_boot_reaches_sideview_gameplay_with_p2_idle() {
             &mut toggled,
             Features {
                 coop: true,
+                wide_gameplay: None,
                 record: false,
+                margin_sprites: false,
             },
         );
         assert!(
@@ -197,7 +201,9 @@ fn coop_dual_pad_script_is_deterministic() {
         };
         let feats = Features {
             coop: true,
+            wide_gameplay: None,
             record: false,
+            margin_sprites: false,
         };
         // Shared script: pad-2 idle through the menu flow, then pad 2 walks
         // right while pad 1 idles in gameplay.

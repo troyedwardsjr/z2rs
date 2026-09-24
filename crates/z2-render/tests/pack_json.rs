@@ -10,6 +10,46 @@ const GREEN: [u8; 4] = [0, 255, 0, 255];
 const BLUE: [u8; 4] = [0, 0, 255, 255];
 const CLEAR: [u8; 4] = [0, 0, 0, 0];
 
+#[test]
+fn layer_background_signature_validation_and_roundtrip() {
+    let manifest = |signature: serde_json::Value| {
+        serde_json::json!({
+            "version":1,"name":"signature","scale":1,"sheets":[],
+            "layers":[{"file":"layer.png","when":{"background_tile":signature}}]
+        })
+    };
+    let valid = serde_json::json!({"x":255,"y":239,"page":31,"tile":255,"colors":[0,32,63]});
+    let json = manifest(valid.clone()).to_string();
+    let parsed: z2_render::PackManifest = serde_json::from_str(&json).unwrap();
+    let roundtrip = serde_json::to_string(&parsed).unwrap();
+    assert_eq!(parsed, serde_json::from_str(&roundtrip).unwrap());
+    let pack = load(&roundtrip, vec![("layer.png", solid_png(1, 1, RED))]).unwrap();
+    assert_eq!(pack.layers()[0].background_tile.unwrap().x, 255);
+    for (key, value) in [
+        ("x", serde_json::json!(256)),
+        ("y", serde_json::json!(240)),
+        ("page", serde_json::json!(32)),
+        ("tile", serde_json::json!(256)),
+        ("colors", serde_json::json!([0, 1, 64])),
+        ("colors", serde_json::json!([0, 1])),
+        ("x", serde_json::json!(-1)),
+    ] {
+        let mut bad = valid.clone();
+        bad[key] = value;
+        assert!(
+            load(
+                &manifest(bad).to_string(),
+                vec![("layer.png", solid_png(1, 1, RED))]
+            )
+            .is_err(),
+            "{key}"
+        );
+    }
+    let legacy: z2_render::LayerWhen = serde_json::from_str(r#"{"world":1}"#).unwrap();
+    assert!(legacy.background_tile.is_none());
+    assert_eq!(serde_json::to_string(&legacy).unwrap(), r#"{"world":1}"#);
+}
+
 /// Scale-1 page sheet with only `tile` painted `px`.
 fn one_tile_sheet(tile: u8, px: [u8; 4]) -> Vec<u8> {
     page_sheet_png(1, move |t, _, _| if t == tile { px } else { CLEAR })
