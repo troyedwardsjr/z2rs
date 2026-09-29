@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Z2rs" parent="Theme.Material3.DayNight.NoActionBar">
+        <item name="colorPrimary">@color/z2_primary_night</item>
+        <item name="colorOnPrimary">@color/z2_on_primary_night</item>
+    </style>
+</resources>

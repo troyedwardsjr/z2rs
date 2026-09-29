@@ -325,9 +325,10 @@ fn synthetic_emu() -> Emu {
     }
 }
 
-/// Run `body` on a thread with an explicit stack. An `Emu` is 83 KiB and an
-/// unoptimized build moves it by value through `run_pair`, `Peer::tick` and
-/// the constructors behind `Rebuild`; measured on a debug build, the ROM run
+/// Run `body` on a thread with an explicit stack. An `Emu` was 83 KiB (before
+/// `Game::frame` moved to the heap; about 24 KiB now) and an unoptimized
+/// build moves it by value through `run_pair`, `Peer::tick` and
+/// the constructors behind `Rebuild`; measured on a debug build then, the ROM run
 /// needs more than the 2 MiB a test thread gets and the synthetic run more
 /// than 1.25 MiB of it. A panic in `body` fails the test with its own message.
 fn tall_stack(body: impl FnOnce() + Send + 'static) {

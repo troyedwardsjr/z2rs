@@ -169,6 +169,9 @@ pub struct Settings {
     pub scale: u32,
     /// Start in borderless fullscreen.
     pub fullscreen: bool,
+    /// Scale by whole numbers only (sharper, may leave black borders).
+    /// Off = fill the window / screen height (`--scale-mode fit`).
+    pub integer_scale: bool,
     /// Widescreen margins.
     pub widescreen: Widescreen,
     /// With widescreen, enemies spawn and move in the margins.
@@ -205,6 +208,7 @@ impl Default for Settings {
             rom_path: String::new(),
             scale: 3,
             fullscreen: false,
+            integer_scale: false,
             widescreen: Widescreen::Off,
             wide_gameplay: true,
             margin_sprites: true,
@@ -267,6 +271,10 @@ pub fn build_args(s: &Settings) -> Vec<String> {
     if s.fullscreen {
         push("--fullscreen", None);
     }
+    push(
+        "--scale-mode",
+        Some(if s.integer_scale { "integer" } else { "fit" }.to_string()),
+    );
     push("--widescreen", Some(s.widescreen.flag_value().to_string()));
     if s.widescreen != Widescreen::Off {
         push("--wide-gameplay", Some(on_off(s.wide_gameplay)));
@@ -525,7 +533,16 @@ mod tests {
         let s = Settings::default();
         assert_eq!(
             build_args(&s),
-            vec!["--scale", "3", "--widescreen", "off", "--hd-pack", ""]
+            vec![
+                "--scale",
+                "3",
+                "--scale-mode",
+                "fit",
+                "--widescreen",
+                "off",
+                "--hd-pack",
+                ""
+            ]
         );
     }
 
@@ -548,6 +565,8 @@ mod tests {
                 "--scale",
                 "4",
                 "--fullscreen",
+                "--scale-mode",
+                "fit",
                 "--widescreen",
                 "16:9",
                 "--wide-gameplay",
@@ -598,7 +617,7 @@ mod tests {
             ..Settings::default()
         };
         assert_eq!(
-            build_args(&s)[6..],
+            build_args(&s)[8..],
             [
                 "--coop-host",
                 "zelda-night",

@@ -1,7 +1,7 @@
 name: release
 
-# Builds the desktop app for each supported platform and attaches the archives
-# to a GitHub release. Pushing a tag such as `v0.1.0` publishes the release.
+# Builds the desktop app for each supported platform and the Android APK, and
+# attaches them to a GitHub release. Pushing a tag such as `v0.1.0` publishes the release.
 # Running the workflow by hand builds the same archives and leaves them as
 # workflow artifacts, which is the way to check a build before tagging.
 
@@ -150,9 +150,82 @@ jobs:
           path: ${{ env.ARCHIVE }}
           if-no-files-found: error
 
+  # The Android app: the Rust library for arm64-v8a and x86_64 (cargo-ndk),
+  # then the release APK from the Gradle project in android/. The runner image
+  # already has the Android SDK and JDK 17; the NDK, platform and build tools
+  # are pinned here. Tag builds are signed with the release key from the
+  # repository secrets, so every release installs over the previous one. A
+  # manual run without the secrets leaves an unsigned APK as the artifact.
+  android:
+    name: android
+    runs-on: ubuntu-latest
+    env:
+      NDK_VERSION: 27.2.12479018
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Install the Android NDK, platform and build tools
+        run: |
+          echo "JAVA_HOME=$JAVA_HOME_17_X64" >> "$GITHUB_ENV"
+          yes | "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" --licenses > /dev/null || true
+          "$ANDROID_HOME/cmdline-tools/latest/bin/sdkmanager" \
+            "ndk;$NDK_VERSION" "platforms;android-35" "build-tools;35.0.0" > /dev/null
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/$NDK_VERSION" >> "$GITHUB_ENV"
+
+      - name: Install the Rust targets and cargo-ndk
+        run: |
+          rustup target add aarch64-linux-android x86_64-linux-android
+          cargo install cargo-ndk --locked
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: android
+
+      - name: Build
+        shell: bash
+        run: |
+          version="${GITHUB_REF_NAME#v}"
+          [ "$GITHUB_REF_TYPE" = tag ] || version="0.0.0"
+          Z2RS_VERSION="$version" tools/android/build.sh --apk release
+
+      - name: Sign
+        shell: bash
+        env:
+          KEYSTORE_BASE64: ${{ secrets.ANDROID_KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.ANDROID_KEYSTORE_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+        run: |
+          name="z2rs-${GITHUB_REF_NAME#v}-android"
+          [ "$GITHUB_REF_TYPE" = tag ] || name="z2rs-android"
+          tools="$ANDROID_HOME/build-tools/35.0.0"
+          unsigned=android/app/build/outputs/apk/release/app-release-unsigned.apk
+          if [ -z "$KEYSTORE_BASE64" ]; then
+            if [ "$GITHUB_REF_TYPE" = tag ]; then
+              echo "The release key secrets are not set; a tagged release needs a signed APK." >&2
+              exit 1
+            fi
+            cp "$unsigned" "$name-unsigned.apk"
+            echo "ARCHIVE=$name-unsigned.apk" >> "$GITHUB_ENV"
+            exit 0
+          fi
+          echo "$KEYSTORE_BASE64" | base64 -d > "$RUNNER_TEMP/release.jks"
+          "$tools/zipalign" -P 16 -f 4 "$unsigned" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" sign --ks "$RUNNER_TEMP/release.jks" \
+            --ks-pass env:KEYSTORE_PASSWORD --ks-key-alias "$KEY_ALIAS" \
+            --out "$name.apk" "$RUNNER_TEMP/aligned.apk"
+          "$tools/apksigner" verify --print-certs "$name.apk"
+          rm -f "$RUNNER_TEMP/release.jks"
+          echo "ARCHIVE=$name.apk" >> "$GITHUB_ENV"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: android
+          path: ${{ env.ARCHIVE }}
+          if-no-files-found: error
+
   release:
     name: publish
-    needs: build
+    needs: [build, android]
     if: github.ref_type == 'tag'
     runs-on: ubuntu-latest
     steps:
@@ -166,7 +239,7 @@ jobs:
       - name: Checksums
         run: |
           cd dist
-          sha256sum *.tar.gz *.zip > SHA256SUMS
+          sha256sum *.tar.gz *.zip *.apk > SHA256SUMS
           cat SHA256SUMS
 
       # The binaries are unsigned, so the release notes say what each system
@@ -176,7 +249,7 @@ jobs:
           GH_TOKEN: ${{ github.token }}
         run: |
           cat > notes.md <<'EOF'
-          Desktop builds of z2rs. Download the archive for your system and unpack
+          Desktop and Android builds of z2rs. Download the archive for your system and unpack
           it. Double-click `z2rs-launcher` (`z2rs.app` on macOS), pick your ROM,
           and press Play. The game remembers the ROM, so later you can also start
           `z2rs` directly. `HOW-TO-PLAY.txt` in the archive lists the controls and
@@ -204,8 +277,15 @@ jobs:
           - Linux: if the files do not start, run
             `chmod +x z2rs z2rs-launcher z2-signal`.
 
-          `SHA256SUMS` lists the checksum of every archive.
+          On Android 8.0 or newer, download `z2rs-VERSION-android.apk` on the
+          phone and open it. Android asks once to allow installs from your
+          browser or file manager. Open z2rs, pick your ROM and press Play. An
+          on-screen gamepad is shown until you connect a controller.
+          `guide/android.md` has the details.
+
+          `SHA256SUMS` lists the checksum of every archive and the APK.
           EOF
+          sed -i "s/VERSION/${GITHUB_REF_NAME#v}/" notes.md
           gh release create "$GITHUB_REF_NAME" \
             --title "z2rs $GITHUB_REF_NAME" \
             --notes-file notes.md \

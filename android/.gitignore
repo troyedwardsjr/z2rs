@@ -1,0 +1,14 @@
+# Gradle and IDE state
+.gradle/
+.kotlin/
+build/
+/local.properties
+.idea/
+*.iml
+captures/
+
+# Native libraries built by tools/android/build.sh (cargo-ndk). Never committed.
+/app/src/main/jniLibs/
+
+# Never commit a ROM, even one dropped here for testing (see LEGAL.md).
+*.nes

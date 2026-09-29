@@ -28,21 +28,25 @@
 //!   emulator thread is starving the callback (machine too slow, or the
 //!   frame budget overran — check the title-bar FPS first).
 //!
-//! ## Device-rate negotiation
+//! ## Device-rate negotiation and resampling
 //!
-//! The old code kept the device default rate unconditionally, so a default
-//! 44.1 kHz game on a 48 kHz device drained 3900 samples/s faster than the
-//! emulator produced — an underrun flood (~234k/min) that is clearly audible
-//! (8% zero-order-hold duty ≈ buzzy distortion). [`open_output_stream`] now
-//! requests the game rate when the device offers it at the default channel
-//! count (same sample format preferred), and only then falls back to the
-//! device default with a loud stderr warning. The returned `u32` is the
-//! **actual device rate** (compare against [`SharedAudio::rate`] to detect a
-//! fallback; suggest `audio_rate = <device rate>` to the user).
+//! The ring always holds **game-rate** PCM. [`open_output_stream`] asks the
+//! device for the game rate, then the other shipped rate (48/44.1 kHz), and
+//! otherwise takes the device default (Windows WASAPI shared mode only offers
+//! the mix format, which users can set to 96 or 192 kHz). Whatever rate the
+//! device ends up at, the callback converts through an exact-ratio
+//! [`Resampler`], so the ring drains at exactly the game rate.
 //!
-//! [`select_device_rate`] models the rate dimension of that choice without
-//! hardware (unit-tested); [`drain_minus_production_per_sec`] quantifies the
-//! drift of any game/device pair.
+//! Before the resampler, a mismatched device read game samples at the device
+//! rate: at 192 kHz the ring drained ~4.35x faster than the emulator filled
+//! it. The windowed loop's audio-depth pacing nudge then stepped an extra
+//! frame on every OS tick to refill it, which made the game run 2-4x fast
+//! (and 8.8% fast on the common 44.1 kHz game / 48 kHz device pair), with
+//! glitchy audio. The resampler removes the drift, and the nudge is now rate
+//! limited (see `app::AudioPacer`), so pacing is wall-clock driven with audio
+//! as a soft sync only. [`select_device_rate`] models the rate choice without
+//! hardware; [`drain_minus_production_per_sec`] quantifies the raw drift the
+//! resampler cancels.
 //!
 //! ## Startup prime
 //!
@@ -68,7 +72,7 @@
 //!
 //! [`SharedAudio::push_frame`] is intentionally unbounded: `--headless`
 //! accumulates whole 600-frame dumps for signal-energy gates. When the game
-//! outruns the device (48 kHz game on a 44.1 kHz fallback, or 4×
+//! outruns the device (device clock drift, or 4×
 //! fast-forward), the windowed loop — and only it — should call
 //! [`SharedAudio::trim_oldest`] with [`suggested_max_depth_samples`] (8
 //! frames ≈ 133 ms). Trimmed samples are real (never counted as underruns)
@@ -146,33 +150,159 @@ pub fn effective_channels(channels: u16) -> usize {
     usize::from(channels).max(1)
 }
 
-/// Rate-dimension model of the [`open_output_stream`] negotiation, without
-/// hardware: the game rate when any supported `(min, max)` range covers it,
-/// else the device default.
-///
-/// `want_rate` is clamped to a shipped rate first (unknown → 44100).
+/// Device rates [`open_output_stream`] asks for, best first: the game rate
+/// (no resampling), then the other shipped rate (48 kHz / 44.1 kHz). A rate
+/// the device only offers as its default (96 kHz, 192 kHz, ...) is the last
+/// resort and goes through the [`Resampler`].
 #[must_use]
-pub fn select_device_rate(want_rate: u32, default_rate: u32, supported: &[(u32, u32)]) -> u32 {
+pub fn preferred_device_rates(want_rate: u32) -> [u32; 2] {
     let want = clamp_rate(want_rate);
-    if default_rate == want {
-        return want;
-    }
-    if supported.iter().any(|&(lo, hi)| lo <= want && want <= hi) {
-        want
+    let other = if want == RATE_48000 {
+        RATE_44100
     } else {
-        default_rate
-    }
+        RATE_48000
+    };
+    [want, other]
 }
 
-/// Device drain minus game production, in samples/sec. Positive means the
-/// callback outruns the emulator (underrun flood); negative means the ring
-/// grows (overrun — trim per [`SharedAudio::trim_oldest`]).
+/// Rate-dimension model of the [`open_output_stream`] negotiation, without
+/// hardware: the first of [`preferred_device_rates`] that the device default
+/// or any supported `(min, max)` range covers, else the device default.
 ///
-/// Example: 44.1 kHz game on a 48 kHz device → `+3900`/s (≈234k/min, i.e.
-/// "millions" within minutes).
+/// `want_rate` is clamped to a shipped rate first (unknown → 44100). A device
+/// rate that differs from the game rate is fine: the callback resamples (see
+/// [`Resampler`]), so this choice affects quality only, never game speed.
+#[must_use]
+pub fn select_device_rate(want_rate: u32, default_rate: u32, supported: &[(u32, u32)]) -> u32 {
+    for cand in preferred_device_rates(want_rate) {
+        if default_rate == cand || supported.iter().any(|&(lo, hi)| lo <= cand && cand <= hi) {
+            return cand;
+        }
+    }
+    default_rate
+}
+
+/// Device drain minus game production, in samples/sec, **without**
+/// resampling. Positive means a raw callback would outrun the emulator;
+/// negative means the ring would grow.
+///
+/// Example: 44.1 kHz game on a 48 kHz device → `+3900`/s; on a 192 kHz
+/// device → `+147900`/s. This used to be the real drift (the callback read
+/// game samples at the device rate), and the audio pacing nudge turned it
+/// into game speed-up. The callback now resamples through [`Resampler`], so
+/// the ring drains at the game rate for any device rate; this helper only
+/// describes what the resampler corrects.
 #[must_use]
 pub fn drain_minus_production_per_sec(game_rate: u32, device_rate: u32) -> i64 {
     i64::from(device_rate) - i64::from(game_rate)
+}
+
+/// Exact-ratio linear-interpolation resampler from the game rate to the
+/// device rate (mono `i16`).
+///
+/// The phase is an exact rational (`frac / out_rate`, advanced by `in_rate`
+/// per output sample), so over any run of `n` output samples it consumes
+/// exactly `floor((frac + n * in_rate) / out_rate)` input samples: the ring
+/// drains at precisely the game rate on average, whatever the device rate
+/// (44.1k, 48k, 96k, 192k, ...), with zero long-term drift. That is what
+/// keeps the audio-depth pacing nudge neutral, so the game runs at the NES
+/// rate on every device.
+///
+/// Equal rates are a pass-through (delayed by two samples).
+#[derive(Debug, Clone)]
+pub struct Resampler {
+    in_rate: u64,
+    out_rate: u64,
+    /// Phase numerator in `0..out_rate`.
+    frac: u64,
+    prev: i16,
+    cur: i16,
+}
+
+impl Resampler {
+    /// Resampler from `in_rate` (game) to `out_rate` (device); zero rates are
+    /// treated as 1 so the math never divides by zero.
+    #[must_use]
+    pub fn new(in_rate: u32, out_rate: u32) -> Self {
+        Self {
+            in_rate: u64::from(in_rate.max(1)),
+            out_rate: u64::from(out_rate.max(1)),
+            frac: 0,
+            prev: 0,
+            cur: 0,
+        }
+    }
+
+    /// Input (game) rate.
+    #[must_use]
+    pub fn in_rate(&self) -> u32 {
+        self.in_rate as u32
+    }
+
+    /// Output (device) rate.
+    #[must_use]
+    pub fn out_rate(&self) -> u32 {
+        self.out_rate as u32
+    }
+
+    /// Input samples the next [`process`](Self::process) of `n_out` outputs
+    /// consumes.
+    #[must_use]
+    pub fn input_needed(&self, n_out: usize) -> usize {
+        ((self.frac + n_out as u64 * self.in_rate) / self.out_rate) as usize
+    }
+
+    /// Append `n_out` resampled samples to `out`, consuming
+    /// [`input_needed(n_out)`](Self::input_needed) samples of `input`
+    /// (missing input repeats the last sample, like the FIFO's underrun pad).
+    pub fn process(&mut self, input: &[i16], n_out: usize, out: &mut Vec<i16>) {
+        let mut src = input.iter().copied();
+        out.reserve(n_out);
+        for _ in 0..n_out {
+            let a = i64::from(self.prev);
+            let b = i64::from(self.cur);
+            let v = a + (b - a) * self.frac as i64 / self.out_rate as i64;
+            out.push(v as i16);
+            self.frac += self.in_rate;
+            while self.frac >= self.out_rate {
+                self.frac -= self.out_rate;
+                self.prev = self.cur;
+                self.cur = src.next().unwrap_or(self.cur);
+            }
+        }
+    }
+}
+
+/// Callback-side state: the resampler plus reusable scratch buffers, so a
+/// device callback never allocates in steady state.
+#[derive(Debug, Clone)]
+pub struct CallbackFeed {
+    resampler: Resampler,
+    game: Vec<i16>,
+    device: Vec<i16>,
+}
+
+impl CallbackFeed {
+    /// Feed converting `shared`'s game rate to `device_rate`.
+    #[must_use]
+    pub fn new(game_rate: u32, device_rate: u32) -> Self {
+        Self {
+            resampler: Resampler::new(game_rate, device_rate),
+            game: Vec::new(),
+            device: Vec::new(),
+        }
+    }
+
+    /// Pull enough game samples from `shared` for `n_out` device-rate mono
+    /// samples and return them (exactly `n_out` long).
+    pub fn fill(&mut self, shared: &SharedAudio, n_out: usize) -> &[i16] {
+        self.game.clear();
+        self.device.clear();
+        let need = self.resampler.input_needed(n_out);
+        shared.consume(need, &mut self.game);
+        self.resampler.process(&self.game, n_out, &mut self.device);
+        &self.device
+    }
 }
 
 /// Suggested [`SharedAudio::trim_oldest`] bound: 8 nominal frames (~133 ms).
@@ -378,20 +508,21 @@ pub fn synthetic_apu_frame(rate: u32) -> Vec<i16> {
 
 /// Open the default `cpal` output stream feeding from `shared`.
 ///
-/// The callback duplicates mono game PCM to all device channels (see
-/// [`effective_channels`]). The device default sample format is honoured
-/// (`F32`/`I16`/`U16`, converted via [`pcm_i16_to_f32`]/[`pcm_i16_to_u16`]);
-/// the game rate is requested when the device offers it at the default
-/// channel count, else the device default is kept with a stderr warning
-/// (see [`drain_minus_production_per_sec`]). The ring is primed with one
-/// frame of silence before `play()` so startup costs zero underruns.
-/// Never called in tests — the windowed loop owns the returned stream
-/// handle (dropping it stops audio). Never panics on missing devices:
+/// The callback resamples game PCM to the device rate ([`CallbackFeed`] /
+/// [`Resampler`]) and duplicates mono to all device channels (see
+/// [`effective_channels`]). The sample format is honoured (`F32`/`I16`/`U16`,
+/// converted via [`pcm_i16_to_f32`]/[`pcm_i16_to_u16`]). The device rate is
+/// negotiated per [`select_device_rate`]: the game rate, else 48/44.1 kHz,
+/// at the default channel count; else the device default (e.g. a Windows
+/// shared-mode mix format of 192 kHz). If building a stream at a negotiated
+/// rate fails, the device default config is tried before giving up. The ring
+/// is primed with one frame of silence before `play()` so startup costs zero
+/// underruns. Never called in tests — the windowed loop owns the returned
+/// stream handle (dropping it stops audio). Never panics on missing devices:
 /// every failure is `eprintln!`-ed **and** returned as `Err`.
 ///
-/// Returns the stream plus the **actual device rate** (compare with
-/// [`SharedAudio::rate`]: a mismatch means fallback — set `audio_rate` to
-/// the device rate to silence the drift).
+/// Returns the stream plus the **actual device rate** (informational: the
+/// resampler makes any device rate play at the game's speed and pitch).
 ///
 /// Errors are human-readable (no `anyhow` dependency).
 pub fn open_output_stream(shared: &SharedAudio) -> Result<(cpal::Stream, u32), String> {
@@ -412,148 +543,67 @@ pub fn open_output_stream(shared: &SharedAudio) -> Result<(cpal::Stream, u32), S
     let default_config = default_supported.config();
     let default_rate = default_config.sample_rate.0;
 
-    // Prefer the game rate when offered at the default channel count (same
+    // Try the preferred rates in order at the default channel count (same
     // sample format first, then any format); otherwise keep the default.
-    let chosen: cpal::SupportedStreamConfig = if default_rate == want_rate {
-        default_supported
-    } else {
+    let mut chosen: Option<cpal::SupportedStreamConfig> = None;
+    if default_rate != want_rate {
         match device.supported_output_configs() {
             Ok(ranges) => {
-                let want = cpal::SampleRate(want_rate);
-                let mut same_format: Option<cpal::SupportedStreamConfig> = None;
-                let mut any_format: Option<cpal::SupportedStreamConfig> = None;
-                for r in ranges {
-                    if r.channels() != default_config.channels {
-                        continue;
+                let ranges: Vec<_> = ranges
+                    .filter(|r| r.channels() == default_config.channels)
+                    .collect();
+                for cand in preferred_device_rates(want_rate) {
+                    if cand == default_rate {
+                        break; // the default itself is next best
                     }
-                    if r.min_sample_rate() > want || r.max_sample_rate() < want {
-                        continue;
-                    }
-                    // Re-checked against the range; `None` is unreachable
-                    // here but handled without panicking.
-                    if r.sample_format() == default_supported.sample_format() {
-                        if let Some(cfg) = r.try_with_sample_rate(want) {
-                            same_format = Some(cfg);
+                    let want = cpal::SampleRate(cand);
+                    let fits = |r: &&cpal::SupportedStreamConfigRange| {
+                        r.min_sample_rate() <= want && want <= r.max_sample_rate()
+                    };
+                    let same = ranges
+                        .iter()
+                        .filter(fits)
+                        .find(|r| r.sample_format() == default_supported.sample_format());
+                    let any = ranges.iter().find(fits);
+                    if let Some(r) = same.or(any) {
+                        chosen = (*r).try_with_sample_rate(want);
+                        if chosen.is_some() {
                             break;
                         }
-                    } else if any_format.is_none() {
-                        any_format = r.try_with_sample_rate(want);
                     }
                 }
-                same_format.or(any_format).unwrap_or(default_supported)
             }
             Err(e) => {
                 eprintln!(
                     "z2 audio: cannot enumerate rates ({e}); keeping device default {default_rate} Hz"
                 );
-                default_supported
             }
         }
-    };
-
-    let picked_format = chosen.sample_format();
-    let config = chosen.config();
-    let device_rate = config.sample_rate.0;
-    let channels = effective_channels(config.channels);
-    if device_rate != want_rate {
-        eprintln!(
-            "z2 audio: rate fallback — game {want_rate} Hz vs device {device_rate} Hz \
-             (drift {:+} samples/s; underrun/overrun meters will climb — \
-             set audio_rate to {device_rate} to silence)",
-            drain_minus_production_per_sec(want_rate, device_rate),
-        );
     }
-    let make_err_cb = || {
-        let err_shared = shared.clone();
-        move |e| {
-            err_shared.note_stream_error();
-            eprintln!("z2 audio stream error: {e}");
-        }
+
+    let stream = match chosen {
+        Some(cfg) => match build_stream(&device, &cfg, shared) {
+            Ok(s) => Some((s, cfg.config().sample_rate.0)),
+            Err(e) => {
+                eprintln!(
+                    "z2 audio: {} Hz stream failed ({e}); retrying device default {default_rate} Hz",
+                    cfg.config().sample_rate.0
+                );
+                None
+            }
+        },
+        None => None,
     };
-    let stream = match picked_format {
-        cpal::SampleFormat::F32 => {
-            let shared_cb = shared.clone();
-            device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [f32], _| {
-                        let n = data.len() / channels;
-                        let mut mono = Vec::with_capacity(n);
-                        shared_cb.consume(n, &mut mono);
-                        for (i, slot) in data.chunks_mut(channels).enumerate() {
-                            let s = mono.get(i).copied().unwrap_or(0);
-                            let v = pcm_i16_to_f32(s);
-                            for ch in slot.iter_mut() {
-                                *ch = v;
-                            }
-                        }
-                    },
-                    make_err_cb(),
-                    None,
-                )
-                .map_err(|e| {
-                    let m = format!("build output stream: {e}");
-                    eprintln!("z2 audio: {m}");
-                    m
-                })?
-        }
-        cpal::SampleFormat::I16 => {
-            let shared_cb = shared.clone();
-            device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [i16], _| {
-                        let n = data.len() / channels;
-                        let mut mono = Vec::with_capacity(n);
-                        shared_cb.consume(n, &mut mono);
-                        for (i, slot) in data.chunks_mut(channels).enumerate() {
-                            let s = mono.get(i).copied().unwrap_or(0);
-                            for ch in slot.iter_mut() {
-                                *ch = s;
-                            }
-                        }
-                    },
-                    make_err_cb(),
-                    None,
-                )
-                .map_err(|e| {
-                    let m = format!("build output stream: {e}");
-                    eprintln!("z2 audio: {m}");
-                    m
-                })?
-        }
-        cpal::SampleFormat::U16 => {
-            let shared_cb = shared.clone();
-            device
-                .build_output_stream(
-                    &config,
-                    move |data: &mut [u16], _| {
-                        let n = data.len() / channels;
-                        let mut mono = Vec::with_capacity(n);
-                        shared_cb.consume(n, &mut mono);
-                        for (i, slot) in data.chunks_mut(channels).enumerate() {
-                            let s = mono.get(i).copied().unwrap_or(0);
-                            let v = pcm_i16_to_u16(s);
-                            for ch in slot.iter_mut() {
-                                *ch = v;
-                            }
-                        }
-                    },
-                    make_err_cb(),
-                    None,
-                )
-                .map_err(|e| {
-                    let m = format!("build output stream: {e}");
-                    eprintln!("z2 audio: {m}");
-                    m
-                })?
-        }
-        fmt => {
-            let m = format!("unsupported sample format {fmt:?}");
-            eprintln!("z2 audio: {m}");
-            return Err(m);
-        }
+    let (stream, device_rate) = match stream {
+        Some(s) => s,
+        None => (
+            build_stream(&device, &default_supported, shared)?,
+            default_rate,
+        ),
     };
+    if device_rate != want_rate {
+        eprintln!("z2 audio: resampling game {want_rate} Hz -> device {device_rate} Hz");
+    }
     shared.prime_silence();
     stream.play().map_err(|e| {
         let m = format!("start output stream: {e}");
@@ -561,6 +611,93 @@ pub fn open_output_stream(shared: &SharedAudio) -> Result<(cpal::Stream, u32), S
         m
     })?;
     Ok((stream, device_rate))
+}
+
+/// Build (not start) an output stream at `supported`, resampling `shared`'s
+/// game rate to the config's rate in the callback.
+fn build_stream(
+    device: &cpal::Device,
+    supported: &cpal::SupportedStreamConfig,
+    shared: &SharedAudio,
+) -> Result<cpal::Stream, String> {
+    use cpal::traits::DeviceTrait;
+
+    let config = supported.config();
+    let device_rate = config.sample_rate.0;
+    let channels = effective_channels(config.channels);
+    let make_err_cb = || {
+        let err_shared = shared.clone();
+        move |e| {
+            err_shared.note_stream_error();
+            eprintln!("z2 audio stream error: {e}");
+        }
+    };
+    let built = match supported.sample_format() {
+        cpal::SampleFormat::F32 => {
+            let shared_cb = shared.clone();
+            let mut feed = CallbackFeed::new(shared.rate(), device_rate);
+            device.build_output_stream(
+                &config,
+                move |data: &mut [f32], _| {
+                    let mono = feed.fill(&shared_cb, data.len() / channels);
+                    for (i, slot) in data.chunks_mut(channels).enumerate() {
+                        let v = pcm_i16_to_f32(mono.get(i).copied().unwrap_or(0));
+                        for ch in slot.iter_mut() {
+                            *ch = v;
+                        }
+                    }
+                },
+                make_err_cb(),
+                None,
+            )
+        }
+        cpal::SampleFormat::I16 => {
+            let shared_cb = shared.clone();
+            let mut feed = CallbackFeed::new(shared.rate(), device_rate);
+            device.build_output_stream(
+                &config,
+                move |data: &mut [i16], _| {
+                    let mono = feed.fill(&shared_cb, data.len() / channels);
+                    for (i, slot) in data.chunks_mut(channels).enumerate() {
+                        let s = mono.get(i).copied().unwrap_or(0);
+                        for ch in slot.iter_mut() {
+                            *ch = s;
+                        }
+                    }
+                },
+                make_err_cb(),
+                None,
+            )
+        }
+        cpal::SampleFormat::U16 => {
+            let shared_cb = shared.clone();
+            let mut feed = CallbackFeed::new(shared.rate(), device_rate);
+            device.build_output_stream(
+                &config,
+                move |data: &mut [u16], _| {
+                    let mono = feed.fill(&shared_cb, data.len() / channels);
+                    for (i, slot) in data.chunks_mut(channels).enumerate() {
+                        let v = pcm_i16_to_u16(mono.get(i).copied().unwrap_or(0));
+                        for ch in slot.iter_mut() {
+                            *ch = v;
+                        }
+                    }
+                },
+                make_err_cb(),
+                None,
+            )
+        }
+        fmt => {
+            let m = format!("unsupported sample format {fmt:?}");
+            eprintln!("z2 audio: {m}");
+            return Err(m);
+        }
+    };
+    built.map_err(|e| {
+        let m = format!("build output stream: {e}");
+        eprintln!("z2 audio: {m}");
+        m
+    })
 }
 
 #[cfg(test)]
@@ -680,12 +817,137 @@ mod tests {
             44100
         );
         assert_eq!(select_device_rate(48000, 44100, &[(8000, 96000)]), 48000);
-        // Not offered: honest fallback to the device default.
+        // Game rate not offered: the other shipped rate, else the default.
         assert_eq!(select_device_rate(44100, 48000, &[(48000, 96000)]), 48000);
         assert_eq!(select_device_rate(44100, 48000, &[]), 48000);
         // Unknown want clamps to 44100 first.
         assert_eq!(select_device_rate(22050, 48000, &[(44100, 48000)]), 44100);
         assert_eq!(select_device_rate(22050, 16000, &[(16000, 16000)]), 16000);
+        // High-rate Windows mix formats: prefer a shipped rate when offered.
+        assert_eq!(select_device_rate(44100, 192000, &[(44100, 192000)]), 44100);
+        assert_eq!(
+            select_device_rate(44100, 192000, &[(48000, 48000), (192000, 192000)]),
+            48000
+        );
+        assert_eq!(
+            select_device_rate(48000, 96000, &[(44100, 44100), (96000, 96000)]),
+            44100
+        );
+        // Shared-mode device offering only its mix format: keep it (resampled).
+        assert_eq!(
+            select_device_rate(44100, 192000, &[(192000, 192000)]),
+            192000
+        );
+        assert_eq!(select_device_rate(48000, 96000, &[]), 96000);
+        assert_eq!(preferred_device_rates(44100), [44100, 48000]);
+        assert_eq!(preferred_device_rates(48000), [48000, 44100]);
+    }
+
+    /// Drive a [`CallbackFeed`] for `secs` of device time in `period`-sized
+    /// callbacks while producing game audio at exactly the game rate; returns
+    /// `(game samples consumed, device samples produced)`.
+    fn run_feed(game_rate: u32, device_rate: u32, period: usize, secs: u64) -> (u64, u64) {
+        let ring = SharedAudio::new(game_rate);
+        let mut feed = CallbackFeed::new(ring.rate(), device_rate);
+        let total_out = u64::from(device_rate) * secs;
+        let mut produced_out = 0u64;
+        let mut pushed_in = 0u64;
+        // Keep a small lead so the ring never starves.
+        ring.push_frame(&vec![0i16; 4 * frame_samples(game_rate)]);
+        pushed_in += 4 * frame_samples(game_rate) as u64;
+        while produced_out < total_out {
+            let n = period.min((total_out - produced_out) as usize);
+            // Produce game audio in lock step with device time.
+            let due_in = (produced_out + n as u64) * u64::from(ring.rate())
+                / u64::from(device_rate)
+                + 4 * frame_samples(game_rate) as u64;
+            if due_in > pushed_in {
+                ring.push_frame(&vec![100i16; (due_in - pushed_in) as usize]);
+                pushed_in = due_in;
+            }
+            let out = feed.fill(&ring, n);
+            assert_eq!(out.len(), n, "fill yields exactly n samples");
+            produced_out += n as u64;
+        }
+        let (_, popped) = ring.totals();
+        assert_eq!(
+            ring.underruns(),
+            0,
+            "{game_rate}->{device_rate}: no underruns"
+        );
+        (popped, produced_out)
+    }
+
+    #[test]
+    fn resampler_drains_at_game_rate_for_any_device_rate() {
+        // The Windows bug: at 192 kHz the ring used to drain 192000 game
+        // samples/s. Resampled, one device second always drains one game
+        // second, so the pacing nudge never sees a starving ring.
+        for game in [44100u32, 48000] {
+            for device in [22050u32, 44100, 48000, 88200, 96000, 176400, 192000, 384000] {
+                for period in [64usize, 441, 480, 1024, 1920] {
+                    let (popped, out) = run_feed(game, device, period, 10);
+                    assert_eq!(out, u64::from(device) * 10);
+                    let want = u64::from(game) * 10;
+                    assert!(
+                        popped.abs_diff(want) <= 1,
+                        "{game}->{device} p{period}: popped {popped}, want {want}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resampler_input_accounting_is_exact() {
+        let mut r = Resampler::new(44100, 192000);
+        let mut consumed = 0u64;
+        let mut produced = 0u64;
+        let mut out = Vec::new();
+        for n in [1usize, 7, 512, 1024, 3, 999, 4410] {
+            let need = r.input_needed(n);
+            let input = vec![1i16; need];
+            out.clear();
+            r.process(&input, n, &mut out);
+            assert_eq!(out.len(), n);
+            consumed += need as u64;
+            produced += n as u64;
+            // Exact rational phase: consumed == floor(produced * in / out).
+            assert_eq!(consumed, produced * 44100 / 192000);
+        }
+        assert_eq!(r.in_rate(), 44100);
+        assert_eq!(r.out_rate(), 192000);
+    }
+
+    #[test]
+    fn resampler_equal_rates_pass_through() {
+        let mut r = Resampler::new(48000, 48000);
+        let input: Vec<i16> = (1..=6).collect();
+        assert_eq!(r.input_needed(6), 6);
+        let mut out = Vec::new();
+        r.process(&input, 6, &mut out);
+        // Two-sample pipeline delay (~42 us), otherwise identical.
+        assert_eq!(out, vec![0, 0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn resampler_interpolates_and_stays_in_range() {
+        // 2x upsample of a step: midpoints appear between input samples.
+        let mut r = Resampler::new(24000, 48000);
+        let mut out = Vec::new();
+        let n = 8;
+        let need = r.input_needed(n);
+        assert_eq!(need, 4);
+        r.process(&[1000, 1000, -1000, -1000], n, &mut out);
+        assert_eq!(out, vec![0, 0, 0, 500, 1000, 1000, 1000, 0]);
+        // Full-scale extremes never overflow i16.
+        let mut r = Resampler::new(44100, 192000);
+        let input = [i16::MIN, i16::MAX, i16::MIN, i16::MAX, i16::MIN, i16::MAX];
+        let n = 20;
+        assert!(r.input_needed(n) <= input.len());
+        out.clear();
+        r.process(&input, n, &mut out);
+        assert_eq!(out.len(), n);
     }
 
     #[test]

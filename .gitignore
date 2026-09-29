@@ -24,6 +24,14 @@ assets.bin
 # here too: the bundle is a build artifact and is rebuilt by `make run-web`.
 /crates/z2-web/site/pkg/
 
+# Android build outputs (make android): the cargo-ndk libraries copied into
+# jniLibs, Gradle caches and build trees, and the per-machine SDK path file.
+/android/app/src/main/jniLibs/
+/android/**/build/
+/android/.gradle/
+/android/local.properties
+/android/.kotlin/
+
 # Editor / OS noise
 .DS_Store
 *.swp

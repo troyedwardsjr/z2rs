@@ -10,6 +10,9 @@
 //! resolved names / button values so unit tests never open a window or
 //! touch a gamepad device.
 //!
+//! The `gilrs` items are desktop-only: gilrs 0.11 has no Android backend, and
+//! the Android app reports its pads through [`crate::external_pad`] instead.
+//!
 //! # Input latency note (acceptance)
 //!
 //! The windowed loop polls keyboard + gamepad **once per emulated frame**,
@@ -87,6 +90,7 @@ pub const GILRS_MAPPING_OVERRIDES: &str = "\
 /// `SDL_GAMECONTROLLERCONFIG` loads last, so the overrides are appended to
 /// that variable (keeping any user-provided mappings, which still win when
 /// they come later in the value) before building.
+#[cfg(not(target_os = "android"))]
 // `gilrs::Error` is a third-party type returned once, at startup; boxing it
 // would only move the allocation without changing any caller.
 #[allow(clippy::result_large_err)]
@@ -109,6 +113,7 @@ pub fn new_gilrs(default_filters: bool) -> Result<gilrs::Gilrs, gilrs::Error> {
 ///
 /// Positional, like the NES pad: B sits left/below A, so the bottom face
 /// button (Xbox A, SNES B) is NES B and the right one (Xbox B, SNES A) is NES A.
+#[cfg(not(target_os = "android"))]
 pub fn gilrs_button_to_bit(button: gilrs::Button) -> Option<u8> {
     use gilrs::Button;
     match button {
@@ -141,6 +146,7 @@ pub fn gamepad_name_to_bit(
 /// old hard-coded layout. The list is the domain of the binding tables, not
 /// a layout — [`crate::config::GamepadBindings::default`] still supplies the
 /// same default mapping as before.
+#[cfg(not(target_os = "android"))]
 pub const BINDABLE_BUTTONS: [(&str, gilrs::Button); 8] = [
     ("South", gilrs::Button::South),
     ("East", gilrs::Button::East),
@@ -154,6 +160,7 @@ pub const BINDABLE_BUTTONS: [(&str, gilrs::Button); 8] = [
 
 /// Extra d-pad buttons (kept out of [`BINDABLE_BUTTONS`] only to keep that
 /// array at the eight most commonly rebound entries); the loop polls both.
+#[cfg(not(target_os = "android"))]
 pub const BINDABLE_DPAD: [(&str, gilrs::Button); 2] = [
     ("DPadLeft", gilrs::Button::DPadLeft),
     ("DPadRight", gilrs::Button::DPadRight),
@@ -292,6 +299,7 @@ mod tests {
         assert_eq!(k.pad(&t), 0);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn gilrs_default_layout_matches_contract() {
         use gilrs::Button;
@@ -341,6 +349,7 @@ mod tests {
         assert_eq!(gamepad_bits(&t, ["North"].into_iter()), 0);
     }
 
+    #[cfg(not(target_os = "android"))]
     #[test]
     fn every_bindable_button_has_a_stable_name() {
         for (name, button) in BINDABLE_BUTTONS.iter().chain(BINDABLE_DPAD.iter()) {

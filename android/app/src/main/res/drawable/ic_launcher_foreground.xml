@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Generic geometric game-pad glyph (d-pad cross and two round buttons) inside
+     the 66dp safe zone of a 108dp adaptive icon. No third-party artwork. -->
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Rounded pad body -->
+    <path
+        android:fillColor="#F2EBD3"
+        android:pathData="M30,38 H78 A14,14 0 0 1 92,52 V56 A14,14 0 0 1 78,70 H30 A14,14 0 0 1 16,56 V52 A14,14 0 0 1 30,38 Z" />
+    <!-- D-pad cross -->
+    <path
+        android:fillColor="#123B33"
+        android:pathData="M29,45 H35 V51 H41 V57 H35 V63 H29 V57 H23 V51 H29 Z" />
+    <!-- Two face buttons -->
+    <path
+        android:fillColor="#C8412F"
+        android:pathData="M68,58 m-5,0 a5,5 0 1 0 10,0 a5,5 0 1 0 -10,0 Z" />
+    <path
+        android:fillColor="#C8412F"
+        android:pathData="M81,50 m-5,0 a5,5 0 1 0 10,0 a5,5 0 1 0 -10,0 Z" />
+    <!-- Select / Start bars -->
+    <path
+        android:fillColor="#123B33"
+        android:pathData="M46,60 H52 V63 H46 Z M55,60 H61 V63 H55 Z" />
+</vector>

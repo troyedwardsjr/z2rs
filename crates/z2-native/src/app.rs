@@ -20,6 +20,19 @@
 //! * Pause on focus loss when configured; title bar shows emulated frames
 //!   per second + audio underruns.
 //!
+//! # Lifecycle (desktop and Android)
+//!
+//! [`run_windowed`] builds its own winit event loop; [`run_windowed_with`]
+//! takes one pre-built by the host (Android builds it with
+//! `EventLoopBuilderExtAndroid::with_android_app`). The window, the `pixels`
+//! surface and the viewport renderer exist only between `resumed` and
+//! `suspended`: Android destroys the native window on every `suspended`
+//! (app backgrounded, screen off) and hands a new one to the next `resumed`,
+//! so the loop drops all three there, saves SRAM (the process may be killed
+//! any time after `onStop`), stops stepping and silences audio, and rebuilds
+//! them on the next `resumed`. Desktop platforms never send `suspended`, so
+//! the desktop path is the old single `resumed` → run-until-quit.
+//!
 //! # Input latency note
 //!
 //! Keyboard + gamepad are polled once per emulated frame, immediately before
@@ -27,6 +40,7 @@
 //! frame (~16.64 ms) plus OS/display queue depth.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use z2_core::game::{Game, FRAME_H as GAME_H, FRAME_W as GAME_W};
@@ -121,17 +135,13 @@ impl FrameTimer {
     }
 }
 
-/// Audio-driven pacing nudge (pure).
+/// Audio-depth water-mark decision (pure, not rate limited).
 ///
-/// The wall-clock timer alone keeps the shared audio ring at whatever depth
-/// the one-frame silence prime left it, so any main-thread stall longer
-/// than a frame (window events, a slow present) starves the `cpal`
-/// callback and the title-bar underrun meter climbs. Nudging the step
-/// count by the ring depth keeps it between [`PACE_LOW_FRAMES`] and
-/// [`PACE_HIGH_FRAMES`] nominal frames: below the low mark one extra frame
-/// is stepped this tick, above the high mark one is held back. Only at
-/// normal speed (fast-forward and pause bypass it); the long-run average
-/// stays 60 steps/s because the ring drains at exactly the device rate.
+/// Below [`PACE_LOW_FRAMES`] nominal frames of buffered game audio, one extra
+/// frame is proposed; above [`PACE_HIGH_FRAMES`], one is held back. Only at
+/// normal speed (fast-forward and pause bypass it). The loop never applies
+/// this directly: a ring that drains faster than the emulator fills it would
+/// then set the game speed. [`AudioPacer`] rate limits it.
 #[must_use]
 pub fn pace_steps(steps: usize, depth_samples: usize, rate: u32, normal_speed: bool) -> usize {
     if !normal_speed {
@@ -151,24 +161,148 @@ pub fn pace_steps(steps: usize, depth_samples: usize, rate: u32, normal_speed: b
 pub const PACE_LOW_FRAMES: usize = 2;
 /// [`pace_steps`] high-water mark, in nominal audio frames (~100 ms).
 pub const PACE_HIGH_FRAMES: usize = 6;
+/// Minimum wall time between two [`AudioPacer`] nudges (seconds). One frame
+/// per second caps the audio's pull on game speed at about 1.7% (1 of ~60
+/// frames/s), however fast or slow the device drains.
+pub const PACE_NUDGE_INTERVAL_SECS: f64 = 1.0;
+
+/// Audio as a *soft* sync on top of the wall-clock [`FrameTimer`].
+///
+/// The timer alone keeps emulation at [`NTSC_HZ`]. After a main-thread stall
+/// the ring can sit low (or high), so the pacer lets [`pace_steps`] add or
+/// hold back one frame, but at most once per [`PACE_NUDGE_INTERVAL_SECS`] of
+/// wall time.
+///
+/// The old loop applied the nudge on every OS tick. With `ControlFlow::Poll`
+/// that is hundreds to thousands of ticks per second, so a ring that drained
+/// faster than it filled (a Windows device at 96/192 kHz, or 48 kHz under a
+/// 44.1 kHz game, before the callback resampled) got a frame added on every
+/// tick: the game ran as fast as the device drained, 2-4x at 192 kHz. The
+/// rate limit keeps that from coming back whatever the audio path does.
+#[derive(Debug, Clone, Default)]
+pub struct AudioPacer {
+    /// Wall time left before the next nudge is allowed.
+    cooldown: f64,
+}
+
+impl AudioPacer {
+    /// Pacer ready to nudge immediately (startup refill).
+    #[must_use]
+    pub fn new() -> Self {
+        Self { cooldown: 0.0 }
+    }
+
+    /// Apply the rate-limited nudge to this tick's `steps` after `dt_secs` of
+    /// wall time. Returns the adjusted step count.
+    pub fn apply(
+        &mut self,
+        steps: usize,
+        dt_secs: f64,
+        depth_samples: usize,
+        rate: u32,
+        normal_speed: bool,
+    ) -> usize {
+        self.cooldown = (self.cooldown - dt_secs.max(0.0)).max(0.0);
+        if self.cooldown > 0.0 {
+            return steps;
+        }
+        let nudged = pace_steps(steps, depth_samples, rate, normal_speed);
+        if nudged != steps {
+            self.cooldown = PACE_NUDGE_INTERVAL_SECS;
+        }
+        nudged
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Viewport / scaling
 // ---------------------------------------------------------------------------
 
-/// Centered viewport inside the OS window.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// How the presented texture is scaled onto the window / fullscreen surface.
+///
+/// `pixels` 0.15's own renderer only ever scales by a whole number (and never
+/// below 1x), which on the 2560x1600 and 1920x1080 screens players actually
+/// have left thick black borders on every side and cropped any texture larger
+/// than the window. The windowed loop therefore draws the texture itself
+/// ([`crate::gpu_present`]) into the rectangle [`compute_viewport`] returns.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum ScaleMode {
+    /// Largest aspect-preserving size that fits (fractional allowed), so the
+    /// picture fills the screen height. The default.
+    #[default]
+    Fit,
+    /// Whole-number multiples only (sharpest pixels, may leave borders).
+    /// Still shrinks — never crops — when the surface is smaller than 1x.
+    Integer,
+}
+
+impl ScaleMode {
+    /// Parse `fit` / `integer` (the config key and `--scale-mode` values).
+    #[must_use]
+    pub fn parse(raw: &str) -> Option<Self> {
+        match raw.trim().to_ascii_lowercase().as_str() {
+            "fit" | "fill" => Some(Self::Fit),
+            "integer" | "int" => Some(Self::Integer),
+            _ => None,
+        }
+    }
+
+    /// The flag / config spelling.
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Fit => "fit",
+            Self::Integer => "integer",
+        }
+    }
+}
+
+/// How much of a widescreen frame's outer edge, per side and in unscaled
+/// frame pixels, [`ScaleMode::Fit`] may trim so the picture fills the screen
+/// height instead of leaving thin bars. One tile: enough for the 16:9 preset
+/// (432 px wide, 1.8:1) to cover a 16:9 display (needs 2.67 px per side), and
+/// only ever margin art — the original 256-px NES picture is never trimmed.
+pub const FILL_CROP_MAX_PX: u32 = 8;
+
+/// Side trim allowance in **texture** texels for [`compute_viewport`]:
+/// [`FILL_CROP_MAX_PX`] times the HD output scale when widescreen margins are
+/// on, 0 (never trim) for the plain 4:3 picture.
+#[must_use]
+pub fn fill_crop_texels(wide_tiles: u8, hd_scale: u32) -> u32 {
+    if wide_tiles == 0 {
+        0
+    } else {
+        FILL_CROP_MAX_PX.min(u32::from(wide_tiles) * 8) * hd_scale.max(1)
+    }
+}
+
+/// Where the texture lands on the surface.
+#[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Viewport {
-    /// Left offset (physical pixels).
+    /// Left edge of the drawn rectangle (surface pixels).
     pub x: u32,
-    /// Top offset (physical pixels).
+    /// Top edge of the drawn rectangle (surface pixels).
     pub y: u32,
-    /// Viewport width.
+    /// Drawn width (surface pixels, never more than the surface).
     pub w: u32,
-    /// Viewport height.
+    /// Drawn height (surface pixels, never more than the surface).
     pub h: u32,
-    /// Integer scale factor applied (1 when letterboxed / window too small).
-    pub scale: u32,
+    /// First visible texture column (texels; > 0 only when the sides are
+    /// trimmed to fill the height).
+    pub src_x: f64,
+    /// Visible texture width (texels). The full texture height is always
+    /// shown: the HUD at the top is never cropped.
+    pub src_w: f64,
+    /// Surface pixels per texel.
+    pub scale: f64,
+}
+
+impl Viewport {
+    /// True when the drawn rectangle covers the whole surface.
+    #[must_use]
+    pub fn fills(&self, surface: (u32, u32)) -> bool {
+        self.x == 0 && self.y == 0 && self.w == surface.0 && self.h == surface.1
+    }
 }
 
 /// Clamp a window surface size to valid `pixels` dimensions.
@@ -182,56 +316,102 @@ pub fn clamp_surface_size(w: u32, h: u32) -> (u32, u32) {
     (w.max(1), h.max(1))
 }
 
-/// Compute the centered viewport for `window_w × window_h`.
+/// Compute where a `tex` texture is drawn on a `surface` (both in physical
+/// pixels), centered and aspect-preserving.
 ///
-/// * Integer scaling: `scale = floor(min(ww/eff_w, wh/eff_h))`, min 1.
-/// * Aspect correction: effective frame is `256*8/7 × 240` (≈292×240,
-///   the NTSC PAR-corrected width); otherwise `256×240`.
-/// * When the window is smaller than one effective frame, the viewport is
-///   the clamped window size centered (scale 1, letterboxed by `pixels`).
+/// * [`ScaleMode::Fit`]: `scale = min(sw/tw, sh/th)`, fractional. When the
+///   texture is only slightly wider than the screen's aspect and trimming at
+///   most `side_crop_texels` per side would fill the height, the sides are
+///   trimmed instead (16:9 widescreen on a 16:9 display fills it fully).
+/// * [`ScaleMode::Integer`]: the largest whole-number scale that fits, or the
+///   fractional fit when even 1x does not (shrink, never crop).
+///
+/// The rectangle never exceeds the surface and the full texture height is
+/// always visible.
+#[must_use]
 pub fn compute_viewport(
-    window_w: u32,
-    window_h: u32,
-    integer_scaling: bool,
-    aspect_correction: bool,
+    surface: (u32, u32),
+    tex: (u32, u32),
+    mode: ScaleMode,
+    side_crop_texels: u32,
 ) -> Viewport {
-    let eff_w: f64 = if aspect_correction {
-        FRAME_W as f64 * 8.0 / 7.0
-    } else {
-        FRAME_W as f64
-    };
-    let eff_h: f64 = FRAME_H as f64;
-    if window_w == 0 || window_h == 0 {
+    let (sw, sh) = surface;
+    let (tw, th) = tex;
+    if sw == 0 || sh == 0 || tw == 0 || th == 0 {
         return Viewport {
             x: 0,
             y: 0,
             w: 0,
             h: 0,
-            scale: 1,
+            src_x: 0.0,
+            src_w: f64::from(tw),
+            scale: 1.0,
         };
     }
-    let scale_f = (f64::from(window_w) / eff_w).min(f64::from(window_h) / eff_h);
-    let scale: u32 = if integer_scaling {
-        (scale_f.floor() as u32).max(1)
-    } else {
-        1
+    let (swf, shf, twf, thf) = (f64::from(sw), f64::from(sh), f64::from(tw), f64::from(th));
+    let fit = (swf / twf).min(shf / thf);
+    let (scale, trim) = match mode {
+        ScaleMode::Integer => (if fit >= 1.0 { fit.floor() } else { fit }, false),
+        ScaleMode::Fit => {
+            let by_height = shf / thf;
+            let overflow = twf * by_height - swf;
+            // Trim only when it is the height that is short, and only by the
+            // allowance (in surface pixels at the fill scale).
+            if overflow > 0.5 && overflow / 2.0 <= f64::from(side_crop_texels) * by_height + 1e-6 {
+                (by_height, true)
+            } else {
+                (fit, false)
+            }
+        }
     };
-    // With integer scaling the viewport is exactly scale*eff; without it the
-    // viewport fills the window (pixels stretches the 256×240 texture).
-    let (w, h) = if integer_scaling {
-        let w = ((eff_w * f64::from(scale)).round() as u32).min(window_w);
-        let h = ((eff_h * f64::from(scale)).round() as u32).min(window_h);
-        (w, h)
+    let h = ((thf * scale).round() as u32).clamp(1, sh);
+    let (w, src_x, src_w) = if trim {
+        let src_w = swf / scale;
+        (sw, (twf - src_w) / 2.0, src_w)
     } else {
-        (window_w, window_h)
+        (((twf * scale).round() as u32).clamp(1, sw), 0.0, twf)
     };
     Viewport {
-        x: window_w.saturating_sub(w) / 2,
-        y: window_h.saturating_sub(h) / 2,
+        x: (sw - w) / 2,
+        y: (sh - h) / 2,
         w,
         h,
+        src_x,
+        src_w,
         scale,
     }
+}
+
+/// CPU reference of the windowed blit: draw `rgba` (`tex` sized) into a black
+/// `surface`-sized RGBA buffer through `vp`, nearest-sampled. The GPU path
+/// ([`crate::gpu_present`]) samples the same texel for every pixel centre
+/// (it only smooths the seams between texels at fractional scales), so a
+/// headless `--dump-present --surface WxH` PNG shows exactly the borders,
+/// size and trim a player gets.
+#[must_use]
+pub fn blit_viewport(rgba: &[u8], tex: (u32, u32), surface: (u32, u32), vp: &Viewport) -> Vec<u8> {
+    let (sw, sh) = (surface.0 as usize, surface.1 as usize);
+    let (tw, th) = (tex.0 as usize, tex.1 as usize);
+    let mut out = vec![0u8; sw * sh * 4];
+    for px in out.chunks_exact_mut(4) {
+        px[3] = 0xFF;
+    }
+    if tw == 0 || th == 0 || rgba.len() < tw * th * 4 || vp.w == 0 || vp.h == 0 {
+        return out;
+    }
+    let (vx, vy, vw, vh) = (vp.x as usize, vp.y as usize, vp.w as usize, vp.h as usize);
+    let tpx_x = vp.src_w / vw as f64;
+    let tpx_y = th as f64 / vh as f64;
+    for dy in 0..vh.min(sh.saturating_sub(vy)) {
+        let ty = (((dy as f64 + 0.5) * tpx_y) as usize).min(th - 1);
+        for dx in 0..vw.min(sw.saturating_sub(vx)) {
+            let tx = ((vp.src_x + (dx as f64 + 0.5) * tpx_x) as usize).min(tw - 1);
+            let s = (ty * tw + tx) * 4;
+            let d = ((vy + dy) * sw + vx + dx) * 4;
+            out[d..d + 4].copy_from_slice(&rgba[s..s + 4]);
+        }
+    }
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -407,56 +587,71 @@ pub fn present_size_scaled(wide_tiles: u8, scale: u32) -> (u32, u32) {
     )
 }
 
-/// Initial window size in logical pixels for a `tex_w x tex_h` framebuffer.
+/// Logical pixels kept free beside the window when sizing it to a monitor
+/// (window borders).
+pub const WINDOW_CHROME_W: u32 = 16;
+/// Logical pixels kept free above/below the window when sizing it to a
+/// monitor (title bar plus a taskbar or dock).
+pub const WINDOW_CHROME_H: u32 = 120;
+
+/// Initial window size in **logical** pixels for a `base_w x base_h` frame
+/// (256x240, or the widescreen width x 240 — before any HD output scale).
 ///
-/// `pixels` 0.15 letterboxes with an integer scale clamped to `>= 1`, so a
-/// texture LARGER than the surface is cropped, not shrunk: the window must
-/// therefore never open smaller than the texture. Picks the largest of 3x,
-/// 2x, 1x that fits `monitor` (leaving room for titlebar/dock), falling back
-/// to a 1536-logical-px budget when the monitor size is unknown.
+/// Picks the largest of 3x, 2x, 1x that fits `monitor` (its **logical** size,
+/// i.e. physical / DPI scale, with room kept for the title bar and taskbar),
+/// falling back to a 1536-logical-px budget when the monitor size is unknown.
+/// When even 1x does not fit, the window is shrunk to fit: the present path
+/// scales the texture to any surface ([`compute_viewport`]), so a window
+/// smaller than the texture no longer crops it.
 #[must_use]
-pub fn initial_window_size(tex_w: u32, tex_h: u32, monitor: Option<(u32, u32)>) -> (f64, f64) {
-    let mut scale = 3u32;
-    while scale > 1 {
-        let (w, h) = (tex_w * scale, tex_h * scale);
-        let fits = match monitor {
-            Some((mw, mh)) => w <= mw && h.saturating_add(120) <= mh,
-            None => w <= 1536,
-        };
-        if fits {
-            break;
+pub fn initial_window_size(base_w: u32, base_h: u32, monitor: Option<(u32, u32)>) -> (f64, f64) {
+    match monitor {
+        Some(_) => window_size_for_scale((base_w, base_h), 3, monitor),
+        None => {
+            let (bw, bh) = (base_w.max(1), base_h.max(1));
+            let mut s = 3u32;
+            while s > 1 && bw * s > 1536 {
+                s -= 1;
+            }
+            (f64::from(bw * s), f64::from(bh * s))
         }
-        scale -= 1;
     }
-    (f64::from(tex_w * scale), f64::from(tex_h * scale))
 }
 
-/// Initial window size in logical pixels for an explicit `--scale` /
+/// Initial window size in **logical** pixels for an explicit `--scale` /
 /// `window_scale` multiplier.
 ///
-/// `base_w x base_h` is the frame before any HD output scale (256x240, or the
-/// widescreen width x 240) and `tex_w x tex_h` the texture actually presented.
-/// The window is `base * scale`, stepped down while it does not fit
-/// `monitor` (logical size; titlebar/dock room kept as in
-/// [`initial_window_size`]), but never smaller than the texture: `pixels`
-/// crops a texture larger than its surface instead of shrinking it.
+/// `base` is the frame before any HD output scale (256x240, or the widescreen
+/// width x 240). The window is `base * scale`, stepped down while it does not
+/// fit `monitor` (logical size, chrome room kept as in
+/// [`initial_window_size`]), and shrunk below 1x to fit a monitor too small
+/// even for that. The HD texture size plays no part: an HD pack used to force
+/// the window up to its full texture (1728x960 logical for a 4x 16:9 pack,
+/// 3456x1920 physical at 200% DPI), past the edge of a 2560x1600 screen.
 #[must_use]
 pub fn window_size_for_scale(
     base: (u32, u32),
-    tex: (u32, u32),
     scale: u32,
     monitor: Option<(u32, u32)>,
 ) -> (f64, f64) {
     let (base_w, base_h) = (base.0.max(1), base.1.max(1));
     let mut s = scale.clamp(1, crate::config::MAX_WINDOW_SCALE);
-    if let Some((mw, mh)) = monitor {
-        while s > 1 && (base_w * s > mw || (base_h * s).saturating_add(120) > mh) {
-            s -= 1;
-        }
+    let Some((mw, mh)) = monitor else {
+        return (f64::from(base_w * s), f64::from(base_h * s));
+    };
+    let room_w = mw.saturating_sub(WINDOW_CHROME_W).max(1);
+    let room_h = mh.saturating_sub(WINDOW_CHROME_H).max(1);
+    while s > 1 && (base_w * s > room_w || base_h * s > room_h) {
+        s -= 1;
     }
+    if base_w * s <= room_w && base_h * s <= room_h {
+        return (f64::from(base_w * s), f64::from(base_h * s));
+    }
+    // Not even 1x fits: shrink, keeping the frame's aspect.
+    let f = (f64::from(room_w) / f64::from(base_w)).min(f64::from(room_h) / f64::from(base_h));
     (
-        f64::from((base_w * s).max(tex.0)),
-        f64::from((base_h * s).max(tex.1)),
+        (f64::from(base_w) * f).floor().max(1.0),
+        (f64::from(base_h) * f).floor().max(1.0),
     )
 }
 
@@ -1595,6 +1790,9 @@ pub struct NativeArgs {
     /// `--fullscreen`: start in borderless fullscreen (ORed with the
     /// `fullscreen` config key). Display only.
     pub fullscreen: bool,
+    /// `--scale-mode fit|integer` (overrides the `scale_mode` config key).
+    /// Display only.
+    pub scale_mode: Option<ScaleMode>,
 }
 
 pub const NATIVE_USAGE: &str = "\
@@ -1604,7 +1802,7 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                  [--margin-sprites on|off]
                  [--wide-gameplay on|off]
                  [--hd-pack DIR] [--hd-scale N] [--hd-record DIR]
-                 [--scale N] [--fullscreen]
+                 [--scale N] [--fullscreen] [--scale-mode fit|integer]
                  [--coop-local] [--coop-host ROOM | --coop-join ROOM]
                  [--signal URL] [--net-mode rollback|lockstep] [--net-delay N]
                  [--ice SPEC] [--p2-pad INDEX] [--p2-follow N] [--headless ...]
@@ -1632,6 +1830,9 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                    3x/2x/1x that fits the screen). Config key window_scale.
   --fullscreen     start in borderless fullscreen (config key fullscreen).
                    F11 or Alt+Enter (Cmd+Ctrl+F on macOS) toggles it.
+  --scale-mode M   fit (default: fill the window/screen height, any size) or
+                   integer (whole multiples only; sharper, may leave borders).
+                   Config key scale_mode.
   --hd-record DIR  on exit, write a template pack of the tiles this session drew.
                    ROM-derived output: DIR must be outside any git work tree.
   --coop-local     two players on this machine (P2: keys_p2 / second gamepad).
@@ -1800,6 +2001,12 @@ pub fn parse_native_args(argv: &[String]) -> Result<NativeArgs, String> {
                 out.scale = Some(n);
             }
             "--fullscreen" => out.fullscreen = true,
+            "--scale-mode" => {
+                let raw = native_arg_value(&mut it, "--scale-mode")?;
+                out.scale_mode = Some(ScaleMode::parse(&raw).ok_or_else(|| {
+                    format!("--scale-mode expects fit | integer, got '{raw}'\n{NATIVE_USAGE}")
+                })?);
+            }
             "--hd-scale" => {
                 let raw = native_arg_value(&mut it, "--hd-scale")?;
                 let n: u32 = raw.parse().unwrap_or(0);
@@ -1857,6 +2064,21 @@ pub fn parse_native_args(argv: &[String]) -> Result<NativeArgs, String> {
 /// tests. Returns a human-readable error (the `main` wrapper maps it to an
 /// exit code).
 pub fn run_windowed(args: &NativeArgs) -> Result<(), String> {
+    let event_loop = winit::event_loop::EventLoop::new().map_err(|e| format!("event loop: {e}"))?;
+    run_windowed_with(args, event_loop)
+}
+
+/// [`run_windowed`] on an event loop the host already built.
+///
+/// For hosts that must configure the loop themselves: Android builds it with
+/// `EventLoopBuilderExtAndroid::with_android_app` (see `crates/z2-android`),
+/// and winit allows one event loop per process, so it cannot be made here.
+/// Everything else — config, ROM, audio, the loop body — is shared with the
+/// desktop path.
+pub fn run_windowed_with(
+    args: &NativeArgs,
+    event_loop: winit::event_loop::EventLoop<()>,
+) -> Result<(), String> {
     // -- config + data dir -------------------------------------------------
     let mut config: NativeConfig = match &args.config {
         Some(p) => NativeConfig::load_from(Path::new(p)),
@@ -1991,18 +2213,21 @@ pub fn run_windowed(args: &NativeArgs) -> Result<(), String> {
         );
     }
 
-    run_event_loop(RunConfig {
-        config,
-        data_dir,
-        emu,
-        display,
-        movie_track,
-        has_rom,
-        feats,
-        coop_local,
-        args: args.clone(),
-        rom_body,
-    })
+    run_event_loop(
+        RunConfig {
+            config,
+            data_dir,
+            emu,
+            display,
+            movie_track,
+            has_rom,
+            feats,
+            coop_local,
+            args: args.clone(),
+            rom_body,
+        },
+        event_loop,
+    )
 }
 
 /// Effective visual settings from the CLI (which wins) and the config file.
@@ -2121,7 +2346,10 @@ fn assets_path_config() -> PathBuf {
 /// The winit event-loop body. Separated for readability; still opens a
 /// window — never call from tests.
 #[allow(clippy::too_many_lines)]
-fn run_event_loop(run: RunConfig) -> Result<(), String> {
+fn run_event_loop(
+    run: RunConfig,
+    event_loop: winit::event_loop::EventLoop<()>,
+) -> Result<(), String> {
     let RunConfig {
         config,
         data_dir,
@@ -2136,7 +2364,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
     } = run;
     use winit::application::ApplicationHandler;
     use winit::event::{ElementState, WindowEvent};
-    use winit::event_loop::{ActiveEventLoop, ControlFlow, EventLoop};
+    use winit::event_loop::{ActiveEventLoop, ControlFlow};
     use winit::keyboard::{KeyCode, PhysicalKey};
     use winit::window::Window;
 
@@ -2148,11 +2376,16 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         display: Display,
         movie: Vec<u8>,
         movie_pos: usize,
-        window: Option<&'static Window>,
+        /// The window, shared with the `pixels` surface (which owns a clone,
+        /// hence `Pixels<'static>` without leaking). `None` before the first
+        /// `resumed` and between `suspended` and the next `resumed`.
+        window: Option<Arc<Window>>,
         pixels: Option<pixels::Pixels<'static>>,
         keyboard: crate::input::KeyboardState,
+        #[cfg(not(target_os = "android"))]
         gilrs: Option<gilrs::Gilrs>,
         /// Gamepad that most recently pressed a button (drives player 1).
+        #[cfg(not(target_os = "android"))]
         active_pad: Option<gilrs::GamepadId>,
         audio: SharedAudio,
         _stream: Option<cpal::Stream>,
@@ -2160,6 +2393,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         /// title so rate fallback/silence is always visible.
         device_rate: Option<u32>,
         timer: FrameTimer,
+        pacer: AudioPacer,
         last_tick: Option<Instant>,
         paused: bool,
         has_rom: bool,
@@ -2188,10 +2422,14 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         /// game at `Started` without re-reading the file.
         rom_body: Option<Vec<u8>>,
         /// Gamepad driving player 2 by "most recent presser that is not P1".
+        #[cfg(not(target_os = "android"))]
         active_pad2: Option<gilrs::GamepadId>,
         /// Gamepads in connection order, for `--p2-pad INDEX`.
+        #[cfg(not(target_os = "android"))]
         pad_order: Vec<gilrs::GamepadId>,
         /// `--p2-pad INDEX`: pin player 2 to this entry of `pad_order`.
+        /// (Unused on Android, where the host numbers its pads itself.)
+        #[cfg_attr(target_os = "android", allow(dead_code))]
         p2_pad: Option<usize>,
         /// `--p2-follow N`: pad 2 replays the movie's pad 1 N frames late.
         p2_follow: Option<usize>,
@@ -2210,6 +2448,15 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         remember_rom: bool,
         /// Current keyboard modifiers (for the Alt+Enter / Cmd+Ctrl+F chords).
         modifiers: winit::keyboard::ModifiersState,
+        /// `--scale-mode` / `scale_mode`: how the texture fills the surface.
+        scale_mode: ScaleMode,
+        /// Size the `pixels` surface was last configured to (physical px);
+        /// the viewport is computed against it.
+        surface_size: (u32, u32),
+        /// The viewport blit (`None` while there is no window).
+        renderer: Option<crate::gpu_present::ViewportRenderer>,
+        /// Between `suspended` and the next `resumed` (Android lifecycle).
+        lifecycle_suspended: bool,
         /// Monotonic base for the millisecond clock netplay timers use.
         #[cfg(feature = "netplay")]
         start: Instant,
@@ -2229,6 +2476,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         /// reproduce the previous hard-coded layout exactly — pinned by
         /// `input::config_gamepad_table_reproduces_the_default_layout` — so
         /// nothing changes for a user who never edited the config.
+        #[cfg(not(target_os = "android"))]
         fn pad_bits(gp: &gilrs::Gamepad<'_>, table: &std::collections::HashMap<String, u8>) -> u8 {
             let mut names: Vec<&str> = Vec::new();
             for (name, button) in crate::input::BINDABLE_BUTTONS
@@ -2253,11 +2501,13 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         }
 
         /// Gamepad pinned to player 2 by `--p2-pad INDEX`, if connected.
+        #[cfg(not(target_os = "android"))]
         fn pinned_p2(&self) -> Option<gilrs::GamepadId> {
             self.p2_pad.and_then(|i| self.pad_order.get(i).copied())
         }
 
         /// Gamepad currently driving player 2.
+        #[cfg(not(target_os = "android"))]
         fn p2_pad_id(&self) -> Option<gilrs::GamepadId> {
             self.pinned_p2().or(self.active_pad2)
         }
@@ -2271,6 +2521,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         /// press from a *different* pad claims player 2 instead of stealing
         /// player 1, and `--p2-pad` pins that slot explicitly. With co-op off
         /// the rule is byte-for-byte what it was before.
+        #[cfg(not(target_os = "android"))]
         fn poll_gamepads(&mut self) -> (u8, u8) {
             enum PadEv {
                 Conn(gilrs::GamepadId),
@@ -2355,6 +2606,14 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
             pads
         }
 
+        /// No gilrs on Android: hardware pads arrive through
+        /// [`crate::external_pad`] instead (read in [`Self::current_inputs`]).
+        #[cfg(target_os = "android")]
+        #[allow(clippy::unused_self)]
+        fn poll_gamepads(&mut self) -> (u8, u8) {
+            (0, 0)
+        }
+
         /// Both players' pads for one frame.
         ///
         /// A demo movie overrides player 1 while frames remain; movie files
@@ -2384,6 +2643,15 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
             // are read separately and drive player 1.
             #[cfg(target_os = "macos")]
             let gp1 = gp1 | crate::gc_pad::poll();
+            // Host-reported pads (the Android touch pad and hardware pads over
+            // JNI; always 0 on desktop). Player 2's follows the same co-op gate
+            // as its keyboard set, so a single-player run never feeds port 2.
+            let gp1 = gp1 | crate::external_pad::p1_mask();
+            let gp2 = if self.coop_local {
+                gp2 | crate::external_pad::p2_mask()
+            } else {
+                gp2
+            };
             (
                 crate::input::combine_inputs(kb1, gp1),
                 crate::input::combine_inputs(kb2, gp2),
@@ -2758,7 +3026,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         }
 
         fn redraw(&mut self) {
-            let Some(window) = self.window else {
+            let Some(window) = self.window.clone() else {
                 return;
             };
             window.set_title(&self.compose_title());
@@ -2781,6 +3049,10 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                         eprintln!("present resize_buffer {}x{}: {e:?}", want.0, want.1);
                         return;
                     }
+                    // `resize_buffer` replaced the texture the blit samples.
+                    if let Some(r) = self.renderer.as_mut() {
+                        r.rebind(p);
+                    }
                 }
                 self.tex_size = want;
             }
@@ -2790,6 +3062,10 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                 pixels,
                 display,
                 emu,
+                renderer,
+                surface_size,
+                scale_mode,
+                tex_size,
                 ..
             } = self;
             let Some(pixels) = pixels.as_mut() else {
@@ -2821,7 +3097,25 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                     return;
                 }
             }
-            if let Err(e) = pixels.render() {
+            // Our own blit instead of `pixels.render()`: pixels' scaler only
+            // does whole-number scales >= 1 (thick fullscreen borders, and a
+            // texture larger than the window was cropped). See
+            // `compute_viewport` / `gpu_present`.
+            let tex = *tex_size;
+            let vp = compute_viewport(
+                *surface_size,
+                tex,
+                *scale_mode,
+                fill_crop_texels(display.settings().wide_tiles, display.effective_scale()),
+            );
+            let result = match renderer.as_ref() {
+                Some(r) => pixels.render_with(|encoder, target, ctx| {
+                    r.render(encoder, target, &ctx.queue, &vp, tex);
+                    Ok(())
+                }),
+                None => pixels.render(),
+            };
+            if let Err(e) = result {
                 // A swallowed render error leaves the last good (or the initial
                 // grey) frame up while the title keeps moving - exactly the
                 // reported symptom. Log it and re-establish the surface.
@@ -2830,6 +3124,8 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                 let (w, h) = clamp_surface_size(size.width, size.height);
                 if let Err(e2) = pixels.resize_surface(w, h) {
                     eprintln!("present resize {w}x{h}: {e2:?}");
+                } else {
+                    *surface_size = (w, h);
                 }
             }
         }
@@ -2900,13 +3196,15 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
 
         /// Whether the window is currently fullscreen (any kind).
         fn is_fullscreen(&self) -> bool {
-            self.window.is_some_and(|w| w.fullscreen().is_some())
+            self.window
+                .as_ref()
+                .is_some_and(|w| w.fullscreen().is_some())
         }
 
         /// Enter or leave borderless fullscreen. winit answers with a
         /// `Resized` event, which is what resizes the `pixels` surface.
         fn set_fullscreen(&self, on: bool) {
-            if let Some(w) = self.window {
+            if let Some(w) = self.window.as_ref() {
                 w.set_fullscreen(on.then_some(winit::window::Fullscreen::Borderless(None)));
             }
         }
@@ -2936,6 +3234,68 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                 }
             }
             SRAM_FILE
+        }
+
+        /// Apply the pause / save-state requests a non-winit host posted to
+        /// [`crate::external_pad`] (the Android app's buttons over JNI; never
+        /// set on desktop). Same rules as the `P` / `F5` / `F7` hotkeys,
+        /// including the netplay refusals.
+        fn apply_external_requests(&mut self) {
+            if let Some(paused) = crate::external_pad::take_pause_request() {
+                if self.net_active() {
+                    self.refuse_during_netplay("pause");
+                } else if paused != self.paused {
+                    eprintln!("{}", if paused { "paused" } else { "resumed" });
+                    self.paused = paused;
+                    self.audio.set_paused(paused);
+                    if !paused {
+                        self.audio.clear();
+                    }
+                }
+            }
+            let save = crate::external_pad::take_save_request();
+            let load = crate::external_pad::take_load_request();
+            if save.is_none() && load.is_none() {
+                return;
+            }
+            if let Some(why) = crate::netplay::savestate_blocked(self.net_active()) {
+                eprintln!("{why}");
+                return;
+            }
+            // Save before load, so "save then load" in one iteration is a
+            // round trip rather than a load of the previous contents.
+            if let Some(slot) = save {
+                match save_savestate(&self.emu.game, &self.data_dir, slot) {
+                    Ok(p) => eprintln!("saved {}", p.display()),
+                    Err(e) => eprintln!("save failed: {e}"),
+                }
+            }
+            if let Some(slot) = load {
+                match load_savestate(&mut self.emu.game, &self.data_dir, slot) {
+                    Ok(()) => eprintln!("loaded savestate{slot}"),
+                    Err(e) => eprintln!("load failed: {e}"),
+                }
+            }
+        }
+
+        /// Start or stop the output stream itself (not just the ring mute):
+        /// a backgrounded Android app must release the audio device. A
+        /// failure is logged and otherwise harmless — the ring stays muted.
+        fn set_stream_running(&self, running: bool) {
+            use cpal::traits::StreamTrait;
+            if let Some(stream) = self._stream.as_ref() {
+                let result = if running {
+                    stream.play().map_err(|e| e.to_string())
+                } else {
+                    stream.pause().map_err(|e| e.to_string())
+                };
+                if let Err(e) = result {
+                    eprintln!(
+                        "audio: could not {} the output stream: {e}",
+                        if running { "restart" } else { "pause" }
+                    );
+                }
+            }
         }
 
         /// Window title: meters + audio + co-op + netplay suffixes.
@@ -2993,31 +3353,22 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
             if self.window.is_some() {
                 return;
             }
-            // Texture size follows the widescreen width, and the window is
-            // opened at least that big: pixels 0.15 clamps its integer scale to
-            // >= 1, so a texture larger than the surface would be CROPPED
-            // rather than shrunk.
+            // The window is sized from the frame BEFORE any HD output scale,
+            // against the monitor's LOGICAL size (physical / DPI scale), so a
+            // 125-200% Windows display or a handheld never gets a window
+            // taller than its screen. The texture no longer dictates a
+            // minimum window size: the viewport blit shrinks it to fit.
             let (tex_w, tex_h) = self.display.size();
+            let hd = self.display.effective_scale().max(1);
+            let base = (tex_w / hd, tex_h / hd);
             let primary = event_loop.primary_monitor();
+            let monitor = primary.as_ref().map(|m| {
+                let s: winit::dpi::LogicalSize<u32> = m.size().to_logical(m.scale_factor());
+                (s.width, s.height)
+            });
             let (lw, lh) = match self.window_scale {
-                // Explicit `--scale` / `window_scale`: a multiple of the
-                // frame before any HD output scale, fitted to the monitor's
-                // logical size.
-                Some(n) => {
-                    let hd = self.display.effective_scale().max(1);
-                    let monitor = primary.as_ref().map(|m| {
-                        let s: winit::dpi::LogicalSize<u32> = m.size().to_logical(m.scale_factor());
-                        (s.width, s.height)
-                    });
-                    window_size_for_scale((tex_w / hd, tex_h / hd), (tex_w, tex_h), n, monitor)
-                }
-                None => {
-                    let monitor = primary.as_ref().map(|m| {
-                        let s = m.size();
-                        (s.width, s.height)
-                    });
-                    initial_window_size(tex_w, tex_h, monitor)
-                }
+                Some(n) => window_size_for_scale(base, n, monitor),
+                None => initial_window_size(base.0, base.1, monitor),
             };
             let attrs = Window::default_attributes()
                 .with_title(if self.has_rom { "z2rs" } else { NO_ROM_TITLE })
@@ -3034,23 +3385,75 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                     return;
                 }
             };
-            // Leak to 'static so the pixels surface can borrow it (standard
-            // winit-0.30 + pixels-0.15 pattern; the window lives for the app).
-            let window: &'static Window = Box::leak(Box::new(window));
+            // Shared, not leaked: the `pixels` surface owns an `Arc` clone
+            // (raw-window-handle implements the handle traits for `Arc<W>`),
+            // so it is `Pixels<'static>` and `suspended` can drop both and
+            // free the window for real before the next `resumed` makes another.
+            let window = Arc::new(window);
             let size = window.inner_size();
             let (sw, sh) = clamp_surface_size(size.width, size.height);
-            let surface = pixels::SurfaceTexture::new(sw, sh, window);
+            let surface = pixels::SurfaceTexture::new(sw, sh, Arc::clone(&window));
             match pixels::Pixels::new(tex_w, tex_h, surface) {
-                Ok(p) => self.pixels = Some(p),
+                Ok(p) => {
+                    self.renderer = Some(crate::gpu_present::ViewportRenderer::new(&p));
+                    self.pixels = Some(p);
+                }
                 Err(e) => {
                     eprintln!("create pixels surface: {e}");
                     event_loop.exit();
                     return;
                 }
             }
+            self.surface_size = (sw, sh);
             self.tex_size = (tex_w, tex_h);
             self.window = Some(window);
             self.last_tick = Some(Instant::now());
+            self.occluded = false;
+            if self.lifecycle_suspended {
+                // Back from `suspended` (Android only): run again, restart the
+                // device and follow the pause state exactly as before the
+                // suspend; drop whatever was queued so no stale burst plays.
+                self.lifecycle_suspended = false;
+                event_loop.set_control_flow(ControlFlow::Poll);
+                self.audio.clear();
+                self.audio.set_paused(self.paused);
+                self.set_stream_running(true);
+            }
+        }
+
+        /// The native window is going away (Android: app backgrounded or the
+        /// screen turned off; never sent on desktop). Everything that holds
+        /// the window is dropped here — surface first, then the window — and
+        /// rebuilt by the next `resumed`. The emulator stops stepping (see
+        /// `about_to_wait`) with its `paused` flag untouched, so it resumes in
+        /// whatever state the player left it; audio is muted and the device
+        /// released. SRAM is saved now because Android may kill the process
+        /// at any point after `onStop` without another callback.
+        fn suspended(&mut self, event_loop: &ActiveEventLoop) {
+            if self.window.is_none() {
+                return;
+            }
+            self.renderer = None;
+            self.pixels = None;
+            self.window = None;
+            self.tex_size = (0, 0);
+            self.lifecycle_suspended = true;
+            self.keyboard.clear();
+            self.fast_forward = false;
+            crate::external_pad::clear_masks();
+            self.audio.set_paused(true);
+            self.set_stream_running(false);
+            // Same wedge guard as the periodic autosave: never write faulted
+            // RAM over a good save.
+            if self.exec_errors_seen == 0 {
+                let name = self.sram_file();
+                if let Err(e) = save_sram_named(&mut self.emu.game, &self.data_dir, name) {
+                    eprintln!("suspend: SRAM save failed: {e}");
+                }
+            }
+            // Nothing to present or step until the next `resumed`: sleep
+            // instead of spinning the CPU in the background.
+            event_loop.set_control_flow(ControlFlow::Wait);
         }
 
         fn window_event(
@@ -3087,7 +3490,16 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                     // Auto-pause is ignored during netplay: a paused peer
                     // stalls the other one, so an unfocused window keeps
                     // stepping.
-                    let pause_pref = self.config.pause_on_focus_loss && !self.net_active();
+                    //
+                    // On Android the Kotlin activity owns pausing (its pause
+                    // menu calls `setPaused`), and backgrounding arrives as
+                    // `suspended`, which stops stepping by itself. Focus
+                    // events there race the JNI unpause and could leave the
+                    // game paused with no visible way out, so they never
+                    // pause.
+                    let pause_pref = self.config.pause_on_focus_loss
+                        && !self.net_active()
+                        && !cfg!(target_os = "android");
                     ui.on_focus(focused, pause_pref);
                     self.paused = ui.paused;
                     self.ever_focused = ui.ever_focused;
@@ -3181,6 +3593,8 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                             // Was `let _ =` (silent grey/stale after a failed
                             // resize). Needs human eyes if it ever fires.
                             eprintln!("present resize_surface {w}x{h}: {e:?}");
+                        } else {
+                            self.surface_size = (w, h);
                         }
                     }
                 }
@@ -3188,15 +3602,15 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                     // macOS Retina transitions (window moved across displays,
                     // display-scale change): the backing store size changed
                     // without a `Resized`. Without this arm the surface keeps
-                    // the old physical size (stale/blurry presentation). This
-                    // only tracks the surface — `compute_viewport`
-                    // letterboxing is still unwired (config
-                    // integer_scaling/aspect_correction are no-ops).
+                    // the old physical size (stale/blurry presentation). The
+                    // viewport follows `surface_size` on the next redraw.
                     if let (Some(p), Some(w)) = (self.pixels.as_mut(), self.window.as_ref()) {
                         let size = w.inner_size();
                         let (sw, sh) = clamp_surface_size(size.width, size.height);
                         if let Err(e) = p.resize_surface(sw, sh) {
                             eprintln!("present scale-factor resize {sw}x{sh}: {e:?}");
+                        } else {
+                            self.surface_size = (sw, sh);
                         }
                     }
                 }
@@ -3210,6 +3624,8 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
                             let (sw, sh) = clamp_surface_size(size.width, size.height);
                             if let Err(e) = p.resize_surface(sw, sh) {
                                 eprintln!("present unocclude resize {sw}x{sh}: {e:?}");
+                            } else {
+                                self.surface_size = (sw, sh);
                             }
                         }
                     }
@@ -3363,6 +3779,14 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         }
 
         fn about_to_wait(&mut self, _event_loop: &ActiveEventLoop) {
+            if self.window.is_none() {
+                // Suspended (or not yet resumed): no stepping, so a
+                // backgrounded app neither advances the game nor fills the
+                // audio ring. The clock restarts cleanly on resume.
+                self.last_tick = None;
+                return;
+            }
+            self.apply_external_requests();
             let now = Instant::now();
             let dt = self
                 .last_tick
@@ -3385,10 +3809,12 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
             let mut steps = self.timer.advance(dt.as_secs_f64(), speed, self.paused);
             // Only with a live output stream draining the ring: without a
             // device the ring never empties and the nudge would hold the
-            // emulator back.
+            // emulator back. Rate limited: audio is a soft sync, never the
+            // clock (see `AudioPacer`).
             if !self.paused && self.device_rate.is_some() {
-                steps = pace_steps(
+                steps = self.pacer.apply(
                     steps,
+                    dt.as_secs_f64(),
                     self.audio.depth(),
                     self.audio.rate(),
                     !self.fast_forward,
@@ -3424,8 +3850,8 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
     let config_p2_pad = config.gamepad_p2_index;
     // Display-only window settings (never part of any netplay identity).
     let window_scale = config.effective_window_scale();
+    let config_scale_mode = config.effective_scale_mode();
     let start_fullscreen = config.fullscreen;
-    let event_loop = EventLoop::new().map_err(|e| format!("event loop: {e}"))?;
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let audio = SharedAudio::new(config.effective_audio_rate());
@@ -3433,7 +3859,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         Ok((s, r)) => {
             if r != audio.rate() {
                 eprintln!(
-                    "audio: device runs {r} Hz vs game {} Hz — set audio_rate to {r} in the config for exact pitch",
+                    "audio: device runs {r} Hz vs game {} Hz (resampled; speed and pitch unaffected)",
                     audio.rate()
                 );
             }
@@ -3446,6 +3872,7 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
             (None, None)
         }
     };
+    #[cfg(not(target_os = "android"))]
     let gilrs = crate::input::new_gilrs(true).ok();
 
     let initial = WindowUiState::new(has_rom);
@@ -3560,12 +3987,15 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         window: None,
         pixels: None,
         keyboard: crate::input::KeyboardState::new(),
+        #[cfg(not(target_os = "android"))]
         gilrs,
+        #[cfg(not(target_os = "android"))]
         active_pad: None,
         audio,
         _stream: stream,
         device_rate,
         timer: FrameTimer::new(),
+        pacer: AudioPacer::new(),
         last_tick: None,
         paused: initial.paused,
         has_rom: initial.has_rom,
@@ -3581,13 +4011,19 @@ fn run_event_loop(run: RunConfig) -> Result<(), String> {
         feats,
         coop_local,
         rom_body,
+        #[cfg(not(target_os = "android"))]
         active_pad2: None,
+        #[cfg(not(target_os = "android"))]
         pad_order: Vec::new(),
         p2_pad: args.p2_pad.or(config_p2_pad),
         p2_follow: args.p2_follow,
         tex_size: (0, 0),
         window_scale: args.scale.or(window_scale),
         start_fullscreen: args.fullscreen || start_fullscreen,
+        scale_mode: args.scale_mode.unwrap_or(config_scale_mode),
+        surface_size: (1, 1),
+        renderer: None,
+        lifecycle_suspended: false,
         remember_rom: args.config.is_none(),
         modifiers: winit::keyboard::ModifiersState::empty(),
         #[cfg(feature = "netplay")]
@@ -3640,21 +4076,193 @@ mod tests {
         assert_eq!((n1, n4), (2, MAX_STEPS_PER_TICK.min(8)));
     }
 
+    /// Frame sizes the launcher's widescreen options produce (scale 1).
+    const OFF: (u32, u32) = (256, 240);
+    const W16X10: (u32, u32) = (384, 240);
+    const W16X9: (u32, u32) = (432, 240);
+
+    fn fit(surface: (u32, u32), tex: (u32, u32)) -> Viewport {
+        let wide = u8::from(tex.0 > 256);
+        compute_viewport(surface, tex, ScaleMode::Fit, fill_crop_texels(wide, 1))
+    }
+
+    fn rect(v: &Viewport) -> (u32, u32, u32, u32) {
+        (v.x, v.y, v.w, v.h)
+    }
+
+    /// Fullscreen always fills the screen height for 4:3 (fractional scale,
+    /// pillarboxed sides) — the Legion Go report showed 6x = 1440 of 1600.
     #[test]
-    fn viewport_centers_integer_scale() {
-        // 768×720 @ integer+aspect: eff 292.57×240 → scale 2 → 585×480 centered.
-        let v = compute_viewport(768, 720, true, true);
-        assert_eq!(v.scale, 2);
-        assert_eq!((v.w, v.h), (585, 480));
-        assert_eq!((v.x, v.y), ((768 - 585) / 2, (720 - 480) / 2));
-        // Without aspect correction: 256×240 in 768×720 → scale 3 → fills.
-        let v2 = compute_viewport(768, 720, true, false);
-        assert_eq!(v2.scale, 3);
-        assert_eq!((v2.w, v2.h), (768, 720));
-        assert_eq!((v2.x, v2.y), (0, 0));
-        // Non-integer fills the window.
-        let v3 = compute_viewport(800, 600, false, false);
-        assert_eq!((v3.w, v3.h), (800, 600));
+    fn viewport_fit_4x3_fills_height_on_common_screens() {
+        for (surface, want) in [
+            ((1920, 1080), (384, 0, 1152, 1080)),
+            ((2560, 1600), (426, 0, 1707, 1600)),
+            ((1280, 800), (213, 0, 853, 800)),
+            ((3840, 2160), (768, 0, 2304, 2160)),
+        ] {
+            let v = fit(surface, OFF);
+            assert_eq!(rect(&v), want, "{surface:?}");
+            assert_eq!(v.h, surface.1, "fills the height on {surface:?}");
+            assert_eq!((v.src_x, v.src_w), (0.0, 256.0), "4:3 is never trimmed");
+        }
+        assert!((fit((2560, 1600), OFF).scale - 6.6667).abs() < 1e-3);
+    }
+
+    /// "16:9 doesn't cover my 16:9 screen": 432x240 is 1.8:1, so it fills a
+    /// 16:9 display by trimming under 3 px of margin per side.
+    #[test]
+    fn viewport_fit_16x9_covers_16x9_displays() {
+        for surface in [(1920, 1080), (3840, 2160), (1280, 720), (2560, 1440)] {
+            let v = fit(surface, W16X9);
+            assert!(v.fills(surface), "{surface:?}: {v:?}");
+            let trim = v.src_x;
+            assert!(
+                trim > 0.0 && trim < 3.0,
+                "{surface:?} trims {trim} px per side"
+            );
+            assert!((v.src_w - (432.0 - 2.0 * trim)).abs() < 1e-9);
+        }
+        let v = fit((1920, 1080), W16X9);
+        assert!((v.scale - 4.5).abs() < 1e-9);
+        assert!((v.src_w - 426.6667).abs() < 1e-3);
+    }
+
+    /// 16:10 screens (Legion Go 2560x1600, 1280x800 laptops/Steam Deck):
+    /// the 16:10 preset fills them exactly; 16:9 letterboxes minimally
+    /// (would need 24 px per side of trim, more than the one-tile allowance)
+    /// and never exceeds the surface, so nothing is clipped.
+    #[test]
+    fn viewport_fit_on_16x10_displays() {
+        assert_eq!(rect(&fit((2560, 1600), W16X10)), (0, 0, 2560, 1600));
+        assert_eq!(rect(&fit((1280, 800), W16X10)), (0, 0, 1280, 800));
+        assert_eq!(rect(&fit((2560, 1600), W16X9)), (0, 89, 2560, 1422));
+        assert_eq!(rect(&fit((1280, 800), W16X9)), (0, 44, 1280, 711));
+        for s in [(2560, 1600), (1280, 800)] {
+            let v = fit(s, W16X9);
+            assert_eq!((v.src_x, v.src_w), (0.0, 432.0), "no trim, whole picture");
+        }
+        // 16:10 on 16:9 displays: pillarboxed, height filled.
+        assert_eq!(rect(&fit((1920, 1080), W16X10)), (96, 0, 1728, 1080));
+        assert_eq!(rect(&fit((3840, 2160), W16X10)), (192, 0, 3456, 2160));
+    }
+
+    /// Integer mode keeps whole multiples (the old look) for those who want it.
+    #[test]
+    fn viewport_integer_mode() {
+        let int = |s, t| compute_viewport(s, t, ScaleMode::Integer, 64);
+        assert_eq!(rect(&int((1920, 1080), OFF)), (448, 60, 1024, 960));
+        assert_eq!(rect(&int((2560, 1600), OFF)), (512, 80, 1536, 1440));
+        assert_eq!(rect(&int((1280, 800), OFF)), (256, 40, 768, 720));
+        assert_eq!(rect(&int((3840, 2160), OFF)), (768, 0, 2304, 2160));
+        assert_eq!(rect(&int((1920, 1080), W16X9)), (96, 60, 1728, 960));
+        assert_eq!(rect(&int((2560, 1600), W16X9)), (200, 200, 2160, 1200));
+        assert_eq!(rect(&int((3840, 2160), W16X9)), (192, 120, 3456, 1920));
+        assert_eq!(rect(&int((2560, 1600), W16X10)), (128, 80, 2304, 1440));
+        assert_eq!(int((1920, 1080), W16X9).src_w, 432.0, "never trims");
+        // Smaller than 1x: shrinks instead of cropping.
+        let v = int((200, 200), OFF);
+        assert!(v.w <= 200 && v.h <= 200 && v.scale < 1.0, "{v:?}");
+    }
+
+    /// An HD texture (any output scale) lands on exactly the same rectangle
+    /// as the 1x frame, and a texture larger than the window is shrunk into
+    /// it — the old pixels scaler cropped it (the Windows 16:10 clipping).
+    #[test]
+    fn viewport_hd_texture_matches_1x_and_shrinks_to_fit() {
+        for surface in [(1920, 1080), (2560, 1600), (1280, 800), (3840, 2160)] {
+            for base in [OFF, W16X10, W16X9] {
+                let wide = u8::from(base.0 > 256) * 11;
+                let v1 = compute_viewport(surface, base, ScaleMode::Fit, fill_crop_texels(wide, 1));
+                let hd = (base.0 * 4, base.1 * 4);
+                let v4 = compute_viewport(surface, hd, ScaleMode::Fit, fill_crop_texels(wide, 4));
+                assert_eq!(rect(&v1), rect(&v4), "{surface:?} {base:?}");
+                assert!((v4.src_x - 4.0 * v1.src_x).abs() < 1e-6);
+            }
+        }
+        // 4x 16:9 pack (1728x960) in a 1280x800 window.
+        let v = compute_viewport((1280, 800), (1728, 960), ScaleMode::Fit, 32);
+        assert!(v.w <= 1280 && v.h <= 800, "{v:?}");
+        assert!(v.scale < 1.0);
+        assert_eq!(v.src_w, 1728.0, "whole picture, shrunk");
+    }
+
+    #[test]
+    fn viewport_never_exceeds_surface_and_is_centered() {
+        for surface in [
+            (1, 1),
+            (7, 900),
+            (1920, 1080),
+            (2560, 1600),
+            (1280, 800),
+            (3840, 2160),
+            (2560, 1080),
+        ] {
+            for tex in [OFF, W16X10, W16X9, (560, 240), (1728, 960)] {
+                for mode in [ScaleMode::Fit, ScaleMode::Integer] {
+                    let v =
+                        compute_viewport(surface, tex, mode, fill_crop_texels(11, tex.0 / 432 + 1));
+                    assert!(
+                        v.x + v.w <= surface.0 && v.y + v.h <= surface.1,
+                        "{surface:?} {tex:?} {v:?}"
+                    );
+                    assert!(v.w >= 1 && v.h >= 1);
+                    assert!(v.x.abs_diff(surface.0 - v.x - v.w) <= 1, "centered x {v:?}");
+                    assert!(v.y.abs_diff(surface.1 - v.y - v.h) <= 1, "centered y {v:?}");
+                    assert!(v.src_x >= 0.0 && v.src_x + v.src_w <= f64::from(tex.0) + 1e-9);
+                }
+            }
+        }
+        let z = compute_viewport((0, 0), OFF, ScaleMode::Fit, 0);
+        assert_eq!((z.w, z.h), (0, 0));
+    }
+
+    #[test]
+    fn fill_crop_only_for_widescreen() {
+        assert_eq!(fill_crop_texels(0, 1), 0);
+        assert_eq!(fill_crop_texels(0, 4), 0);
+        assert_eq!(fill_crop_texels(11, 1), 8);
+        assert_eq!(fill_crop_texels(11, 4), 32);
+        assert_eq!(fill_crop_texels(8, 2), 16);
+    }
+
+    #[test]
+    fn scale_mode_parses_and_defaults_to_fit() {
+        assert_eq!(ScaleMode::default(), ScaleMode::Fit);
+        assert_eq!(ScaleMode::parse("fit"), Some(ScaleMode::Fit));
+        assert_eq!(ScaleMode::parse(" Integer "), Some(ScaleMode::Integer));
+        assert_eq!(ScaleMode::parse("stretch"), None);
+        for m in [ScaleMode::Fit, ScaleMode::Integer] {
+            assert_eq!(ScaleMode::parse(m.as_str()), Some(m));
+        }
+        let a = parse_native_args(&sv(&["--scale-mode", "integer"])).unwrap();
+        assert_eq!(a.scale_mode, Some(ScaleMode::Integer));
+        assert_eq!(parse_native_args(&sv(&[])).unwrap().scale_mode, None);
+        let err = parse_native_args(&sv(&["--scale-mode", "zoom"])).expect_err("bad");
+        assert!(err.contains("--scale-mode expects fit | integer"), "{err}");
+        assert!(NATIVE_USAGE.contains("--scale-mode"));
+    }
+
+    #[test]
+    fn blit_viewport_letterboxes_and_trims() {
+        // 4x2 texture: left half red, right half blue.
+        let mut tex = Vec::new();
+        for _ in 0..2 {
+            for x in 0..4 {
+                tex.extend_from_slice(if x < 2 {
+                    &[255, 0, 0, 255]
+                } else {
+                    &[0, 0, 255, 255]
+                });
+            }
+        }
+        let vp = compute_viewport((16, 4), (4, 2), ScaleMode::Fit, 0);
+        assert_eq!(rect(&vp), (4, 0, 8, 4));
+        let out = blit_viewport(&tex, (4, 2), (16, 4), &vp);
+        let px = |x: usize, y: usize| &out[(y * 16 + x) * 4..(y * 16 + x) * 4 + 4];
+        assert_eq!(px(0, 0), &[0, 0, 0, 255], "pillarbox is black");
+        assert_eq!(px(15, 3), &[0, 0, 0, 255]);
+        assert_eq!(px(4, 0), &[255, 0, 0, 255]);
+        assert_eq!(px(11, 3), &[0, 0, 255, 255]);
     }
 
     #[test]
@@ -4024,6 +4632,74 @@ mod tests {
             );
         }
         assert_eq!(game.traps.len(), game.traps.iter().count());
+    }
+
+    /// Simulate `secs` of the windowed loop at `tick_hz` OS ticks per second
+    /// with a device draining `drain_hz` game samples/s from a ring fed one
+    /// nominal frame per step; returns emulated frames per second.
+    fn simulated_fps(tick_hz: f64, drain_hz: f64, secs: f64) -> f64 {
+        let rate = 44100u32;
+        let frame = f64::from(rate) / NTSC_HZ;
+        let mut timer = FrameTimer::new();
+        let mut pacer = AudioPacer::new();
+        let mut depth = frame; // startup prime
+        let dt = 1.0 / tick_hz;
+        let ticks = (secs * tick_hz) as usize;
+        let mut frames = 0usize;
+        for _ in 0..ticks {
+            depth = (depth - drain_hz * dt).max(0.0);
+            let steps = timer.advance(dt, 1.0, false);
+            let steps = pacer.apply(steps, dt, depth as usize, rate, true);
+            depth += steps as f64 * frame;
+            frames += steps;
+        }
+        frames as f64 / secs
+    }
+
+    #[test]
+    fn audio_pacer_is_a_soft_sync_not_the_clock() {
+        // Matched drain: the NES rate at any display/tick rate.
+        for tick_hz in [60.0, 144.0, 240.0, 1000.0, 5000.0] {
+            let fps = simulated_fps(tick_hz, 44100.0, 60.0);
+            assert!((fps - NTSC_HZ).abs() < 0.2, "tick {tick_hz}: {fps} fps");
+        }
+        // The Windows bug: raw 48/96/192 kHz drain against a 44.1 kHz ring.
+        // The old per-tick nudge ran the game at the drain rate; the pacer
+        // caps the pull at one frame per second.
+        for tick_hz in [60.0, 144.0, 1000.0, 5000.0] {
+            for drain in [48000.0, 96000.0, 192000.0] {
+                let fps = simulated_fps(tick_hz, drain, 60.0);
+                assert!(
+                    fps <= NTSC_HZ + 1.0 / PACE_NUDGE_INTERVAL_SECS + 0.1,
+                    "tick {tick_hz} drain {drain}: {fps} fps"
+                );
+            }
+        }
+        // A slow drain can hold back at most one frame per second too.
+        let fps = simulated_fps(1000.0, 22050.0, 60.0);
+        assert!(
+            fps >= NTSC_HZ - 1.0 / PACE_NUDGE_INTERVAL_SECS - 0.1,
+            "{fps}"
+        );
+    }
+
+    #[test]
+    fn audio_pacer_rate_limits_nudges() {
+        let mut p = AudioPacer::new();
+        // Starving ring: the first tick nudges, the next ones within 1 s do not.
+        assert_eq!(p.apply(1, 0.001, 0, 44100, true), 2);
+        for _ in 0..900 {
+            assert_eq!(p.apply(1, 0.001, 0, 44100, true), 1);
+        }
+        // After the interval, one more nudge is allowed.
+        assert_eq!(p.apply(1, 0.2, 0, 44100, true), 2);
+        // A decision that changes nothing (cannot hold back 0) spends nothing.
+        let mut q = AudioPacer::new();
+        assert_eq!(q.apply(0, 0.001, 8 * 735, 44100, true), 0);
+        assert_eq!(q.apply(1, 0.001, 8 * 735, 44100, true), 0);
+        // Fast-forward bypasses entirely.
+        let mut f = AudioPacer::new();
+        assert_eq!(f.apply(4, 0.001, 0, 44100, false), 4);
     }
 
     #[test]
@@ -4569,47 +5245,70 @@ mod tests {
     }
 
     #[test]
-    fn window_size_for_scale_multiplies_fits_and_never_crops() {
+    fn window_size_for_scale_multiplies_and_fits_the_logical_monitor() {
         // Plain 256x240 at 3x with no monitor info.
-        assert_eq!(
-            window_size_for_scale((256, 240), (256, 240), 3, None),
-            (768.0, 720.0)
-        );
+        assert_eq!(window_size_for_scale((256, 240), 3, None), (768.0, 720.0));
         // Widescreen 16:9 (11 tiles/side = 432 wide) at 2x.
-        assert_eq!(
-            window_size_for_scale((432, 240), (432, 240), 2, None),
-            (864.0, 480.0)
-        );
+        assert_eq!(window_size_for_scale((432, 240), 2, None), (864.0, 480.0));
         // Too big for a 1280x800 screen: steps down to the largest that fits
         // (240*3 + 120 > 800, so 2x).
         assert_eq!(
-            window_size_for_scale((256, 240), (256, 240), 8, Some((1280, 800))),
+            window_size_for_scale((256, 240), 8, Some((1280, 800))),
             (512.0, 480.0)
         );
-        // Never below 1x, even on a tiny screen.
+        // Legion Go / 16:10 laptop at 200%: 2560x1600 physical is 1280x800
+        // logical. The launcher's default 3x of 16:9 (1296x720) no longer
+        // opens past the screen edge.
         assert_eq!(
-            window_size_for_scale((256, 240), (256, 240), 4, Some((100, 100))),
-            (256.0, 240.0)
+            window_size_for_scale((432, 240), 3, Some((1280, 800))),
+            (864.0, 480.0)
         );
-        // An HD texture larger than base*scale keeps the window at least the
-        // texture size (pixels crops, never shrinks).
+        // 1920x1200 at 150% = 1280x800 logical, 6x asked: 2x fits.
         assert_eq!(
-            window_size_for_scale((256, 240), (1024, 960), 2, None),
-            (1024.0, 960.0)
+            window_size_for_scale((384, 240), 6, Some((1280, 800))),
+            (768.0, 480.0)
         );
-        assert_eq!(
-            window_size_for_scale((256, 240), (512, 480), 6, None),
-            (1536.0, 1440.0)
-        );
+        // Smaller than 1x on a tiny screen: shrinks to fit (the viewport
+        // blit scales the texture down; it no longer crops).
+        let (w, h) = window_size_for_scale((256, 240), 4, Some((200, 300)));
+        assert!(w <= 184.0 && h <= 180.0, "{w}x{h}");
+        assert!((w / h - 256.0 / 240.0).abs() < 0.02, "keeps the aspect");
         // Out-of-range scales are clamped, not trusted.
+        assert_eq!(window_size_for_scale((256, 240), 0, None), (256.0, 240.0));
         assert_eq!(
-            window_size_for_scale((256, 240), (256, 240), 0, None),
-            (256.0, 240.0)
-        );
-        assert_eq!(
-            window_size_for_scale((256, 240), (256, 240), 99, None),
+            window_size_for_scale((256, 240), 99, None),
             (2048.0, 1920.0)
         );
+    }
+
+    /// Every launcher scale (1-6) and widescreen option on the logical sizes
+    /// of common displays: the window (plus chrome) always fits the monitor.
+    #[test]
+    fn window_always_fits_common_monitors() {
+        // Logical sizes: 1080p @100/125/150%, 1440p, 2560x1600 @100/150/200%,
+        // 4K @200%.
+        for monitor in [
+            (1920, 1080),
+            (1536, 864),
+            (1280, 720),
+            (2560, 1440),
+            (2560, 1600),
+            (1706, 1066),
+            (1280, 800),
+        ] {
+            for base in [(256, 240), (384, 240), (432, 240), (560, 240)] {
+                for scale in 1..=6 {
+                    let (w, h) = window_size_for_scale(base, scale, Some(monitor));
+                    assert!(
+                        w + f64::from(WINDOW_CHROME_W) <= f64::from(monitor.0)
+                            && h + f64::from(WINDOW_CHROME_H) <= f64::from(monitor.1),
+                        "{base:?} x{scale} on {monitor:?} -> {w}x{h}"
+                    );
+                }
+                let (w, h) = initial_window_size(base.0, base.1, Some(monitor));
+                assert!(w <= f64::from(monitor.0) && h + 120.0 <= f64::from(monitor.1));
+            }
+        }
     }
 
     #[test]

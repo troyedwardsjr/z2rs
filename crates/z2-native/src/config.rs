@@ -287,10 +287,12 @@ pub struct NativeConfig {
     /// Audio output rate (only 44100 / 48000 are shipped game rates).
     #[serde(default = "default_audio_rate")]
     pub audio_rate: u32,
-    /// Integer scaling on/off.
+    /// Legacy key, **ignored**: it was never wired to the renderer, and every
+    /// config written so far carries `true`, so honouring it now would bring
+    /// back the thick fullscreen borders. Use [`Self::scale_mode`].
     #[serde(default = "default_true")]
     pub integer_scaling: bool,
-    /// Aspect correction on/off (correct 8:7 PAR when set).
+    /// Legacy key, not applied (8:7 pixel-aspect correction was never wired).
     #[serde(default = "default_true")]
     pub aspect_correction: bool,
     /// Pause emulation when the window loses focus.
@@ -379,6 +381,17 @@ pub struct NativeConfig {
     /// Alt+Enter toggle it at runtime). Display only. Default off.
     #[serde(default)]
     pub fullscreen: bool,
+    /// How the picture is scaled to the window / screen: `"fit"` (default:
+    /// largest size that fits, fractional, so fullscreen fills the screen
+    /// height) or `"integer"` (whole-number multiples only; sharpest, may
+    /// leave borders). `--scale-mode` overrides it. An unknown value means
+    /// `fit`. Display only.
+    #[serde(default = "default_scale_mode")]
+    pub scale_mode: String,
+}
+
+fn default_scale_mode() -> String {
+    "fit".to_string()
 }
 
 fn default_widescreen() -> String {
@@ -430,6 +443,7 @@ impl Default for NativeConfig {
             netplay: NetplayConfig::default(),
             window_scale: None,
             fullscreen: false,
+            scale_mode: default_scale_mode(),
         }
     }
 }
@@ -467,6 +481,14 @@ impl NativeConfig {
     #[must_use]
     pub fn effective_window_scale(&self) -> Option<u32> {
         self.window_scale.map(|s| s.clamp(1, MAX_WINDOW_SCALE))
+    }
+
+    /// Configured [`crate::app::ScaleMode`]; an unknown value is `Fit` so a
+    /// stale config never stops the app (the `--scale-mode` flag is
+    /// validated and exits 2 instead).
+    #[must_use]
+    pub fn effective_scale_mode(&self) -> crate::app::ScaleMode {
+        crate::app::ScaleMode::parse(&self.scale_mode).unwrap_or_default()
     }
 
     /// Effective audio rate (falls back to 44100 for anything unsupported).
@@ -622,6 +644,27 @@ mod tests {
         assert!(c.window_scale.is_none());
         assert!(c.effective_window_scale().is_none());
         assert!(!c.fullscreen);
+    }
+
+    /// `scale_mode` defaults to fit — including for every existing config,
+    /// all of which carry the never-wired `integer_scaling: true` — and a
+    /// bad value degrades to fit rather than stopping the app.
+    #[test]
+    fn scale_mode_defaults_to_fit_and_ignores_legacy_integer_scaling() {
+        use crate::app::ScaleMode;
+        assert_eq!(
+            NativeConfig::default().effective_scale_mode(),
+            ScaleMode::Fit
+        );
+        let old: NativeConfig =
+            serde_json::from_str(r#"{ "integer_scaling": true }"#).expect("parses");
+        assert_eq!(old.effective_scale_mode(), ScaleMode::Fit);
+        let int: NativeConfig =
+            serde_json::from_str(r#"{ "scale_mode": "integer" }"#).expect("parses");
+        assert_eq!(int.effective_scale_mode(), ScaleMode::Integer);
+        let bad: NativeConfig =
+            serde_json::from_str(r#"{ "scale_mode": "stretchy" }"#).expect("parses");
+        assert_eq!(bad.effective_scale_mode(), ScaleMode::Fit);
     }
 
     /// The window keys parse when present, and a bad scale is clamped rather

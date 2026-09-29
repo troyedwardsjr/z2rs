@@ -1,6 +1,6 @@
 # z2rs
 
-z2rs is a clean-room-style reconstruction of Zelda II: The Adventure of Link (NES) in Rust. It runs as a desktop app and in the browser (WebAssembly), and it is checked frame by frame against the original ROM running in a reference emulator.
+z2rs is a clean-room-style reconstruction of Zelda II: The Adventure of Link (NES) in Rust. It runs as a desktop app, in the browser (WebAssembly) and on Android, and it is checked frame by frame against the original ROM running in a reference emulator.
 
 You bring your own ROM. Nothing from the original game is distributed here. [PROVENANCE.md](PROVENANCE.md) records what reference material the project worked from and where every file in this repository came from, and [LEGAL.md](LEGAL.md) has the rules contributors follow.
 
@@ -22,6 +22,8 @@ Release announcement: [Moddable Zelda 2 PC / Web port with Online Multiplayer Co
 The launcher also sets the window size, fullscreen, widescreen (16:10, 16:9 or 21:9 ultrawide), an HD pack folder, and local or online co-op. Online co-op uses a public signalling server by default, so two players only need to agree on a room name.
 
 The game remembers the last ROM it loaded, so after the first run you can start `z2rs` directly and it boots straight into the game. Dragging a ROM onto the game window still works. `HOW-TO-PLAY.txt` in the archive lists the controls and where settings and saves are kept.
+
+For Android 8.0 and newer, the releases page also has `z2rs-<version>-android.apk`. Install it, pick your ROM in the app and press Play. It has an on-screen gamepad and works with Bluetooth and USB controllers. Online co-op is not available on Android yet. [guide/android.md](guide/android.md) covers installing, the controls and the settings.
 
 Only one dump passes the check, identified by the hash of the ROM body with the 16-byte iNES header stripped: CRC32 `BA322865`, SHA1 `11333adb723a5975e0ecca3aee8f4747aa8d2d26` (No-Intro USA). The file is only ever read in place.
 
@@ -48,6 +50,8 @@ make run            # play the optimized desktop build
 make run-web        # build the wasm bundle and serve it on :8080
 ```
 
+The Android app is built with `make android`, which needs the Android SDK, NDK and `cargo-ndk`. [guide/android.md](guide/android.md) lists the prerequisites and explains how to sign a release APK.
+
 `make help` lists every target. A target that needs `Z2_ROM` prints what to set and exits with status 2 when it is missing.
 
 ## Controls
@@ -67,6 +71,7 @@ make run-web        # build the wasm bundle and serve it on :8080
 | Guide | What is in it |
 |---|---|
 | [guide/desktop.md](guide/desktop.md) | the launcher, every key, save-state slots, command-line flags, the config file, gamepads |
+| [guide/android.md](guide/android.md) | installing the APK, the on-screen gamepad, controllers, accessibility, building and signing the app |
 | [guide/browser.md](guide/browser.md) | the web build, its URL parameters, optional features and bundle size |
 | [guide/co-op.md](guide/co-op.md) | two Links locally or online, widescreen, how both work and what they cannot do |
 | [guide/hd-packs.md](guide/hd-packs.md) | making a pack by painting over spritesheets of the game (`make hd-sheets`, `make hd-pack`) and playing with it |

@@ -1,0 +1,25 @@
+[versions]
+agp = "8.13.2"
+kotlin = "2.1.21"
+# androidx.games:games-activity must stay at exactly 4.4.0: the Rust
+# android-activity 0.6.1 crate is built against this version's native glue.
+gamesActivity = "4.4.0"
+appcompat = "1.7.1"
+coreKtx = "1.13.1"
+customview = "1.1.0"
+lifecycle = "2.8.7"
+material = "1.12.0"
+junit = "4.13.2"
+
+[libraries]
+games-activity = { group = "androidx.games", name = "games-activity", version.ref = "gamesActivity" }
+androidx-appcompat = { group = "androidx.appcompat", name = "appcompat", version.ref = "appcompat" }
+androidx-core-ktx = { group = "androidx.core", name = "core-ktx", version.ref = "coreKtx" }
+androidx-customview = { group = "androidx.customview", name = "customview", version.ref = "customview" }
+androidx-lifecycle-runtime-ktx = { group = "androidx.lifecycle", name = "lifecycle-runtime-ktx", version.ref = "lifecycle" }
+material = { group = "com.google.android.material", name = "material", version.ref = "material" }
+junit = { group = "junit", name = "junit", version.ref = "junit" }
+
+[plugins]
+android-application = { id = "com.android.application", version.ref = "agp" }
+kotlin-android = { id = "org.jetbrains.kotlin.android", version.ref = "kotlin" }

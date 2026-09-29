@@ -289,6 +289,12 @@ impl PpuBind {
         frame
     }
 
+    /// [`PpuBind::finish_frame`] straight into `out` (no 60 KiB temporary).
+    pub fn finish_frame_into(&mut self, out: &mut z2_ppu::render::IndexedFrame) {
+        self.ppu.finish_frame_into(out);
+        self.last_hit = self.ppu.sprite0_hit();
+    }
+
     /// Whole-frame convenience for tests/wiring: [`PpuBind::finish_frame`]
     /// plus the vblank flag.
     pub fn render_frame(&mut self) -> z2_ppu::render::IndexedFrame {

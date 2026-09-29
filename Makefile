@@ -11,7 +11,7 @@
 # (default: the sibling ../z2-corpus checkout, override as needed).
 
 .DEFAULT_GOAL := help
-.PHONY: hd-sheets hd-pack hd-play help build test test-rom verify-smoke extract fuzz-smoke run run-debug run-release run-launcher run-web run-web-net signal check-net netplay-e2e netplay-e2e-rollback netplay-play netplay-e2e-setup corpus-mint fmt clippy clean
+.PHONY: android android-release android-install android-run android-log hd-sheets hd-pack hd-play help build test test-rom verify-smoke extract fuzz-smoke run run-debug run-release run-launcher run-web run-web-net signal check-net netplay-e2e netplay-e2e-rollback netplay-play netplay-e2e-setup corpus-mint fmt clippy clean
 
 # Out-of-tree corpus checkout (movies + minted snapshots live here, never in
 # this repo). Override: `make corpus-mint Z2_CORPUS=/path/to/corpus`.
@@ -75,6 +75,12 @@ help:
 	@echo "               every sprite pose and every scene's tileset (needs Z2_ROM + Z2_CORPUS)"
 	@echo "  hd-pack      cut the painted HD_SHEETS into an HD pack in HD_PACK and validate it"
 	@echo "  hd-play      play with HD_PACK loaded (16:9 widescreen, HD_SCALE)"
+	@echo "  android      Rust library (cargo-ndk, release) + debug APK; needs the Android SDK/NDK"
+	@echo "               (ANDROID_HOME), cargo-ndk and JDK 17, see README.md"
+	@echo "  android-release  release library + release APK"
+	@echo "  android-install  adb install -r the debug APK on the connected device"
+	@echo "  android-run  install, then start the app on the device"
+	@echo "  android-log  adb logcat for the running app (or the z2rs tag)"
 	@echo "  fmt          cargo fmt --all"
 	@echo "  clippy       cargo clippy --workspace --all-targets -- -D warnings"
 	@echo "  clean        cargo clean"
@@ -285,6 +291,29 @@ hd-play:
 	@[ -n "$(ROM)" ] || { echo "hd-play: no ROM (set Z2_ROM or ROM=)"; exit 2; }
 	@[ -f "$(HD_PACK)/pack.json" ] || { echo "hd-play: no $(HD_PACK)/pack.json; run make hd-pack first"; exit 2; }
 	cargo run --release -p z2-native -- --rom "$(ROM)" --hd-pack "$(HD_PACK)" --hd-scale $(HD_SCALE) --widescreen 16:9 $(ARGS)
+
+# --- Android (crates/z2-android + the Gradle project in android/) ---
+# tools/android/build.sh builds libz2rs_android.so for arm64-v8a and x86_64
+# with cargo-ndk into android/app/src/main/jniLibs/, then runs Gradle. It finds
+# the SDK and NDK through ANDROID_HOME / ANDROID_NDK_HOME and says what to
+# install when something is missing. The APK never contains a ROM: players pick
+# their own in the app. ANDROID_ARGS passes extra flags, e.g. --abi arm64-v8a.
+ANDROID_ARGS ?=
+
+android:
+	tools/android/build.sh --apk debug $(ANDROID_ARGS)
+
+android-release:
+	tools/android/build.sh --apk release $(ANDROID_ARGS)
+
+android-install:
+	tools/android/device.sh install debug
+
+android-run:
+	tools/android/device.sh run debug
+
+android-log:
+	tools/android/device.sh log
 
 clean:
 	cargo clean

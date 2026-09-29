@@ -25,6 +25,12 @@ The launcher also sets the window size, fullscreen, widescreen (16:10,
 16:9 or 21:9 ultrawide), an HD graphics pack folder, and local or online
 co-op.
 
+In fullscreen the picture fills the screen height. For edge-to-edge
+widescreen pick the preset that matches your screen: 16:9 for most TVs
+and monitors, 16:10 for the Steam Deck, Legion Go and many laptops.
+"Whole-number scaling only" (--scale-mode integer) is a little sharper
+but can leave black borders.
+
 From a terminal:
 
     ./z2rs --rom /path/to/zelda2.nes --scale 3
@@ -85,6 +91,20 @@ Run anyway.
 Linux: if nothing starts, make the files executable:
 
     chmod +x z2rs z2rs-launcher z2-signal
+
+
+Android
+-------
+
+The Android app does not come in this archive. It works the same way: open
+it, pick your own Zelda II (USA) .nes file, and play. The app keeps a private
+copy of the ROM so it can start straight into the game next time; that copy is
+never backed up and is deleted when you uninstall.
+
+A touch gamepad is shown until you connect a controller. The first controller
+to connect is player 1 and the second is player 2. Back opens the pause menu,
+where you can save and load states. Online co-op is not available on Android
+yet.
 
 
 Problems

@@ -1,0 +1,38 @@
+[package]
+name = "z2-android"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs Android entry point: GameActivity android_main + JNI bridge over z2-native"
+authors = ["troyedwardsjr"]
+license = "MIT"
+publish = false
+
+# Loaded by the Android app as `libz2rs_android.so` (GameActivity's
+# `android.app.lib_name` meta-data is `z2rs_android`). Every dependency is
+# Android-only, so on a desktop workspace build this is an empty library.
+[lib]
+name = "z2rs_android"
+path = "src/lib.rs"
+crate-type = ["cdylib"]
+
+[target.'cfg(target_os = "android")'.dependencies]
+# Netplay (`netplay` feature: webrtc-rs + ring) is off on Android for now: a
+# smaller APK and fewer native C/asm builds to cross-compile. Everything else
+# (widescreen, HD packs, local co-op, save states) is in.
+#
+# cpal (inside z2-native) plays through oboe, which is C++. tools/android/
+# build.sh builds with cargo-ndk `--link-libcxx-shared`, so the .so NEEDs
+# `libc++_shared.so` and the script copies it into jniLibs beside it.
+z2-native = { path = "../z2-native", default-features = false }
+# `android-game-activity` pairs android-activity 0.6 with the Java side's
+# `androidx.games:games-activity:4.x` (GameActivity 4.x ABI); feature
+# unification turns it on for z2-native's winit too.
+winit = { version = "0.30", features = ["android-game-activity", "rwh_06"] }
+# JNI types for the `com.z2rs.game.NativeBridge` exports (already in the
+# Android tree through cpal).
+jni = "0.21"
+log = "0.4"
+android_logger = "0.14"
+# pipe/dup2 to forward the frontend's stderr diagnostics to logcat.
+libc = "0.2"
+serde_json = "1"

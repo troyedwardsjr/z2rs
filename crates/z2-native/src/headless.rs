@@ -96,6 +96,12 @@ pub struct HeadlessArgs {
     /// `--margin-sprites on|off`: side-view objects outside the window in the
     /// widescreen margins (default on, like the windowed frontend).
     pub margin_sprites_flag: Option<bool>,
+    /// `--surface WxH`: draw `--dump-present` into a WxH "screen" through
+    /// the windowed viewport math ([`crate::app::compute_viewport`]), so the
+    /// PNG shows the borders and trim a window / fullscreen of that size gets.
+    pub surface: Option<(u32, u32)>,
+    /// `--scale-mode fit|integer` for `--surface` (default fit).
+    pub scale_mode: Option<crate::app::ScaleMode>,
 }
 
 impl HeadlessArgs {
@@ -178,6 +184,9 @@ usage: z2-native --headless [--snapshot S] [--movie M] [--frames N] [--dump fact
   --dump-present P
                   write the fully composed RGBA PNG here (widescreen + HD pack +
                   scale: exactly what the windowed frontend presents)
+  --surface WxH   draw --dump-present into a WxH screen exactly as the window /
+                  fullscreen scales it (e.g. 2560x1600; black borders included)
+  --scale-mode M  fit (default) | integer, for --surface
   --help          print this text
 exit codes: 0 ran/help, 2 usage error, 3 reserved (was: gated on oracle/PPU), 4 I/O error";
 
@@ -285,6 +294,22 @@ pub fn parse_headless_args(argv: &[String]) -> Result<ParseOutcome, String> {
             "--dump-coop" => args.dump_coop = Some(value_of(&mut it, "--dump-coop")?),
             "--hd-pack" => args.hd_pack = Some(value_of(&mut it, "--hd-pack")?),
             "--dump-present" => args.dump_present = Some(value_of(&mut it, "--dump-present")?),
+            "--surface" => {
+                let raw = value_of(&mut it, "--surface")?;
+                let parsed = raw
+                    .split_once(['x', 'X'])
+                    .and_then(|(w, h)| Some((w.parse::<u32>().ok()?, h.parse::<u32>().ok()?)))
+                    .filter(|&(w, h)| (1..=8192).contains(&w) && (1..=8192).contains(&h));
+                args.surface = Some(parsed.ok_or_else(|| {
+                    format!("--surface expects WxH (1-8192 each), got '{raw}'\n{HEADLESS_USAGE}")
+                })?);
+            }
+            "--scale-mode" => {
+                let raw = value_of(&mut it, "--scale-mode")?;
+                args.scale_mode = Some(crate::app::ScaleMode::parse(&raw).ok_or_else(|| {
+                    format!("--scale-mode expects fit | integer, got '{raw}'\n{HEADLESS_USAGE}")
+                })?);
+            }
             "--hd-scale" => {
                 let raw = value_of(&mut it, "--hd-scale")?;
                 let n: u32 = raw.parse().unwrap_or(0);
@@ -632,11 +657,42 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
         // Exactly the windowed present path: one `app::Display`, one frame.
         let mut display =
             crate::app::Display::new(display_settings.clone()).map_err(HeadlessError::Usage)?;
-        let (w, h) = display.size();
+        let (tw, th) = display.size();
         let rgba = display
             .present(&emu.game)
             .map_err(HeadlessError::Usage)?
             .to_vec();
+        let ((w, h), rgba) = match args.surface {
+            None => ((tw, th), rgba),
+            Some(surface) => {
+                let vp = crate::app::compute_viewport(
+                    surface,
+                    (tw, th),
+                    args.scale_mode.unwrap_or_default(),
+                    crate::app::fill_crop_texels(
+                        display.settings().wide_tiles,
+                        display.effective_scale(),
+                    ),
+                );
+                eprintln!(
+                    "headless: surface {}x{}: picture {}x{} at ({}, {}), scale {:.3}, \
+                     texture columns {:.2}..{:.2} of {tw}",
+                    surface.0,
+                    surface.1,
+                    vp.w,
+                    vp.h,
+                    vp.x,
+                    vp.y,
+                    vp.scale,
+                    vp.src_x,
+                    vp.src_x + vp.src_w
+                );
+                (
+                    surface,
+                    crate::app::blit_viewport(&rgba, (tw, th), surface, &vp),
+                )
+            }
+        };
         let png = z2_render::encode_png_rgba(w, h, &rgba, &[])
             .map_err(|e| HeadlessError::Usage(format!("--dump-present: encode PNG: {e}")))?;
         std::fs::write(path, png).map_err(HeadlessError::Io)?;
@@ -960,6 +1016,48 @@ mod tests {
         let off = HeadlessArgs::default();
         assert_eq!(off.wide_tiles(), 0);
         assert_eq!(off.pad2_for(0xFF), 0, "pad 2 idle by default");
+    }
+
+    #[test]
+    fn parses_surface_and_scale_mode() {
+        let ParseOutcome::Run(a) = parse_headless_args(&argv(&[
+            "--headless",
+            "--surface",
+            "2560x1600",
+            "--scale-mode",
+            "integer",
+        ]))
+        .unwrap() else {
+            panic!("run");
+        };
+        assert_eq!(a.surface, Some((2560, 1600)));
+        assert_eq!(a.scale_mode, Some(crate::app::ScaleMode::Integer));
+        for bad in ["2560", "0x10", "axb", "9000x10"] {
+            assert!(
+                parse_headless_args(&argv(&["--headless", "--surface", bad])).is_err(),
+                "{bad}"
+            );
+        }
+        assert!(parse_headless_args(&argv(&["--headless", "--scale-mode", "zoom"])).is_err());
+    }
+
+    /// `--dump-present --surface` writes a surface-sized PNG (no ROM needed).
+    #[test]
+    fn dump_present_into_a_surface() {
+        let dir = scratch("surface");
+        let out = dir.join("s.png");
+        let args = HeadlessArgs {
+            dump_present: Some(out.to_string_lossy().into_owned()),
+            surface: Some((1920, 1080)),
+            widescreen: Some("16:9".into()),
+            frames: 1,
+            ..HeadlessArgs::default()
+        };
+        run_headless(&args).expect("runs");
+        let png = std::fs::read(&out).expect("written");
+        // IHDR width/height (big-endian) at bytes 16..24.
+        assert_eq!(u32::from_be_bytes(png[16..20].try_into().unwrap()), 1920);
+        assert_eq!(u32::from_be_bytes(png[20..24].try_into().unwrap()), 1080);
     }
 
     #[test]

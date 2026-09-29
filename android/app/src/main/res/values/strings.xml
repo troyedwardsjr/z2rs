@@ -1,0 +1,79 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="app_name" translatable="false">z2rs</string>
+
+    <!-- Launcher -->
+    <string name="launcher_intro">A native port of Zelda II. Bring your own Zelda II (USA) ROM dump: the app contains nothing from the original game.</string>
+    <string name="rom_heading">Game ROM</string>
+    <string name="rom_none">No ROM yet. Choose your own Zelda II (USA) .nes file.</string>
+    <string name="rom_ready">ROM ready: %1$s (%2$s). The game checks it when it starts.</string>
+    <string name="rom_ready_unnamed">ROM ready (%1$s). The game checks it when it starts.</string>
+    <string name="rom_copying">Copying the ROM…</string>
+    <string name="rom_copied">ROM copied: %1$s</string>
+    <string name="rom_error_size">That file is %1$s, which is not the size of a NES ROM. Nothing was changed.</string>
+    <string name="rom_error_read">Could not read that file: %1$s. Nothing was changed.</string>
+    <string name="rom_choose">Choose ROM</string>
+    <string name="rom_replace">Replace ROM</string>
+    <string name="rom_choose_desc">Choose a ROM file with the system file picker</string>
+    <string name="rom_replace_desc">Replace the ROM with another file from the system file picker</string>
+    <string name="play">Play</string>
+    <string name="play_desc_disabled">Play. Choose a ROM first.</string>
+    <string name="no_native_lib">This build has no game library for this device (libz2rs_android.so). Build it with tools/android/build.sh.</string>
+    <string name="launch_error">Could not start the game: %1$s</string>
+
+    <string name="settings_heading">Settings</string>
+    <string name="section_touch">On-screen gamepad</string>
+    <string name="section_display">Display</string>
+    <string name="section_players">Players</string>
+
+    <string name="pref_touch_enabled">Show the on-screen gamepad</string>
+    <string name="pref_touch_hide_controller">Hide it while a controller is connected</string>
+    <string name="pref_pad_size">Gamepad size</string>
+    <string name="pad_size_small">Small</string>
+    <string name="pad_size_medium">Medium</string>
+    <string name="pad_size_large">Large</string>
+    <string name="pref_pad_opacity">Gamepad opacity over the game</string>
+    <string name="pref_pad_opacity_value">%1$d percent</string>
+    <string name="pref_haptics">Vibrate on press (follows the system touch feedback setting)</string>
+    <string name="pref_left_handed">Left-handed layout (d-pad on the right)</string>
+    <string name="pref_high_contrast">High-contrast gamepad (solid buttons, heavy outlines)</string>
+    <string name="pref_keep_screen_on">Keep the screen on while playing</string>
+    <string name="pref_widescreen">Widescreen</string>
+    <string name="widescreen_off">Off (original 4:3 view)</string>
+    <string name="widescreen_16_10">16:10</string>
+    <string name="widescreen_16_9">16:9</string>
+    <string name="widescreen_21_9">21:9</string>
+    <string name="pref_scale_mode">Scaling</string>
+    <string name="scale_fit">Fill the screen</string>
+    <string name="scale_integer">Whole multiples only (sharper, may add borders)</string>
+    <string name="pref_coop_local">Two-player local co-op (second controller is player 2)</string>
+
+    <!-- Game screen -->
+    <string name="pause_button_desc">Pause menu</string>
+    <string name="touch_pad_desc">On-screen gamepad</string>
+    <string name="menu_title">Paused</string>
+    <string name="menu_resume">Resume</string>
+    <string name="menu_save_state">Save state (slot 1)</string>
+    <string name="menu_load_state">Load state (slot 1)</string>
+    <string name="menu_show_pad">Show on-screen gamepad</string>
+    <string name="menu_hide_pad">Hide on-screen gamepad</string>
+    <string name="menu_quit">Quit to launcher</string>
+    <string name="state_saving">Saving state to slot 1</string>
+    <string name="state_loading">Loading state from slot 1</string>
+    <string name="controller_connected">Controller connected: %1$s, player %2$d</string>
+    <string name="controller_disconnected">Controller disconnected: %1$s</string>
+
+    <!-- On-screen gamepad virtual buttons (TalkBack / Switch Access) -->
+    <string name="pad_up">D-pad up</string>
+    <string name="pad_down">D-pad down</string>
+    <string name="pad_left">D-pad left</string>
+    <string name="pad_right">D-pad right</string>
+    <string name="pad_select">Select</string>
+    <string name="pad_start">Start</string>
+    <string name="pad_b">B button</string>
+    <string name="pad_a">A button</string>
+    <string name="pad_label_select" translatable="false">SELECT</string>
+    <string name="pad_label_start" translatable="false">START</string>
+    <string name="pad_label_b" translatable="false">B</string>
+    <string name="pad_label_a" translatable="false">A</string>
+</resources>

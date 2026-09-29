@@ -207,6 +207,10 @@ fn display_section(ui: &mut egui::Ui, s: &mut Settings) {
                 ui.checkbox(&mut s.fullscreen, "Start in fullscreen");
                 ui.end_row();
 
+                ui.label("Scaling");
+                ui.checkbox(&mut s.integer_scale, "Whole-number scaling only");
+                ui.end_row();
+
                 ui.label("Widescreen");
                 egui::ComboBox::from_id_salt("widescreen")
                     .selected_text(s.widescreen.label())
@@ -236,7 +240,13 @@ fn display_section(ui: &mut egui::Ui, s: &mut Settings) {
                 "Show characters and items that are just off the original screen.",
             );
         }
-        hint(ui, "F11 or Alt+Enter switches fullscreen while playing.");
+        hint(
+            ui,
+            "F11 or Alt+Enter switches fullscreen while playing. The picture fills the \
+             screen height; whole-number scaling is a little sharper but can leave black \
+             borders. On a 16:10 screen (Steam Deck, Legion Go, many laptops) pick 16:10 \
+             widescreen to fill it edge to edge.",
+        );
     });
 }
 

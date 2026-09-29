@@ -5,6 +5,7 @@
 The release archives include `z2rs-launcher` (`z2rs-launcher.exe` on Windows, `z2rs.app` on macOS). Double-click it, pick your ROM and press Play. The launcher starts the game binary that sits next to it with the options you chose:
 
 - window size (the `--scale` multiplier) and fullscreen
+- whole-number scaling (the "Whole-number scaling only" checkbox, `--scale-mode integer`)
 - widescreen
 - an HD pack folder
 - local co-op, or online co-op as host or guest with a room name
@@ -12,6 +13,14 @@ The release archives include `z2rs-launcher` (`z2rs-launcher.exe` on Windows, `z
 For online co-op the launcher fills in the public signalling server, `wss://signal.z2rs.com`, so both players only need the same room name. You can point it at your own `z2-signal` instead. See [co-op.md](co-op.md).
 
 The game remembers the last ROM it loaded, whether it came from the launcher, `--rom` or a file dropped onto the window. It stores the path as `rom_path` in the config file, so starting `z2rs` with no arguments (a double-click in a file manager, for example) boots straight into the game. The ROM stays where it is. Only its path is saved.
+
+## Window size and fullscreen
+
+The picture keeps its shape and grows to fill the window, so in fullscreen it fills the height of the screen. It is scaled by whatever factor fits, including fractions, and sampled so the pixels stay sharp. `--scale-mode integer` (or `"scale_mode": "integer"` in the config file, or the launcher's "Whole-number scaling only" checkbox) keeps the picture to whole multiples instead. That is a little sharper, but it can leave black borders.
+
+For a screen with no borders at the sides, pick the widescreen preset that matches the screen's shape: 16:9 for most TVs and monitors, 16:10 for the Steam Deck, the Legion Go and many laptops. To fill the height, widescreen may trim up to one tile from each margin, which is how 16:9 covers a 16:9 screen. 16:9 on a 16:10 screen leaves thin bars above and below.
+
+Without `--scale`, the window opens at the largest of 3x, 2x or 1x that fits the screen, measured against the screen's size after display scaling, with room left for the title bar and taskbar. On a very small screen it opens below 1x. An HD pack does not make the window bigger.
 
 ## Running from a terminal
 
@@ -63,6 +72,7 @@ Besides `--rom`, `--movie` and `--config`:
 |---|---|
 | `--scale N` | window size as a multiple of the picture, 1 to 8 |
 | `--fullscreen` | start in fullscreen (`F11` or `Alt+Enter` switches back) |
+| `--scale-mode fit\|integer` | `fit` (default) fills the window or screen height at any size; `integer` uses whole multiples only |
 | `--widescreen off\|16:10\|16:9\|21:9\|N` | extra scenery left and right of the NES picture: 16:10 is 384x240, 16:9 is 432x240, 21:9 ultrawide is 560x240, or N tiles per side (0 to 20) |
 | `--coop-local` | two players at this machine |
 | `--coop-host ROOM` / `--coop-join ROOM` | online co-op over WebRTC |
@@ -84,7 +94,7 @@ Besides `--rom`, `--movie` and `--config`:
 
 ## Config file
 
-The same settings live in `<data-dir>/z2-native.json`: `rom_path` (the remembered ROM), `widescreen`, `widescreen_fill_left_clip`, `widescreen_fill_right_clip`, `widescreen_margin_sprites`, `widescreen_gameplay`, `hd_pack`, `hd_scale`, `hd_record`, `coop_local`, `keys_p2`, `gamepad`, `gamepad_p2`, `gamepad_p2_index`, and a `netplay` object (`mode`, `signal_url`, `input_delay`, `stall_timeout_ms`, `ice_url`, `ice_username`, `ice_credential`). Command-line flags win over the file. Older config files still load, because every newer key has a default.
+The same settings live in `<data-dir>/z2-native.json`: `rom_path` (the remembered ROM), `window_scale`, `fullscreen`, `scale_mode`, `widescreen`, `widescreen_fill_left_clip`, `widescreen_fill_right_clip`, `widescreen_margin_sprites`, `widescreen_gameplay`, `hd_pack`, `hd_scale`, `hd_record`, `coop_local`, `keys_p2`, `gamepad`, `gamepad_p2`, `gamepad_p2_index`, and a `netplay` object (`mode`, `signal_url`, `input_delay`, `stall_timeout_ms`, `ice_url`, `ice_username`, `ice_credential`). Command-line flags win over the file. Older config files still load, because every newer key has a default.
 
 The data directory is `$XDG_DATA_HOME/z2rs` when `XDG_DATA_HOME` is set. Otherwise it is `~/Library/Application Support/z2rs` on macOS, `%APPDATA%/z2rs` on Windows and `~/.local/share/z2rs` elsewhere. Save states, battery saves and the config file live there. The ROM is never stored there.
 
@@ -109,3 +119,4 @@ Testing status: the mapping, the bit layout (`A,B,Select,Start,Up,Down,Left,Righ
 
 - The ROM is rejected. Only the No-Intro USA dump passes the check (body CRC32 `BA322865`, SHA1 `11333adb...`). Dump your cartridge again. The desktop app reads the ROM directly. `assets.bin` is an optional product of the extractor and the app does not need it to start.
 - There is no sound. When no audio device is available, the desktop app prints `audio disabled: ...` and keeps running silently. The underrun meter in the title bar only means something while audio is up.
+- The game seems to run at the wrong speed. Game speed follows the NES clock, not the audio device, and the sound is resampled to whatever rate the output device uses, so a device set to 96 or 192 kHz plays at normal speed.

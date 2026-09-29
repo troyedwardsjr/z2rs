@@ -1,0 +1,14 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <style name="Theme.Z2rs.Game" parent="Theme.Material3.Dark.NoActionBar">
+        <item name="colorPrimary">@color/z2_primary_night</item>
+        <item name="colorOnPrimary">@color/z2_on_primary_night</item>
+        <item name="android:windowBackground">@color/game_background</item>
+        <item name="android:windowFullscreen">true</item>
+        <item name="android:windowContentOverlay">@null</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <!-- Draw into the cutout area; GameActivity keeps the game out of it. -->
+        <item name="android:windowLayoutInDisplayCutoutMode">shortEdges</item>
+    </style>
+</resources>

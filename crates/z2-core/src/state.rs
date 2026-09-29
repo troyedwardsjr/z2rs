@@ -122,11 +122,7 @@ impl GameState {
     /// Preallocate a ring of these once; saving into them never allocates.
     #[must_use]
     pub fn new() -> Self {
-        let frame: Box<[u8]> = vec![0u8; FRAME_LEN].into_boxed_slice();
-        let frame: Box<[u8; FRAME_LEN]> = match frame.try_into() {
-            Ok(b) => b,
-            Err(_) => unreachable!("vec has FRAME_LEN bytes"),
-        };
+        let frame = crate::game::zeroed_frame();
         Self {
             ram: [0; 0x800],
             wram: [0; 0x2000],
@@ -540,7 +536,7 @@ impl Game {
         s.wram = self.wram;
         s.oam = self.oam;
         s.palette = self.palette;
-        *s.frame = self.frame;
+        s.frame.copy_from_slice(&self.frame[..]);
         s.cpu = self.cpu;
         s.mmc1 = self.mmc1;
         s.ppu.copy_state_from(&self.ppu);
@@ -567,7 +563,7 @@ impl Game {
         self.wram = s.wram;
         self.oam = s.oam;
         self.palette = s.palette;
-        self.frame = *s.frame;
+        self.frame.copy_from_slice(&s.frame[..]);
         self.cpu = s.cpu;
         self.mmc1 = s.mmc1;
         self.ppu.copy_state_from(&s.ppu);

@@ -105,9 +105,10 @@ impl Peer {
     }
 }
 
-/// Run `body` on a thread with an explicit stack. An `Emu` is 83 KiB and an
-/// unoptimized build moves it by value through `run_pair`, `Peer::tick` and
-/// the constructors behind `session_emu`; measured on a debug build, that
+/// Run `body` on a thread with an explicit stack. An `Emu` was 83 KiB (before
+/// `Game::frame` moved to the heap; about 24 KiB now) and an unoptimized
+/// build moves it by value through `run_pair`, `Peer::tick` and
+/// the constructors behind `session_emu`; measured on a debug build then, that
 /// needs more than the 2 MiB a test thread gets. A panic in `body` fails the
 /// test with its own message.
 fn tall_stack(body: impl FnOnce() + Send + 'static) {

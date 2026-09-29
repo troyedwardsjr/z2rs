@@ -7,6 +7,7 @@ members = [
     "crates/z2-assets",
     "crates/z2-verify",
     "crates/z2-native",
+    "crates/z2-android",
     "crates/z2-launcher",
     "crates/z2-web",
     "crates/z2-net",

@@ -295,27 +295,31 @@ fn present_size_follows_the_widescreen_preset_and_scale() {
 }
 
 #[test]
-fn window_never_opens_smaller_than_its_texture() {
-    // pixels 0.15 clamps its integer scale to >= 1, so a window smaller than
-    // the texture CROPS. Whatever the monitor, the logical size must cover it.
+fn window_opens_at_a_whole_multiple_that_fits_the_monitor() {
+    // The window is sized from the 1x frame against the monitor's LOGICAL
+    // size. It may be smaller than an HD texture now: the viewport blit
+    // shrinks the texture instead of cropping it the way pixels' own
+    // scaler did.
     for tiles in [0u8, 8, 11, 16] {
         let (tw, th) = app::present_size(tiles);
         for monitor in [
             None,
             Some((1280, 800)),
             Some((3840, 2160)),
-            Some((640, 480)),
+            Some((1280, 720)),
         ] {
             let (lw, lh) = app::initial_window_size(tw, th, monitor);
-            assert!(
-                lw >= f64::from(tw) && lh >= f64::from(th),
-                "tiles={tiles} monitor={monitor:?} gave {lw}x{lh} for a {tw}x{th} texture"
-            );
-            // Integer multiple, so pixels scales exactly with no half pixels.
+            if let Some((mw, mh)) = monitor {
+                assert!(
+                    lw <= f64::from(mw) && lh + 120.0 <= f64::from(mh),
+                    "tiles={tiles} monitor={monitor:?} gave {lw}x{lh}"
+                );
+            }
+            // Whole multiple of the frame whenever 1x fits.
             assert_eq!(lw % f64::from(tw), 0.0, "non-integer scale {lw}/{tw}");
         }
     }
-    // A roomy display gets 3x; a small one steps down rather than cropping.
+    // A roomy display gets 3x; a small one steps down.
     assert_eq!(
         app::initial_window_size(256, 240, Some((3840, 2160))),
         (768.0, 720.0)

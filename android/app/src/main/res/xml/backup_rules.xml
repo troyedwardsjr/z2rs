@@ -1,0 +1,7 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- Android 11 and older (android:fullBackupContent). The ROM copy never leaves the device. -->
+<full-backup-content>
+    <exclude domain="file" path="rom.nes" />
+    <exclude domain="file" path="rom.nes.tmp" />
+    <exclude domain="file" path="launch_args.json" />
+</full-backup-content>

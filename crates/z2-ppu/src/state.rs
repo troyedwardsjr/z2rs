@@ -385,7 +385,10 @@ impl Ppu {
             w: false,
             ppu_data_buf: 0,
             sprite_limit: SpriteLimit::Faithful8,
-            frame_buf: Box::new([0; WIDTH * HEIGHT]),
+            frame_buf: match vec![0u8; WIDTH * HEIGHT].into_boxed_slice().try_into() {
+                Ok(b) => b,
+                Err(_) => unreachable!("vec has WIDTH * HEIGHT bytes"),
+            },
             next_line: PRERENDER_LINE,
             beam_line: VBLANK_LINE,
             beam_dot: 0,
@@ -835,6 +838,19 @@ impl Ppu {
     /// [`Ppu::set_beam`] past the pre-render line starts a new frame.
     /// Does not touch the vblank flag (see [`Ppu::end_frame`]).
     pub fn finish_frame(&mut self) -> IndexedFrame {
+        self.complete_frame();
+        *self.frame_buf
+    }
+
+    /// [`Ppu::finish_frame`] into `out`, without the 60 KiB by-value return
+    /// (which lands on the stack before it can be stored anywhere).
+    pub fn finish_frame_into(&mut self, out: &mut IndexedFrame) {
+        self.complete_frame();
+        out.copy_from_slice(&self.frame_buf[..]);
+    }
+
+    /// Shared body of [`Ppu::finish_frame`] and [`Ppu::finish_frame_into`].
+    fn complete_frame(&mut self) {
         if self.next_line == PRERENDER_LINE {
             self.start_visible_frame();
         }
@@ -852,7 +868,6 @@ impl Ppu {
             }
         }
         self.trace_event(PpuEventKind::FrameEnd);
-        *self.frame_buf
     }
 
     /// Whole-frame convenience: finish the frame with the current state and
@@ -1527,7 +1542,7 @@ impl Ppu {
         self.w = src.w;
         self.ppu_data_buf = src.ppu_data_buf;
         self.sprite_limit = src.sprite_limit;
-        *self.frame_buf = *src.frame_buf;
+        self.frame_buf.copy_from_slice(&src.frame_buf[..]);
         self.next_line = src.next_line;
         self.beam_line = src.beam_line;
         self.beam_dot = src.beam_dot;

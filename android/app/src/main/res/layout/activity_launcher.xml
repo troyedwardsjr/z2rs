@@ -1,0 +1,222 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:id="@+id/scroll"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:fillViewport="true">
+
+    <LinearLayout
+        android:id="@+id/content"
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_gravity="center_horizontal"
+        android:orientation="vertical"
+        android:paddingStart="24dp"
+        android:paddingTop="24dp"
+        android:paddingEnd="24dp"
+        android:paddingBottom="32dp">
+
+        <TextView
+            android:id="@+id/title"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:accessibilityHeading="true"
+            android:text="@string/app_name"
+            android:textAppearance="?attr/textAppearanceHeadlineLarge" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:text="@string/launcher_intro"
+            android:textAppearance="?attr/textAppearanceBodyLarge" />
+
+        <!-- ROM -->
+        <TextView
+            style="@style/Z2rs.SectionHeading"
+            android:text="@string/rom_heading" />
+
+        <TextView
+            android:id="@+id/rom_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:accessibilityLiveRegion="polite"
+            android:minHeight="48dp"
+            android:gravity="center_vertical"
+            android:text="@string/rom_none"
+            android:textAppearance="?attr/textAppearanceBodyLarge" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/choose_rom"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:minHeight="56dp"
+            android:text="@string/rom_choose"
+            android:textSize="18sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/play"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:minHeight="64dp"
+            android:text="@string/play"
+            android:textSize="20sp" />
+
+        <TextView
+            style="@style/Z2rs.SectionHeading"
+            android:layout_marginTop="32dp"
+            android:text="@string/settings_heading"
+            android:textAppearance="?attr/textAppearanceHeadlineSmall" />
+
+        <!-- On-screen gamepad -->
+        <TextView
+            style="@style/Z2rs.SectionHeading"
+            android:text="@string/section_touch" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_touch_enabled"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_touch_enabled" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_touch_hide_controller"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_touch_hide_controller" />
+
+        <TextView
+            android:id="@+id/pad_size_label"
+            style="@style/Z2rs.FieldLabel"
+            android:text="@string/pref_pad_size" />
+
+        <RadioGroup
+            android:id="@+id/pad_size"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/pad_size_small"
+                style="@style/Z2rs.Radio"
+                android:text="@string/pad_size_small" />
+
+            <RadioButton
+                android:id="@+id/pad_size_medium"
+                style="@style/Z2rs.Radio"
+                android:text="@string/pad_size_medium" />
+
+            <RadioButton
+                android:id="@+id/pad_size_large"
+                style="@style/Z2rs.Radio"
+                android:text="@string/pad_size_large" />
+        </RadioGroup>
+
+        <TextView
+            android:id="@+id/pad_opacity_label"
+            style="@style/Z2rs.FieldLabel"
+            android:labelFor="@id/pad_opacity"
+            android:text="@string/pref_pad_opacity" />
+
+        <com.google.android.material.slider.Slider
+            android:id="@+id/pad_opacity"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:minHeight="48dp"
+            android:stepSize="10"
+            android:valueFrom="20"
+            android:valueTo="100"
+            app:labelBehavior="gone" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_haptics"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_haptics" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_left_handed"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_left_handed" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_high_contrast"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_high_contrast" />
+
+        <!-- Display -->
+        <TextView
+            style="@style/Z2rs.SectionHeading"
+            android:text="@string/section_display" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_keep_screen_on"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_keep_screen_on" />
+
+        <TextView
+            android:id="@+id/widescreen_label"
+            style="@style/Z2rs.FieldLabel"
+            android:text="@string/pref_widescreen" />
+
+        <RadioGroup
+            android:id="@+id/widescreen"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/widescreen_off"
+                style="@style/Z2rs.Radio"
+                android:text="@string/widescreen_off" />
+
+            <RadioButton
+                android:id="@+id/widescreen_16_10"
+                style="@style/Z2rs.Radio"
+                android:text="@string/widescreen_16_10" />
+
+            <RadioButton
+                android:id="@+id/widescreen_16_9"
+                style="@style/Z2rs.Radio"
+                android:text="@string/widescreen_16_9" />
+
+            <RadioButton
+                android:id="@+id/widescreen_21_9"
+                style="@style/Z2rs.Radio"
+                android:text="@string/widescreen_21_9" />
+        </RadioGroup>
+
+        <TextView
+            android:id="@+id/scale_label"
+            style="@style/Z2rs.FieldLabel"
+            android:text="@string/pref_scale_mode" />
+
+        <RadioGroup
+            android:id="@+id/scale_mode"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical">
+
+            <RadioButton
+                android:id="@+id/scale_fit"
+                style="@style/Z2rs.Radio"
+                android:text="@string/scale_fit" />
+
+            <RadioButton
+                android:id="@+id/scale_integer"
+                style="@style/Z2rs.Radio"
+                android:text="@string/scale_integer" />
+        </RadioGroup>
+
+        <!-- Players -->
+        <TextView
+            style="@style/Z2rs.SectionHeading"
+            android:text="@string/section_players" />
+
+        <com.google.android.material.materialswitch.MaterialSwitch
+            android:id="@+id/pref_coop_local"
+            style="@style/Z2rs.Switch"
+            android:text="@string/pref_coop_local" />
+    </LinearLayout>
+</ScrollView>

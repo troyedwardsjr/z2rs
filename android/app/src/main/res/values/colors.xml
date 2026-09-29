@@ -1,0 +1,9 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <color name="z2_primary">#1B6B5A</color>
+    <color name="z2_on_primary">#FFFFFF</color>
+    <color name="z2_primary_night">#7FD8BF</color>
+    <color name="z2_on_primary_night">#00382D</color>
+    <color name="ic_launcher_background">#123B33</color>
+    <color name="game_background">#000000</color>
+</resources>

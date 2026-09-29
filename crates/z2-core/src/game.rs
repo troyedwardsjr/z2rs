@@ -217,6 +217,18 @@ impl std::error::Error for LoadError {}
 
 // ------------------------------------------------- Game
 
+/// A zeroed framebuffer allocated straight on the heap.
+///
+/// `Box::new([0; FRAME_LEN])` would build the 60 KiB array on the stack
+/// first (unoptimized builds always do); going through a `Vec` never does.
+#[must_use]
+pub fn zeroed_frame() -> Box<[u8; FRAME_LEN]> {
+    match vec![0u8; FRAME_LEN].into_boxed_slice().try_into() {
+        Ok(b) => b,
+        Err(_) => unreachable!("vec has FRAME_LEN bytes"),
+    }
+}
+
 /// Live hybrid-execution state: shared RAM mirror + interpreter + traps.
 ///
 /// See the module docs for the ownership/contract notes.
@@ -231,7 +243,13 @@ pub struct Game {
     /// Palette RAM mirror (32 bytes; zeroed until the PPU model feeds it).
     pub palette: [u8; 32],
     /// Indexed framebuffer, 256×240 (zeroed until the PPU model feeds it).
-    pub frame: [u8; FRAME_LEN],
+    ///
+    /// Boxed: at 60 KiB it was three quarters of `Game`, and every by-value
+    /// move of a `Game` (or of the frontends' `Emu` around it) copied it
+    /// across the stack. Building a netplay session's fresh emulator moved
+    /// it half a dozen times and overflowed the 1 MiB Windows main-thread
+    /// stack. Build one with [`zeroed_frame`].
+    pub frame: Box<[u8; FRAME_LEN]>,
     /// 2A03 registers (interp only).
     #[cfg(feature = "interp")]
     pub cpu: Cpu,
@@ -316,7 +334,7 @@ impl Game {
             wram: [0; 0x2000],
             oam: [0; 256],
             palette: [0; 32],
-            frame: [0; FRAME_LEN],
+            frame: zeroed_frame(),
             #[cfg(feature = "interp")]
             cpu: Cpu::new(),
             #[cfg(feature = "interp")]
@@ -631,8 +649,7 @@ impl Game {
     fn capture_frame(&mut self, end: u64) {
         self.ppu.sync_from_mapper(&self.chr, &self.mmc1);
         self.ppu.sync_cycles(end);
-        let fb = self.ppu.finish_frame();
-        self.frame = fb;
+        self.ppu.finish_frame_into(&mut self.frame);
     }
 
     /// Vblank start (interp only): raise the flag, or leave it clear for
