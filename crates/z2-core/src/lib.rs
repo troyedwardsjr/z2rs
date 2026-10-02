@@ -73,6 +73,10 @@ pub mod enemy_data;
 /// Gated behind `interp` with the interpreter (needs `Game` + `TrapTable`).
 #[cfg(feature = "interp")]
 pub mod enemy_traps;
+/// ZALiA-inspired optional enhancements (all off by default; never part of
+/// verification). See README.md.
+#[cfg(feature = "interp")]
+pub mod enh;
 pub mod facts;
 pub mod game;
 /// Overworld systems: RLE maps, encounters, transitions.

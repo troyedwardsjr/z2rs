@@ -10,8 +10,9 @@
 //! * **Standalone / `Game::audio` path** (the simpler one to wire):
 //!   the engine calls [`Engine::tick_frame`](crate::engine::Engine::tick_frame)
 //!   once per video frame to emit `$4000-$4017` writes, then
-//!   [`Apu::audio`] advances all timers by exactly one NTSC frame
-//!   ([`FRAME_CPU_CYCLES`]) and appends the resampled PCM.
+//!   [`Apu::audio`] advances all timers by exactly one NTSC video frame
+//!   (29780.5 CPU cycles on average, see [`VIDEO_FRAME_HALF_CYCLES`]) and
+//!   appends the resampled PCM.
 //! * **Cycle-driven path** (future full CPU integration):
 //!   call [`Apu::clock_cpu_cycle`] once per CPU cycle and pull PCM with
 //!   [`Apu::drain_samples`]. [`Apu::audio`] must not be used on top.
@@ -22,12 +23,12 @@
 //! exact-rational fixed-point accumulator maps CPU cycles to output
 //! samples: `due = cycles_total * rate / CPU_HZ` (all integer math, no
 //! drift), averaging the raw mixer values in between (box filter). Per
-//! frame this yields 735 +/- 1 samples at 44.1 kHz (800 +/- 1 at 48 kHz);
+//! video frame this yields `rate / 60.0988` samples (733.8 at 44.1 kHz,
+//! 798.7 at 48 kHz, so 733/734 and 798/799);
 //! the frontend FIFO (see [`crate::audio`]) absorbs the jitter.
 
-use crate::audio::sample_rate_supported;
 use crate::dmc::{Dmc, DmcSource, SilentSource};
-use crate::frame::{FrameCounter, FRAME_CPU_CYCLES};
+use crate::frame::FrameCounter;
 use crate::noise::Noise;
 use crate::pulse::Pulse;
 use crate::reglog::RegLog;
@@ -36,6 +37,11 @@ use crate::triangle::Triangle;
 
 /// NES CPU clock (NTSC) in Hz.
 pub const CPU_HZ: u64 = 1_789_773;
+
+/// Twice the CPU cycles in one NTSC video frame (`2 * 29780.5`): the PPU's
+/// 341 x 262 dots, less the dot skipped on odd rendered frames, over 3.
+/// `CPU_HZ * 2 / VIDEO_FRAME_HALF_CYCLES` is the 60.0988 Hz frame rate.
+pub const VIDEO_FRAME_HALF_CYCLES: u64 = 59_561;
 
 /// Output gain applied after the DC-blocking high-pass filter.
 pub const OUTPUT_GAIN: f32 = 1.0;
@@ -65,6 +71,11 @@ pub struct Apu {
     // Exact-rational resampler state.
     cycles_total: u64,
     samples_emitted: u64,
+    // Where the current rate took over (`cycles_total`, `samples_emitted` at
+    // the last `set_sample_rate`); `due` is measured from here so a rate
+    // switch does not re-time everything rendered at the old rate.
+    rate_base_cycles: u64,
+    rate_base_samples: u64,
     mix_acc: f64,
     mix_count: u64,
     // DC-blocking high-pass filter state.
@@ -103,6 +114,8 @@ impl Apu {
             sample_rate: rate,
             cycles_total: 0,
             samples_emitted: 0,
+            rate_base_cycles: 0,
+            rate_base_samples: 0,
             mix_acc: 0.0,
             mix_count: 0,
             hpf_alpha: hpf_alpha(rate),
@@ -115,13 +128,25 @@ impl Apu {
         }
     }
 
-    /// Change the PCM output rate (same range rules as [`Apu::new`]).
-    /// Returns the rate actually selected. Fractional resampler phase is
-    /// preserved, so switching mid-stream does not click beyond the
-    /// unavoidable filter-state transient.
+    /// Change the PCM output rate. Any rate in
+    /// `MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE` is accepted (the same range
+    /// [`Apu::new`] takes; 44100 / 48000 stay the headline game rates, see
+    /// [`crate::audio::sample_rate_supported`]); anything else is rejected and the current
+    /// rate is kept. Returns the rate actually selected.
+    ///
+    /// The resampler is re-anchored at the switch: samples come due from
+    /// here on at the new rate, measured from this cycle. Without that,
+    /// `cycles_total * rate / CPU_HZ` re-times the whole history at the new
+    /// rate: switching up after a minute of 44.1 kHz emitted ~3900 samples
+    /// per second of history in one burst, and switching down emitted
+    /// nothing at all until the counters caught up (seconds of silence).
     pub fn set_sample_rate(&mut self, rate: u32) -> u32 {
-        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) || !sample_rate_supported(rate) {
+        if !(MIN_SAMPLE_RATE..=MAX_SAMPLE_RATE).contains(&rate) {
             return self.sample_rate;
+        }
+        if rate != self.sample_rate {
+            self.rate_base_cycles = self.cycles_total;
+            self.rate_base_samples = self.samples_emitted;
         }
         self.sample_rate = rate;
         self.hpf_alpha = hpf_alpha(rate);
@@ -262,9 +287,20 @@ impl Apu {
         self.push_mix_sample();
     }
 
-    /// Render one NTSC frame of CPU cycles into the sample FIFO.
+    /// Render one NTSC video frame of CPU cycles into the sample FIFO.
+    ///
+    /// A video frame is 29780.5 CPU cycles on average (`CPU_HZ / 60.0988`),
+    /// so frames alternate 29780 and 29781 cycles ([`VIDEO_FRAME_HALF_CYCLES`]).
+    /// This is *not* [`crate::frame::FRAME_CPU_CYCLES`] (29830, the APU frame sequencer's
+    /// own 4-step period): rendering that per video frame made each frame
+    /// 1/60 s of sound, so a frontend stepping 60.0988 frames per second
+    /// produced 0.16% more PCM than its device played (+79 samples/s at
+    /// 48 kHz). The browser's ring then had to throw away ~40 ms every
+    /// ~25 s to hold its latency, which is heard as a skip in the music.
     pub fn render_frame_cycles(&mut self) {
-        for _ in 0..FRAME_CPU_CYCLES {
+        let f = self.frames_rendered;
+        let cycles = ((f + 1) * VIDEO_FRAME_HALF_CYCLES) / 2 - (f * VIDEO_FRAME_HALF_CYCLES) / 2;
+        for _ in 0..cycles {
             self.clock_cpu_cycle();
         }
         self.frames_rendered += 1;
@@ -277,8 +313,8 @@ impl Apu {
     }
 
     /// **Game audio API.** Advance the APU by exactly one video frame and
-    /// append that frame's PCM (nominally `rate/60` samples: 735 at
-    /// 44100 Hz, 800 at 48000 Hz, +/- 1 from resampler phase) to `out`.
+    /// append that frame's PCM (`rate / 60.0988` samples on average: 733.8
+    /// at 44100 Hz, 798.7 at 48000 Hz) to `out`.
     ///
     /// Call once per emulated video frame, after the engine's register
     /// writes for that frame. `out` is appended to, never cleared, so the
@@ -337,9 +373,18 @@ impl Apu {
         self.mix_acc += f64::from(self.mix_voltage());
         self.mix_count += 1;
         let rate = u64::from(self.sample_rate);
-        let due = (self.cycles_total * rate) / CPU_HZ;
+        let due =
+            self.rate_base_samples + ((self.cycles_total - self.rate_base_cycles) * rate) / CPU_HZ;
         while self.samples_emitted < due {
-            let avg = (self.mix_acc / self.mix_count as f64) as f32;
+            // More than one sample can only come due on one cycle if the
+            // rate were above CPU_HZ; never divide by an empty box anyway.
+            // 0 / 0 here once put a NaN into the high-pass state, and every
+            // sample after it rendered as 0: permanent silence.
+            let avg = if self.mix_count == 0 {
+                self.hpf_prev_in
+            } else {
+                (self.mix_acc / self.mix_count as f64) as f32
+            };
             self.mix_acc = 0.0;
             self.mix_count = 0;
             self.samples_emitted += 1;
@@ -437,32 +482,44 @@ mod tests {
 
     #[test]
     fn frame_sample_counts_match_nominal_rates() {
-        for (rate, nominal) in [(44_100, 735), (48_000, 800)] {
+        // One video frame is 1 / 60.0988 s: 733.8 samples at 44.1 kHz,
+        // 798.7 at 48 kHz.
+        for (rate, lo, hi) in [(44_100, 733, 734), (48_000, 798, 799)] {
             let mut a = Apu::new(rate);
-            let mut out = Vec::new();
-            a.audio(&mut out);
-            let n = out.len() as i64;
-            assert!(
-                (n - nominal).abs() <= 1,
-                "rate {rate}: got {n}, want {nominal}±1"
-            );
+            for _ in 0..10 {
+                let mut out = Vec::new();
+                a.audio(&mut out);
+                let n = out.len();
+                assert!(
+                    (lo..=hi).contains(&n),
+                    "rate {rate}: got {n}, want {lo}..={hi}"
+                );
+            }
         }
     }
 
     #[test]
     fn long_run_sample_total_matches_wall_clock() {
-        for (rate, nominal) in [(44_100u32, 735u64), (48_000, 800)] {
+        // 60.0988 frames must render exactly `rate` samples: the frontends
+        // step that many frames per wall-clock second and the device plays
+        // `rate` per second, so any excess is a backlog that has to be
+        // dropped (heard as a skip) and any shortfall an underrun.
+        for rate in [22_050u32, 44_100, 48_000, 96_000, 192_000] {
             let mut a = Apu::new(rate);
             let mut out = Vec::new();
-            for _ in 0..600 {
+            let frames = 6000u64;
+            for _ in 0..frames {
                 a.audio(&mut out);
             }
-            let want = 600 * nominal;
-            let got = out.len() as u64;
+            let want =
+                (frames * u64::from(rate) * VIDEO_FRAME_HALF_CYCLES) as f64 / (2 * CPU_HZ) as f64;
+            let got = out.len() as f64;
             assert!(
-                got.abs_diff(want) <= 600,
-                "rate {rate}: {got} vs nominal {want} over 600 frames"
+                (got - want).abs() <= 1.0,
+                "rate {rate}: {got} vs {want:.1} over {frames} frames"
             );
+            let fps = (CPU_HZ * 2) as f64 / VIDEO_FRAME_HALF_CYCLES as f64;
+            assert!((fps - 60.0988).abs() < 0.0001, "fps {fps}");
         }
     }
 
@@ -488,8 +545,11 @@ mod tests {
         let mut a = Apu::new(44_100);
         a.write_reg(0x4017, 0x00); // 4-step, IRQ allowed
         let mut out = Vec::new();
-        a.audio(&mut out); // one frame -> frame IRQ latched
-        assert_ne!(a.read_status() & 0x40, 0, "frame IRQ set after a frame");
+        // The 4-step sequence (29830 cycles) is a little longer than a video
+        // frame (29780.5), so the IRQ latches during the second frame.
+        a.audio(&mut out);
+        a.audio(&mut out);
+        assert_ne!(a.read_status() & 0x40, 0, "frame IRQ set after a sequence");
         assert_eq!(a.read_status() & 0x40, 0, "read clears the flag");
         assert!(!a.irq_pending());
     }
@@ -510,9 +570,87 @@ mod tests {
         let mut a = Apu::new(123); // out of range -> 44100 fallback
         assert_eq!(a.sample_rate(), 44_100);
         assert_eq!(a.set_sample_rate(48_000), 48_000);
-        // Non-game rates are rejected (the synth only ships 44.1/48 kHz
-        // paths); the current rate is kept.
-        assert_eq!(a.set_sample_rate(22_050), 48_000);
-        assert_eq!(a.sample_rate(), 48_000);
+        // Any rate in range renders (a browser's AudioContext can run at
+        // 22.05, 96 or 192 kHz); out-of-range rates keep the current one.
+        assert_eq!(a.set_sample_rate(96_000), 96_000);
+        assert_eq!(a.set_sample_rate(1_000), 96_000);
+        assert_eq!(a.set_sample_rate(400_000), 96_000);
+        assert_eq!(a.sample_rate(), 96_000);
+    }
+
+    #[test]
+    fn rate_switch_mid_stream_keeps_sounding() {
+        // Regression: the page creates its AudioContext (and switches the
+        // synth to the context's 48 kHz) seconds after the ROM started at
+        // 44.1 kHz. The old resampler then emitted the re-timed history in one
+        // burst whose samples after the first averaged 0 / 0 = NaN, which
+        // stuck in the high-pass filter: every sample after it was 0, and the
+        // web build stayed silent on any 48 kHz output device.
+        let mut a = Apu::new(44_100);
+        a.write_reg(0x4015, 0x01);
+        a.write_reg(0x4000, 0xBF); // duty 2, constant volume 15
+        a.write_reg(0x4002, 0xFD);
+        a.write_reg(0x4003, 0x00);
+        a.write_reg(0x4017, 0x80);
+        let mut out = Vec::new();
+        for _ in 0..180 {
+            a.audio(&mut out);
+        }
+        a.set_sample_rate(48_000);
+        a.write_reg(0x4003, 0x00); // keep the length counter loaded
+        let mut after = Vec::new();
+        for _ in 0..30 {
+            a.audio(&mut after);
+        }
+        // The last 20 frames must still carry the tone.
+        let tail = &after[after.len() - 20 * 798..];
+        let loudest = tail.iter().map(|s| s.unsigned_abs()).max().unwrap_or(0);
+        assert!(
+            loudest > 1000,
+            "silent after the rate switch (loudest {loudest})"
+        );
+        assert!(
+            after.len() < 31 * 800,
+            "burst of {} samples after the switch",
+            after.len()
+        );
+    }
+
+    #[test]
+    fn rate_switch_mid_stream_neither_bursts_nor_stalls() {
+        // Two seconds at 44.1 kHz, then switch: the next frame must hold one
+        // frame's worth at the new rate, not a re-timing of the history.
+        for (from, to) in [
+            (44_100, 48_000),
+            (48_000, 44_100),
+            (44_100, 192_000),
+            (96_000, 22_050),
+        ] {
+            let mut a = Apu::new(from);
+            let mut out = Vec::new();
+            for _ in 0..120 {
+                a.audio(&mut out);
+            }
+            a.set_sample_rate(to);
+            let mut next = Vec::new();
+            a.audio(&mut next);
+            let per_frame = f64::from(to) / 60.0988;
+            assert!(
+                (next.len() as f64 - per_frame).abs() <= 2.0,
+                "{from}->{to}: {} samples in the frame after the switch, want ~{per_frame:.1}",
+                next.len()
+            );
+            // And the long-run rate is exact at the new rate.
+            let mut sec = Vec::new();
+            for _ in 0..601 {
+                a.audio(&mut sec);
+            }
+            let want = 601.0 * per_frame;
+            assert!(
+                (sec.len() as f64 - want).abs() <= 2.0,
+                "{from}->{to}: {} vs {want:.1}",
+                sec.len()
+            );
+        }
     }
 }

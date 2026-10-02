@@ -140,6 +140,9 @@ fn run_pair(raw: &[u8]) {
         wide_gameplay: None,
         record: false,
         margin_sprites: false,
+        rando: None,
+        no_traps: false,
+        enhancements: Default::default(),
     };
     let host_emu = app::emu_from_rom_body_with(&body, 44_100, feats).expect("host emulator");
     let guest_emu = app::emu_from_rom_body_with(&body, 44_100, feats).expect("guest emulator");

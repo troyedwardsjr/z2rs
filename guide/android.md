@@ -55,6 +55,10 @@ Besides the gamepad options, the launcher has:
 
 Settings are read when the game starts, so change them in the launcher before pressing Play.
 
+## HD packs
+
+The launcher's HD graphics pack section imports a pack from a `.zip` file or from an unzipped folder. The game checks the pack before it replaces the installed one, so a broken pack leaves the old one in place. You can cancel an import while it runs, replace the pack later or remove it. [hd-packs.md](hd-packs.md) explains how packs are made.
+
 ## Accessibility
 
 Each on-screen gamepad button is exposed to TalkBack and Switch Access as its own labelled control ("D-pad up", "A button", "Start" and so on), even though the pad is drawn as one surface. Activating one presses that button briefly. Every launcher control has a spoken label, and TalkBack announces controllers as they connect and disconnect.
@@ -64,7 +68,7 @@ Gamepad buttons and the pause button are at least 48dp, Android's recommended mi
 ## Limits
 
 - Online co-op is not available on Android yet. The app does not request internet access. Local co-op with two controllers works.
-- The app has no HD pack option.
+- The randomizer and the enhancements are not in the Android app yet.
 - Only `arm64-v8a` and `x86_64` are built. 32-bit ARM devices are not supported by the release APK.
 
 ## Building from source

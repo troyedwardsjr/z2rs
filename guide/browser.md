@@ -18,8 +18,10 @@ The web build runs the same engine as the desktop app, in a tab, with no npm and
 | HD pack folder picker: choose the directory that holds `pack.json` | none |
 | Scale 1x to 4x (the page warns about the cost above 2x), plus a separate CSS zoom | `?scale=`, `?zoom=` |
 | Online co-op: mode (rollback by default, or lockstep), signal URL, room, delay, ICE, Host (P1) / Join (P2) / Leave | `?net=lockstep`, `?signal=`, `?room=`, `?ice=`, `?delay=` |
+| Randomizer: seed, Random button and flag string (see [randomizer.md](randomizer.md)); applied when the ROM loads | none |
+| Mute checkbox, or the VOL button on the TV | none |
 
-The canvas sizes itself from the emulator and works down to phone width. HD pack PNGs are decoded inside wasm. If a pack fails to load, the page says so in red and the game keeps playing with the original art. During online play, a status line shows your role, the frame, the delay, stalls, and the reason the session closed.
+The canvas sizes itself from the emulator and works down to phone width. HD pack PNGs are decoded inside wasm. If a pack fails to load, the page says so in red and the game keeps playing with the original art. Sound is on by default. Browsers only allow sound after a click, tap or key press on the page, and a gamepad button does not count, so until then a "Click or press any key for sound" strip sits on the screen. The `sound:` line under Mute shows the audio state, which helps with bug reports. During online play, a status line shows your role, the frame, the delay, stalls, and the reason the session closed.
 
 More detail about the page, its `window.z2` scripting API and its tests is in [crates/z2-web/site/README](crates/z2-web/site/README).
 

@@ -15,6 +15,189 @@ pub const GAME_BIN_ENV: &str = "Z2RS_GAME_BIN";
 pub const GAME_LOG_FILE_NAME: &str = "last-game.log";
 /// How many trailing log lines an error shows.
 pub const ERROR_TAIL_LINES: usize = 20;
+/// The game's own startup / crash breadcrumb log inside the data dir (kept
+/// in step with `z2_native::diag::LOG_FILE_NAME`).
+pub const GAME_CRASH_LOG_FILE_NAME: &str = "z2-native.log";
+/// The game's graphics-backend crash guard inside the data dir (kept in
+/// step with `z2_native::gpu_guard::GUARD_FILE_NAME`): `crashed <label>`
+/// lines for backends that killed a run while starting, then at most one
+/// `attempting <label>` line, left behind when the run died in that backend.
+pub const GPU_GUARD_FILE_NAME: &str = "gpu-backend-guard.txt";
+/// The backends the game tries on its own on Windows, in order (kept in
+/// step with `z2_native::gpu_present::backend_attempts`).
+pub const AUTO_GPU_BACKENDS: [&str; 2] = ["DX12", "Vulkan"];
+
+/// File names of the vendor OpenGL drivers (ICDs) `opengl32.dll` loads.
+const GL_ICD_MODULES: [&str; 5] = [
+    "atio6axx.dll",
+    "atioglxx.dll",
+    "nvoglv64.dll",
+    "ig9icd64.dll",
+    "ig75icd64.dll",
+];
+
+/// What the launcher should say about the game's graphics-backend guard
+/// file (`text`), or `None` when there is nothing to say.
+///
+/// A leftover `attempting` line means the last run died while starting that
+/// backend; the game will skip it (when it chooses the backend itself) and
+/// try the next one.
+#[must_use]
+pub fn gpu_guard_notice(text: &str) -> Option<String> {
+    let mut crashed: Vec<&str> = Vec::new();
+    let mut attempting = None;
+    for line in text.lines().map(str::trim) {
+        if let Some(l) = line.strip_prefix("crashed ").map(str::trim) {
+            if !l.is_empty() && !crashed.contains(&l) {
+                crashed.push(l);
+            }
+        } else if let Some(l) = line.strip_prefix("attempting ").map(str::trim) {
+            if !l.is_empty() {
+                attempting = Some(l);
+            }
+        }
+    }
+    if let Some(a) = attempting {
+        if !crashed.contains(&a) {
+            crashed.push(a);
+        }
+    }
+    let next: Vec<&str> = AUTO_GPU_BACKENDS
+        .iter()
+        .copied()
+        .filter(|b| !crashed.contains(b))
+        .collect();
+    let auto_plan = if next.is_empty() {
+        "every automatic backend has crashed before, so the game will try them all again"
+            .to_string()
+    } else {
+        format!(
+            "with \"gpu_backend\" on \"auto\" the game tries {} instead",
+            next.join(", then ")
+        )
+    };
+    match attempting {
+        Some(a) if a == "GL" || !AUTO_GPU_BACKENDS.contains(&a) => Some(format!(
+            "Graphics backend {a} crashed the game last time while starting. It was \
+             chosen in \"gpu_backend\" (z2-native.json) or WGPU_BACKEND, so the game \
+             will try it again; set \"gpu_backend\" back to \"auto\" ({auto_plan})."
+        )),
+        Some(a) => Some(format!(
+            "Graphics backend {a} crashed the game last time while starting; {auto_plan}."
+        )),
+        None if crashed.is_empty() => None,
+        None => Some(format!(
+            "Skipping graphics backend {}, which crashed the game before; {auto_plan}. \
+             Delete {GPU_GUARD_FILE_NAME} in the data folder to try it again.",
+            crashed.join(", ")
+        )),
+    }
+}
+
+/// A graphics-specific explanation of a crash, from the game's output
+/// (`log_text`: its stderr and/or `z2-native.log`), or `None`.
+///
+/// Recognizes a fault inside a vendor OpenGL driver (named by the game's
+/// crash logger, or the last backend breadcrumb being GL) and a crash while
+/// any backend was still starting (no `first frame presented` after the
+/// last `trying backend` line).
+#[must_use]
+pub fn gpu_crash_hint(log_text: &str) -> Option<String> {
+    let lower = log_text.to_ascii_lowercase();
+    let icd = GL_ICD_MODULES.iter().find(|m| {
+        lower
+            .lines()
+            .any(|l| l.contains("fatal:") && l.contains(*m))
+    });
+    let mut trying: Option<String> = None;
+    let mut started = false;
+    let mut using_gl = false;
+    for line in log_text.lines() {
+        if let Some(rest) = line.split("gpu: trying backend ").nth(1) {
+            trying = rest.split_whitespace().next().map(str::to_string);
+            started = false;
+            using_gl = false;
+        } else if line.contains("gpu: using '") {
+            using_gl = line.contains(" via Gl ");
+        } else if line.contains("gpu: first frame presented") {
+            started = true;
+        }
+    }
+    let gl = icd.is_some() || using_gl || trying.as_deref() == Some("GL");
+    if gl {
+        let module = icd.map_or_else(String::new, |m| format!(" ({m})"));
+        return Some(format!(
+            "The crash looks like it came from the OpenGL graphics driver{module}: the \
+             vendor OpenGL ICD, atio6axx.dll on AMD, nvoglv64.dll on NVIDIA, \
+             ig9icd64.dll on Intel. Set \"gpu_backend\" to \"auto\" or \"dx12\" in \
+             z2-native.json so the game uses DirectX 12 instead, set the monitor to \
+             a standard refresh rate (60, 120, 144 Hz...), and update the graphics \
+             driver."
+        ));
+    }
+    match trying {
+        Some(t) if !started => Some(format!(
+            "The game died while starting graphics backend {t}. With \"gpu_backend\" \
+             on \"auto\" it skips {t} next time and tries the next one; updating the \
+             graphics driver or turning off overlays may make {t} work again."
+        )),
+        _ => None,
+    }
+}
+
+/// A plain-language explanation of a crash exit code, or `None` for an
+/// ordinary one.
+///
+/// Windows reports a process killed by an exception with the NTSTATUS code
+/// as its exit code, which `ExitStatus::code` shows as a large negative
+/// number (0xC0000005 is -1073741819). 101 is Rust's exit code after a
+/// panic, on every platform.
+#[must_use]
+pub fn explain_exit_code(code: i32) -> Option<&'static str> {
+    Some(match code as u32 {
+        101 => {
+            "The game hit an internal error (a Rust panic). The message is in \
+             the log below and in z2-native.log."
+        }
+        0xC000_0005 => {
+            "The game crashed with an access violation (0xC0000005) in native \
+             code, most often a graphics, audio or controller driver, or an \
+             overlay (Steam, Discord, MSI Afterburner / RivaTuner, OBS, \
+             ReShade). z2-native.log says which part was starting and, for a \
+             crash, which DLL it was in. Updating the graphics driver or \
+             turning overlays off often helps; setting \"gpu_backend\" to \
+             \"dx12\" or \"vulkan\" in z2-native.json tries another \
+             graphics API."
+        }
+        0xC000_00FD => "The game ran out of stack space (stack overflow, 0xC00000FD).",
+        0xC000_0409 => {
+            "The game was stopped by a fatal error check (0xC0000409): an \
+             abort after an internal error, or memory corruption."
+        }
+        0xC000_0135 => {
+            "Windows could not find a DLL the game needs (0xC0000135). \
+             Reinstall the game, or install the Microsoft Visual C++ \
+             Redistributable."
+        }
+        0xC000_0142 => "A DLL the game needs failed to start (0xC0000142).",
+        0xC000_001D => {
+            "The game used a CPU instruction this processor does not have \
+             (illegal instruction, 0xC000001D)."
+        }
+        0xC000_0374 => "The game's memory was corrupted (heap corruption, 0xC0000374).",
+        _ => return None,
+    })
+}
+
+/// `exit code N`, with the hex NTSTATUS form for Windows exception codes.
+#[must_use]
+pub fn format_exit_code(code: i32) -> String {
+    if (code as u32) >= 0xC000_0000 {
+        format!("exit code {code} / 0x{:08X}", code as u32)
+    } else {
+        format!("exit code {code}")
+    }
+}
 
 /// Program names tried next to the launcher, in order.
 pub fn game_binary_names() -> Vec<String> {
@@ -120,8 +303,14 @@ pub struct GameExit {
     pub success: bool,
     /// Human-readable status (exit code or signal).
     pub status: String,
+    /// What a crash exit code means, when it is a known one
+    /// ([`explain_exit_code`]).
+    pub explanation: Option<&'static str>,
     /// Last lines of the game's output.
     pub tail: Vec<String>,
+    /// For a failed run: what the game's logs say about a graphics driver
+    /// crash ([`gpu_crash_hint`]).
+    pub gpu_hint: Option<String>,
 }
 
 impl RunningGame {
@@ -162,18 +351,35 @@ impl RunningGame {
             Ok(None) => None,
             Ok(Some(status)) => {
                 let text = std::fs::read_to_string(&self.log_path).unwrap_or_default();
+                let gpu_hint = if status.success() {
+                    None
+                } else {
+                    // The crash logger's FATAL line (faulting DLL) is only in
+                    // z2-native.log, not on stderr.
+                    let crash_log = self
+                        .log_path
+                        .parent()
+                        .map(|d| d.join(GAME_CRASH_LOG_FILE_NAME))
+                        .and_then(|p| std::fs::read_to_string(p).ok())
+                        .unwrap_or_default();
+                    gpu_crash_hint(&format!("{text}\n{crash_log}"))
+                };
                 Some(GameExit {
+                    gpu_hint,
                     success: status.success(),
                     status: match status.code() {
-                        Some(c) => format!("exit code {c}"),
+                        Some(c) => format_exit_code(c),
                         None => format!("{status}"),
                     },
+                    explanation: status.code().and_then(explain_exit_code),
                     tail: last_lines(&text, ERROR_TAIL_LINES),
                 })
             }
             Err(e) => Some(GameExit {
                 success: false,
                 status: format!("could not check the game: {e}"),
+                explanation: None,
+                gpu_hint: None,
                 tail: Vec::new(),
             }),
         }
@@ -259,6 +465,81 @@ mod tests {
         assert_eq!(c.len(), 3);
         assert!(c[2].starts_with("/w/target/release"));
         assert_eq!(candidate_paths(Path::new("/w/target/release")).len(), 2);
+    }
+
+    #[test]
+    fn windows_crash_codes_are_explained() {
+        // What `ExitStatus::code` reports on Windows for 0xC0000005.
+        let av = -1_073_741_819;
+        assert!(explain_exit_code(av).unwrap().contains("access violation"));
+        assert_eq!(format_exit_code(av), "exit code -1073741819 / 0xC0000005");
+        assert!(explain_exit_code(0xC000_00FDu32 as i32)
+            .unwrap()
+            .contains("stack overflow"));
+        assert!(explain_exit_code(0xC000_0135u32 as i32)
+            .unwrap()
+            .contains("DLL"));
+        assert!(explain_exit_code(0xC000_0409u32 as i32).is_some());
+        assert!(explain_exit_code(101).unwrap().contains("panic"));
+        assert_eq!(explain_exit_code(1), None);
+        assert_eq!(explain_exit_code(3), None);
+        assert_eq!(format_exit_code(3), "exit code 3");
+    }
+
+    #[test]
+    fn gpu_guard_notice_explains_the_last_crash() {
+        assert_eq!(gpu_guard_notice(""), None);
+        let n = gpu_guard_notice("attempting DX12\n").unwrap();
+        assert!(n.contains("DX12 crashed the game last time"), "{n}");
+        assert!(n.contains("tries Vulkan instead"), "{n}");
+        // GL is only ever tried when named, so the advice is to go back
+        // to auto.
+        let n = gpu_guard_notice("attempting GL\n").unwrap();
+        assert!(n.contains("back to \"auto\""), "{n}");
+        assert!(n.contains("tries DX12, then Vulkan"), "{n}");
+        // A remembered crash with no new one.
+        let n = gpu_guard_notice("crashed DX12\n").unwrap();
+        assert!(n.contains("Skipping graphics backend DX12"), "{n}");
+        assert!(n.contains(GPU_GUARD_FILE_NAME), "{n}");
+        // Everything crashed.
+        let n = gpu_guard_notice("crashed DX12\nattempting Vulkan\n").unwrap();
+        assert!(n.contains("try them all again"), "{n}");
+    }
+
+    #[test]
+    fn gpu_crash_hint_names_the_gl_icd() {
+        // Died inside the AMD GL ICD, as in the v0.4.0 report.
+        let log = "[z2] gpu: trying backend GL (Backends(GL)), surface 1x1, texture 1x1\n\
+                   [    0.4s] FATAL: unhandled access violation (0xC0000005) at 0x1 in \
+                   C:\\WINDOWS\\System32\\DriverStore\\FileRepository\\amdogl.inf_amd64\\atio6axx.dll+0xb1c74a\n";
+        let h = gpu_crash_hint(log).unwrap();
+        assert!(h.contains("(atio6axx.dll)"), "{h}");
+        assert!(h.contains("nvoglv64.dll") && h.contains("\"dx12\""), "{h}");
+        // The last breadcrumb was a GL attempt, no crash logger line.
+        let h = gpu_crash_hint("[z2] gpu: trying backend GL (Backends(GL))\n").unwrap();
+        assert!(h.contains("OpenGL graphics driver"), "{h}");
+        // Running on GL, crashed later.
+        let h = gpu_crash_hint(
+            "[z2] gpu: trying backend WGPU_BACKEND (Backends(GL))\n\
+             [z2] gpu: using 'Radeon' via Gl (driver '' ''), surface format X\n\
+             [z2] gpu: first frame presented (Ok(()))\n",
+        )
+        .unwrap();
+        assert!(h.contains("OpenGL"), "{h}");
+        // Died while DX12 was starting.
+        let h = gpu_crash_hint("[z2] gpu: trying backend DX12 (Backends(DX12))\n").unwrap();
+        assert!(h.contains("starting graphics backend DX12"), "{h}");
+        // DX12 came up fine; the crash was elsewhere.
+        assert_eq!(
+            gpu_crash_hint(
+                "[z2] gpu: trying backend DX12 (Backends(DX12))\n\
+                 [z2] gpu: using 'Radeon' via Dx12 (driver '' ''), surface format X\n\
+                 [z2] gpu: first frame presented (Ok(()))\n\
+                 [z2] audio: opening\n"
+            ),
+            None
+        );
+        assert_eq!(gpu_crash_hint(""), None);
     }
 
     #[test]

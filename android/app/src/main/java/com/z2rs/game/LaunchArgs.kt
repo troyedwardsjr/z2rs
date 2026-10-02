@@ -21,11 +21,14 @@ object LaunchArgs {
         widescreen: String,
         scaleMode: String,
         coopLocal: Boolean,
+        hdPack: String? = null,
     ): List<String> {
         val args = mutableListOf(ARGV0, "--rom", romPath)
         args += listOf("--widescreen", if (widescreen in WIDESCREEN_VALUES) widescreen else "off")
         args += listOf("--scale-mode", if (scaleMode in SCALE_MODES) scaleMode else "fit")
         if (coopLocal) args += "--coop-local"
+        // `--hd-pack ''` would turn a pack off; no pack is simply no flag.
+        if (!hdPack.isNullOrBlank()) args += listOf("--hd-pack", hdPack)
         return args
     }
 

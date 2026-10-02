@@ -64,7 +64,9 @@ pub mod reglog;
 pub mod tables;
 pub mod triangle;
 
-pub use apu::{Apu, CPU_HZ, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, OUTPUT_GAIN};
+pub use apu::{
+    Apu, CPU_HZ, MAX_SAMPLE_RATE, MIN_SAMPLE_RATE, OUTPUT_GAIN, VIDEO_FRAME_HALF_CYCLES,
+};
 pub use audio::{nominal_frame_samples, two_frame_buffer_samples};
 pub use audio::{PcmFifo, BUFFER_SLACK_SAMPLES, RATE_44100, RATE_48000};
 pub use dmc::{Dmc, DmcSource, PrgSource, SilentSource, SliceSource};

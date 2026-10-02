@@ -251,8 +251,10 @@ fn pack_reproducing_nes_art_is_pixel_identical() {
         let want = upscale(frame.as_slice(), WIDTH, scale as usize);
         assert_eq!(got.len(), want.len());
         let bad = got
-            .chunks_exact(4)
-            .zip(want.chunks_exact(4))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .zip(want.as_chunks::<4>().0.iter())
             .enumerate()
             .find(|(_, (a, b))| a != b)
             .map(|(i, _)| (i % (WIDTH * scale as usize), i / (WIDTH * scale as usize)));
@@ -925,8 +927,10 @@ fn widescreen_left_edge_is_hd_with_fine_x() {
 /// nametable is one 32-column ring, so slots 0 and 32 alias), and the margin
 /// provider supplies its own identities for slots 0/1 and 31/32. The indexed
 /// wide frame and the HD composite must both use them, in exactly the same
-/// pixels: the strips the fills repaint, plus slot 0's leading `fine_x`
-/// columns in the left margin. Everything else keeps the record's tiles.
+/// pixels: the strips the fills repaint (widened to the whole of slots 0-1
+/// and 31-32, since the streamed slot reaches past the hidden 8 columns
+/// when `fine_x != 0`), plus slot 0's leading `fine_x` columns in the left
+/// margin. Everything else keeps the record's tiles.
 #[test]
 fn widescreen_edge_strips_use_the_providers_identities() {
     const CENTRE_HD: [u8; 4] = [0, 255, 0, 255];
@@ -980,7 +984,9 @@ fn widescreen_edge_strips_use_the_providers_identities() {
     let mp = wide.margin_px();
     let w = wide.width;
     let edge_idx = rec.line(masked_row).palette[usize::from(EDGE_PAL) * 4 + 1];
-    let x_left_strip = |wx: i32| (-i32::from(fine_x)..8).contains(&wx);
+    let fx = i32::from(fine_x);
+    let x_left_strip = |wx: i32| (-fx..16 - fx).contains(&wx);
+    let x_right_strip = |wx: i32| (248 - fx..256).contains(&wx);
 
     // Indexed: the provider's tile in the left strip and slot 0's margin
     // columns on every line, in the right strip only under the mask.
@@ -988,7 +994,7 @@ fn widescreen_edge_strips_use_the_providers_identities() {
         for wx in -(8 * i32::from(tiles))..WIDTH as i32 + 8 * i32::from(tiles) {
             let got = wide.row(row)[(wx + mp as i32) as usize];
             let in_window = (0..WIDTH as i32).contains(&wx);
-            let edge = x_left_strip(wx) || (right_masked && (248..256).contains(&wx));
+            let edge = x_left_strip(wx) || (right_masked && x_right_strip(wx));
             if edge {
                 assert_eq!(got, edge_idx, "row {row} x {wx}: provider's edge tile");
             } else if in_window {
@@ -1038,7 +1044,7 @@ fn widescreen_edge_strips_use_the_providers_identities() {
             let i = (row * w + (wx + mp as i32) as usize) * 4;
             &out[i..i + 4]
         };
-        for wx in -i32::from(fine_x)..8 {
+        for wx in -fx..16 - fx {
             assert_eq!(at(wx), EDGE_HD.as_slice(), "row {row} x {wx}: left strip");
         }
         assert_eq!(
@@ -1047,14 +1053,14 @@ fn widescreen_edge_strips_use_the_providers_identities() {
             "row {row}"
         );
         assert_eq!(
-            at(8),
+            at(16 - fx),
             CENTRE_HD.as_slice(),
-            "row {row}: first unclipped column"
+            "row {row}: first column past the edge slots"
         );
         assert_eq!(
-            at(247),
+            at(247 - fx),
             CENTRE_HD.as_slice(),
-            "row {row}: left of the right strip"
+            "row {row}: left of the right edge slots"
         );
         assert_eq!(
             at(WIDTH as i32),
@@ -1062,7 +1068,7 @@ fn widescreen_edge_strips_use_the_providers_identities() {
             "row {row}: right margin"
         );
         if right_masked {
-            for wx in 248..256 {
+            for wx in 248 - fx..256 {
                 assert_eq!(at(wx), EDGE_HD.as_slice(), "row {row} x {wx}: right strip");
             }
         } else {

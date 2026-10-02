@@ -437,6 +437,19 @@ pub const fn boss_key_drop() -> (u8, u8, u8) {
     (0x80, 0x40, 0x08)
 }
 
+/// CPU address of the boss-key X-position immediate (`LDA #$80` at `$DE0E`).
+pub const BOSS_KEY_X_OPERAND: u16 = 0xDE0F;
+/// CPU address of the dropped-item immediate (`LDA #$08` at `$DE18`).
+pub const BOSS_KEY_ITEM_OPERAND: u16 = 0xDE19;
+
+/// [`boss_key_drop`] with the X position and item taken from the ROM
+/// operand bytes (`x_operand`, `item_operand`), so a patched ROM (the
+/// randomizer's boss item drop) is honoured. `y` stays `x >> 1` (the
+/// original `LSR`). Vanilla bytes give exactly [`boss_key_drop`].
+pub const fn boss_key_drop_from(x_operand: u8, item_operand: u8) -> (u8, u8, u8) {
+    (x_operand, x_operand >> 1, item_operand)
+}
+
 /// Drop size group from `$6DF9 & $C0` (`bank7_monster_death`, `$E880`).
 ///
 /// `0` → no special drops (`LE8BF` skip); else `>> 6` → group `1..3`
@@ -1103,6 +1116,8 @@ mod tests {
         assert!(is_boss_rank(0xFF));
         assert!(!is_boss_rank(0x10));
         assert_eq!(boss_key_drop(), (0x80, 0x40, 0x08));
+        assert_eq!(boss_key_drop_from(0x80, 0x08), boss_key_drop());
+        assert_eq!(boss_key_drop_from(0x60, 0x0A), (0x60, 0x30, 0x0A));
         assert_eq!(drop_group(0x00), DropGroup::None);
         assert_eq!(drop_group(0x80), DropGroup::Group2);
         assert_eq!(drop_counter_tick(5), (0, true));

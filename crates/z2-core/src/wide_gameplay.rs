@@ -19,7 +19,11 @@
 //!     (`i16`, window coordinates) next to the ROM's 8-bit `$4E,x`
 //!     (`$4E = (ex + $FD) & $FF` always holds). A blob inside `0..248` is
 //!     drawn into OAM exactly like the ROM; a blob further out gets OAM Y
-//!     `$F8` (hidden) and is described as two [`MarginSprite`]s instead.
+//!     `$F8` (hidden) for each 8x16 half that starts outside window x
+//!     0-247, and every half that reaches a margin or the masked right strip
+//!     (x 248-255) is described as a [`MarginSprite`]. A half that starts at
+//!     x 0-247 keeps its OAM entry, so a blob crossing the picture edge never
+//!     loses the half that is still inside the window.
 //!     Blobs despawn when `ex < -M` or `ex >= 256 + M - 8` (the ROM's own
 //!     `ex >= 248` / wrap-below-zero rule at `M = 0`).
 //!
@@ -43,9 +47,9 @@
 //! [`Game::overworld_margin_sprites`] is the list of margin sprites that
 //! belong to the picture the last [`Game::step`] rendered, in window
 //! coordinates and OAM priority order (blob slot 0 first). The hardware
-//! shows OAM written by the previous frame's game logic, so the list the
-//! port builds in frame `N` is latched and shown for frame `N + 1`, exactly
-//! like the in-window blobs. The X values are the ones the port wrote at
+//! shows the OAM page as the `$4014` DMA copied it, so the list the blob
+//! pass builds is latched at the next DMA (`on_oam_dma`), exactly like the
+//! in-window blobs; a lag frame without a DMA keeps both. The X values are the ones the port wrote at
 //! draw time (before Link's step moves the scroll), so margin blobs move
 //! against the background exactly like the ROM's own sprites.
 
@@ -98,6 +102,9 @@ const SCROLL_Y: usize = 0x7F;
 const LINK_OAM_X: usize = 0x0203;
 /// OAM page base of blob slot 0 (`$0280 + 16 * slot`).
 const BLOB_OAM: usize = 0x0280;
+/// Window x of the overworld's masked right strip (`248..256`, the edge-mask
+/// sprite column).
+const STRIP_X: i16 = 248;
 /// First byte of the NMI RNG (`$051B,x` feeds the random walk).
 const RNG: usize = 0x051B;
 /// Blob palette by type (`L8281`) and tiles (`L8275`/`L8276`, indexed by
@@ -191,10 +198,11 @@ impl WideGameplayState {
         self.ran_this_frame = false;
     }
 
+    /// The `$4014` DMA copies the OAM page the last blob pass wrote, so the
+    /// margin sprites that pass described become the shown list.
     fn latch(&mut self) {
         self.shown = self.pending;
         self.shown_len = self.pending_len;
-        self.pending_len = 0;
     }
 
     fn push_sprite(&mut self, s: MarginSprite) {
@@ -388,21 +396,29 @@ pub(crate) fn after_load(game: &mut Game) {
     }
 }
 
-/// End-of-frame observer ([`Game::step`], only while enabled): when the
-/// blob loop did not run this frame, the OAM page was not rewritten, so the
-/// picture just rendered showed the previous frame's blobs and the next one
-/// will show them again: the pending list is shown and kept. Outside the
-/// overworld it is dropped after that one frame.
+/// `$4014` hook (display only): the PPU shows the OAM page as this DMA
+/// copied it, i.e. what the last blob pass drew, so its margin sprites are
+/// latched here, exactly like [`crate::wide_sprites::on_oam_dma`]. A frame
+/// without a DMA (a lag frame) keeps showing the previous list, as it keeps
+/// the previous OAM. Latching on the blob pass instead put the margin half
+/// of a blob one frame ahead of its OAM half after every lag frame, which
+/// split a blob crossing the left edge in two.
+pub(crate) fn on_oam_dma(game: &mut Game) {
+    let st = &mut game.wide_game;
+    if st.enabled {
+        st.latch();
+    }
+}
+
+/// End-of-frame observer ([`Game::step`], only while enabled): outside the
+/// overworld, a frame whose blob loop did not run drops the pending list
+/// (the next DMA then shows none) and the per-blob tracking.
 pub(crate) fn end_of_frame(game: &mut Game) {
     let st = &mut game.wide_game;
-    if !st.ran_this_frame {
-        st.shown = st.pending;
-        st.shown_len = st.pending_len;
-        if game.ram[MODE] != MODE_OVERWORLD {
-            st.pending_len = 0;
-            st.tracked = 0;
-            st.hidden = 0;
-        }
+    if !st.ran_this_frame && game.ram[MODE] != MODE_OVERWORLD {
+        st.pending_len = 0;
+        st.tracked = 0;
+        st.hidden = 0;
     }
     st.ran_this_frame = false;
 }
@@ -570,7 +586,7 @@ fn wide_blobs(game: &mut Game) {
         return;
     }
     let st = &mut game.wide_game;
-    st.latch();
+    st.pending_len = 0;
     st.ran_this_frame = true;
     st.n_passes += 1;
     // Every slot with a type gets steered (even one whose timer ran out this
@@ -922,16 +938,33 @@ fn blob_live(game: &mut Game, s: usize, frame_sp: u8) -> Live {
         }
     }
 
-    // Draw: in the window like the ROM; out in a margin hidden in OAM and
-    // described as margin sprites instead. A blob about to be removed is
-    // drawn like the ROM draws it (it is gone before the picture shows it).
+    // Draw: in the window like the ROM; out in a margin described as margin
+    // sprites instead. A blob about to be removed is drawn like the ROM
+    // draws it (it is gone before the picture shows it).
+    //
+    // A blob past the ROM's range (`hide`) is hidden in OAM one 8x16 half at
+    // a time. A half that starts at window x 0-247 stays in OAM, so the
+    // in-window part of a blob crossing the left edge is drawn by the PPU. A
+    // half that starts left of the window or at x >= 248 is hidden and drawn
+    // as a margin sprite: x >= 248 is the overworld's masked right strip,
+    // where the widescreen compositor drops window sprites (a wrapped blob
+    // half the ROM is removing parks there) and paints margin sprites
+    // instead. Hiding the whole blob left a hole the width of the half still
+    // inside the window: the blob vanished right where the original screen
+    // ends.
     let m = game.wide_game.margin_px;
     let doomed = out_of_bounds(ex, m);
     let hide = !(0..248).contains(&ex) && !doomed;
-    let shown_y = if hide { 0xF8 } else { oy };
+    let half_y = |hx: i16| {
+        if hide && !(0..STRIP_X).contains(&hx) {
+            0xF8
+        } else {
+            oy
+        }
+    };
+    let (y_l, y_r) = (half_y(ex), half_y(ex + 8));
     let base = BLOB_OAM + usize::from(oam);
-    game.ram[base..base + 8]
-        .copy_from_slice(&[shown_y, tile_l, attr, ox, shown_y, tile_r, attr, ox2]);
+    game.ram[base..base + 8].copy_from_slice(&[y_l, tile_l, attr, ox, y_r, tile_r, attr, ox2]);
     let st = &mut game.wide_game;
     st.shadow_oy[s] = oy;
     if hide {
@@ -943,7 +976,9 @@ fn blob_live(game: &mut Game, s: usize, frame_sp: u8) -> Live {
     if m != 0 && !doomed {
         // Right half first: the finished list is reversed into OAM order.
         for (hx, tile) in [(ex + 8, tile_r), (ex, tile_l)] {
-            if hide || hx < 0 || hx + 8 > 256 {
+            // Every half that reaches a margin or the masked right strip:
+            // the strip is drawn from these, not from OAM.
+            if !(0..STRIP_X).contains(&hx) {
                 st.push_sprite(MarginSprite {
                     x: hx,
                     y: oy,

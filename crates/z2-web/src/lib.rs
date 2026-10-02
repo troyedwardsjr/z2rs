@@ -127,25 +127,28 @@ const _: () = assert!(
     "the canonical iNES header must cover the whole verified ROM body"
 );
 
-/// The verified ROM body behind the canonical Zelda II (USA) iNES header
-/// (MMC1, horizontal-mirror seed). Every `Game` the page builds comes from
-/// this image, whether the dropped file had a header or not, so a headered
-/// dump, a bare body and a netplay restart from the stored body all boot
-/// byte-identical games.
+/// A trusted body (the verified vanilla image, or the randomizer's output
+/// for it, which may have 256 KiB of PRG) behind the canonical Zelda II
+/// iNES header (MMC1, horizontal-mirror seed). The PRG unit count follows
+/// the body length; CHR is always the full 128 KiB. Every `Game` the page
+/// builds comes from this image, whether the dropped file had a header or
+/// not, so a headered dump, a bare body and a netplay restart from the
+/// stored body all boot byte-identical games.
 fn canonical_ines(body: &[u8]) -> Vec<u8> {
+    let prg_units = z2_rando::rom::prg_units_for_body_len(body.len()).unwrap_or(INES_PRG_UNITS);
     let mut ines = Vec::with_capacity(rom::INES_HEADER_LEN + body.len());
     ines.extend_from_slice(&rom::INES_MAGIC);
-    ines.extend_from_slice(&[INES_PRG_UNITS, INES_CHR_UNITS, 0x10]);
+    ines.extend_from_slice(&[prg_units, INES_CHR_UNITS, 0x10]);
     ines.resize(rom::INES_HEADER_LEN, 0);
     ines.extend_from_slice(body);
     ines
 }
 
-/// Audio FIFO cap in samples (~5 s at 44.1 kHz, ~4.6 s at 48 kHz): the page
-/// drains this every rAF tick whether or not audio is on, so it is a memory
-/// guard for a stopped tab, not a latency budget — the worklet's queue is
-/// what the player hears as delay (see `site/worklet.js`).
-const AUDIO_FIFO_CAP: usize = 44_100 * 5;
+/// Audio FIFO cap in seconds of PCM at the current rate: the page drains
+/// this every rAF tick whether or not audio is on, so it is a memory guard
+/// for a stopped tab, not a latency budget — the worklet's queue is what the
+/// player hears as delay (see `site/worklet.js`).
+const AUDIO_FIFO_CAP_SECS: usize = 5;
 
 // ---------------------------------------------------------------------------
 // Errors (internal) — the wasm boundary converts these to JS strings.
@@ -300,11 +303,31 @@ pub struct WebEmu {
     /// margin). Default on; it changes gameplay, so it is part of the netplay
     /// identity. Re-applied after every ROM load.
     wide_gameplay: bool,
+    /// ZALiA-inspired gameplay enhancements (all off by default; see
+    /// README.md). Re-applied after every ROM load; part of the
+    /// netplay identity.
+    enh: z2_core::enh::Enhancements,
     /// Identity of the registered trap set (see [`trapset_id`]) with the
     /// wide-gameplay margin folded in ([`session_trapset_id`]).
     trapset_id: u64,
     /// [`trapset_id`] of the default groups alone.
     trapset_base: u64,
+    /// Randomizer request (`set_rando`): seed text and parsed flags. Applied
+    /// to the verified vanilla body by every ROM load and netplay restart.
+    rando: Option<(String, z2_rando::flags::Flags)>,
+    /// Hash code of the randomized game now running (`None` = vanilla).
+    rando_hash: Option<String>,
+    /// CRC32 of the body actually running (sent in the netplay `Hello`).
+    body_crc32: u32,
+    /// Fixed-bank traps disabled because the randomizer patched their code.
+    untrapped: Vec<u16>,
+    /// The running body differs from the verified vanilla one (the ROM
+    /// randomizer changed something): enhancements that assume the original
+    /// world are dropped (`Enhancements::for_rom`).
+    rom_randomized: bool,
+    /// `(vanilla, running)` bodies of a randomized image, so the untrap list
+    /// can be recomputed when the enhancement hooks change.
+    rando_bodies: Option<Box<(Vec<u8>, Vec<u8>)>>,
     /// HD-pack presenter and the staged directory upload (feature `hd`).
     #[cfg(feature = "hd")]
     hd: HdSlot,
@@ -370,27 +393,94 @@ fn fold_trapset(entries: &[(u16, &str)]) -> u64 {
 }
 
 /// Session identity: [`trapset_id`] with the wide-gameplay margin folded in
-/// (the same FNV-1a continued over `"wide_gameplay"` and the tile count);
-/// `None` leaves the id untouched.
+/// (the same FNV-1a continued over `"wide_gameplay"` and the tile count),
+/// then the enhancement identity
+/// (`z2_core::enh::Enhancements::identity_bytes`, continued over `"enh"`
+/// and the bytes). `None` / empty bytes leave the id untouched.
 ///
 /// **Duplicated in `z2-native` (`app::session_trapset_id`)**; both are pinned
-/// to [`WIDE_TRAPSET_PIN_VALUE`].
+/// to [`WIDE_TRAPSET_PIN_VALUE`] and [`ENH_TRAPSET_PIN_VALUE`].
 #[must_use]
-pub fn session_trapset_id(base: u64, wide_tiles: Option<u8>) -> u64 {
-    let Some(tiles) = wide_tiles else {
-        return base;
+pub fn session_trapset_id(base: u64, wide_tiles: Option<u8>, enh_identity: &[u8]) -> u64 {
+    let fold = |mut h: u64, bytes: &mut dyn Iterator<Item = u8>| {
+        for b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
     };
     let mut h = base;
-    for b in b"wide_gameplay".iter().chain(core::iter::once(&tiles)) {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    if let Some(tiles) = wide_tiles {
+        h = fold(
+            h,
+            &mut b"wide_gameplay"
+                .iter()
+                .copied()
+                .chain(core::iter::once(tiles)),
+        );
+    }
+    if !enh_identity.is_empty() {
+        h = fold(h, &mut b"enh".iter().chain(enh_identity).copied());
     }
     h
 }
 
+/// Cross-crate pin for the enhancement fold of [`session_trapset_id`]:
+/// `session_trapset_id(TRAPSET_PIN_VALUE, None, &[1, b'C', 1, 0, 0, 0])`.
+pub const ENH_TRAPSET_PIN_VALUE: u64 = 0x8781_1390_773e_5234;
+
 /// Cross-crate pin for [`session_trapset_id`]:
 /// `session_trapset_id(TRAPSET_PIN_VALUE, Some(11))`.
 pub const WIDE_TRAPSET_PIN_VALUE: u64 = 0x1094_c616_9aeb_24b9;
+
+/// Re-enable the traps in `old`, then disable every fixed-bank trap whose
+/// code the ROM randomizer changed (`bodies` = `(vanilla, running)`;
+/// `None` for the vanilla game). Returns the new list.
+fn rom_untraps(game: &mut Game, old: &[u16], bodies: Option<&(Vec<u8>, Vec<u8>)>) -> Vec<u16> {
+    for &a in old {
+        game.set_untrapped(a, false);
+    }
+    let Some((vanilla, body)) = bodies else {
+        return Vec::new();
+    };
+    let addrs: Vec<u16> = game.traps.iter().map(|t| t.addr).collect();
+    let list = z2_rando::trap_policy::untrap_list(&addrs, vanilla, body);
+    for &a in &list {
+        game.set_untrapped(a, true);
+    }
+    list
+}
+
+/// Fold the traps a randomized ROM forced off (and a no-traps run) into a
+/// session identity (FNV-1a continued over `"untrap"` and each address,
+/// then `"no_traps"`); nothing to fold leaves the id untouched.
+///
+/// **Duplicated in `z2-native` (`app::fold_rom_identity`)**; both are
+/// pinned to [`UNTRAP_PIN_VALUE`].
+#[must_use]
+pub fn fold_rom_identity(id: u64, untrapped: &[u16], no_traps: bool) -> u64 {
+    let mut h = id;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    if !untrapped.is_empty() {
+        eat(b"untrap");
+        for a in untrapped {
+            eat(&a.to_le_bytes());
+        }
+    }
+    if no_traps {
+        eat(b"no_traps");
+    }
+    h
+}
+
+/// Cross-crate pin for [`fold_rom_identity`]:
+/// `fold_rom_identity(TRAPSET_PIN_VALUE, &[0xC358, 0xDF79], false)`.
+pub const UNTRAP_PIN_VALUE: u64 = 0xb2a6_b81c_e697_bbc5;
 
 /// Cross-crate pin for [`trapset_id`]: the value both `z2-web` and
 /// `z2-native` must produce for the entries
@@ -599,8 +689,15 @@ impl WebEmu {
             margin_sprites: true,
             coop: false,
             wide_gameplay: true,
+            enh: z2_core::enh::Enhancements::default(),
             trapset_id: 0,
             trapset_base: 0,
+            rando: None,
+            rando_hash: None,
+            body_crc32: 0,
+            untrapped: Vec::new(),
+            rom_randomized: false,
+            rando_bodies: None,
             #[cfg(feature = "hd")]
             hd: HdSlot::new(),
             #[cfg(feature = "net")]
@@ -652,6 +749,30 @@ impl WebEmu {
                 WebError::Rom(format!("unknown asset section ${id:04X}")).to_string()
             })?;
         Ok(self.rom_body[e.off..e.off + e.len].to_vec())
+    }
+
+    /// Randomizer for the next ROM load (`load_rom`): `seed` is any text,
+    /// `flags` a flag string (see README.md). Both empty turns the
+    /// randomizer off. The flag string is checked here; the seed is applied
+    /// after the hash gate on every load and netplay restart.
+    pub fn set_rando(&mut self, seed: &str, flags: &str) -> Result<(), String> {
+        let (seed, flags) = (seed.trim(), flags.trim());
+        if seed.is_empty() && flags.is_empty() {
+            self.rando = None;
+            return Ok(());
+        }
+        let parsed = if flags.is_empty() {
+            z2_rando::flags::Flags::default()
+        } else {
+            z2_rando::flags::Flags::from_flag_string(flags).map_err(|e| e.to_string())?
+        };
+        self.rando = Some((seed.to_string(), parsed));
+        Ok(())
+    }
+
+    /// Hash code of the randomized game now running (`""` = vanilla).
+    pub fn rando_hash(&self) -> String {
+        self.rando_hash.clone().unwrap_or_default()
     }
 
     /// Load a dropped ROM file: hash-gate → in-tab extract → boot.
@@ -746,7 +867,9 @@ impl WebEmu {
         self.rgba.resize(FRAME_RGBA_LEN, 0);
         for (dst, &px) in self
             .rgba
-            .chunks_exact_mut(4)
+            .as_chunks_mut::<4>()
+            .0
+            .iter_mut()
             .zip(game.frame_indexed().iter())
         {
             dst.copy_from_slice(&indexed_to_rgba(px));
@@ -1110,6 +1233,29 @@ impl WebEmu {
         Ok(())
     }
 
+    /// Set the ZALiA-inspired gameplay enhancements from JSON (the same shape
+    /// as the native `--enh-json`; missing keys are off, `"{}"` turns
+    /// everything off). Changes gameplay and the netplay identity; ignored
+    /// for the running game while a netplay session is live, and re-applied
+    /// after every ROM load.
+    pub fn set_enhancements(&mut self, json: &str) -> Result<(), String> {
+        self.enh = z2_core::enh::Enhancements::from_json(json)?;
+        self.apply_enhancements();
+        Ok(())
+    }
+
+    /// The requested enhancements as JSON.
+    pub fn enhancements_json(&self) -> String {
+        self.enh.to_json()
+    }
+
+    /// Plain-language notes on requested enhancements the loaded ROM turns
+    /// off (the item shuffle on a ROM-randomizer seed), one per line; empty
+    /// when everything requested runs.
+    pub fn enhancement_notes(&self) -> String {
+        self.enh.rom_conflicts(self.rom_randomized).join("\n")
+    }
+
     /// Enable/disable two-Link co-op (pad 2 drives a second Link in
     /// side-view). Re-applied after every ROM load.
     pub fn coop_enable(&mut self, on: bool) -> Result<(), String> {
@@ -1416,12 +1562,15 @@ impl WebEmu {
     /// 44100 Hz context and it gains 3900 samples/s, i.e. a second of extra
     /// delay every 11 s until the worklet's cap starts dropping audio.
     ///
-    /// Only the two shipped game rates are synthesisable; anything else
-    /// falls back to 44100 and is reported by the return value so the caller
-    /// can rebuild its context at a rate the synth can feed exactly. The
-    /// queue is dropped because its contents are at the old rate.
+    /// Any rate the synth's resampler covers (`8000..=192000`: 22.05, 44.1,
+    /// 48, 88.2, 96, 176.4 and 192 kHz contexts all occur in the wild) is
+    /// rendered as is, so the page never has to rebuild its context (a
+    /// rebuilt context is created outside the click, and stays suspended in
+    /// Safari). Anything else falls back to 44100, and the return value says
+    /// so: the page's worklet then resamples. The queue is dropped because
+    /// its contents are at the old rate.
     pub fn set_audio_rate(&mut self, rate: u32) -> u32 {
-        let want = if z2_apu::audio::sample_rate_supported(rate) {
+        let want = if (z2_apu::MIN_SAMPLE_RATE..=z2_apu::MAX_SAMPLE_RATE).contains(&rate) {
             rate
         } else {
             SAMPLE_RATE
@@ -1526,7 +1675,7 @@ impl WebEmu {
         // frame rendered before the first step is backdrop + centre.
         let _armed = game.compose_wide(*wide_tiles, m, w);
         rgba.resize(w.pixels.len() * 4, 0);
-        for (dst, &px) in rgba.chunks_exact_mut(4).zip(w.pixels.iter()) {
+        for (dst, &px) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(w.pixels.iter()) {
             dst.copy_from_slice(&indexed_to_rgba(px));
         }
         Ok(())
@@ -1547,6 +1696,19 @@ impl WebEmu {
         let body = rom::strip_ines_header(file);
         rom::verify_body(body).map_err(|e| WebError::Rom(e.to_string()))?;
         let extracted = extract::extract(body).map_err(|e| WebError::Rom(e.to_string()))?;
+        // Randomizer seam: the verified vanilla body goes in, a trusted
+        // patched body comes out (no second hash check). The vanilla body is
+        // still what `rom_body` keeps, so a netplay restart regenerates the
+        // same seed.
+        let (run_body, rando_hash): (std::borrow::Cow<'_, [u8]>, Option<String>) = match &self.rando
+        {
+            Some((seed, flags)) => {
+                let out = z2_rando::randomize(body, seed, flags)
+                    .map_err(|e| WebError::Rom(format!("randomizer: {e}")))?;
+                (std::borrow::Cow::Owned(out.body), Some(out.hash_code))
+            }
+            None => (std::borrow::Cow::Borrowed(body), None),
+        };
 
         // `Game::from_ines` wants the full iNES image (header + PRG + CHR).
         // The body just verified is the pinned 256 KiB image, so its layout
@@ -1557,7 +1719,7 @@ impl WebEmu {
         // bank the mapper selected past 64 KiB then failed to load while the
         // mapper cache marked it served, and the overworld drew with the
         // previous area's tiles — black except the road.
-        let ines = canonical_ines(body);
+        let ines = canonical_ines(&run_body);
 
         let mut game = Game::from_ines(&ines).map_err(|e| WebError::Rom(e.to_string()))?;
         game.reset();
@@ -1585,7 +1747,32 @@ impl WebEmu {
         }
         let wide = self.wide_gameplay_margin();
         game.set_wide_gameplay(wide);
-        self.trapset_id = session_trapset_id(self.trapset_base, wide);
+        // Enhancements last (they may wrap any trap above); all off registers
+        // nothing and leaves the identity untouched. They run on top of the
+        // randomized image; options that assume the original world are
+        // dropped first (`Enhancements::for_rom`).
+        let randomized = run_body.as_ref() != body;
+        self.rom_randomized = randomized;
+        // Item shuffle off on a randomized ROM: the page greys it out
+        // (`rom_conflicts` explains it to the JS side through
+        // `enhancement_notes`).
+        let enh = self.enh.for_rom(randomized);
+        game.set_enhancements(enh);
+        self.rando_bodies = rando_hash
+            .is_some()
+            .then(|| Box::new((body.to_vec(), run_body.to_vec())));
+        // Patched code inside a trapped fixed-bank routine only runs with
+        // that trap off (same policy as the native frontend), computed over
+        // every trap including the enhancement hooks, against the
+        // randomizer's own output.
+        self.untrapped = rom_untraps(&mut game, &[], self.rando_bodies.as_deref());
+        self.trapset_id = fold_rom_identity(
+            session_trapset_id(self.trapset_base, wide, &enh.identity_bytes()),
+            &self.untrapped,
+            false,
+        );
+        self.body_crc32 = rom::crc32_ieee(&run_body);
+        self.rando_hash = rando_hash;
 
         let mut assets = Vec::with_capacity(extracted.sections.len());
         for s in &extracted.sections {
@@ -1640,7 +1827,35 @@ impl WebEmu {
             if g.wide_gameplay_tiles() != want {
                 g.set_wide_gameplay(want);
             }
-            self.trapset_id = session_trapset_id(self.trapset_base, want);
+            let enh = self.enh.for_rom(self.rom_randomized);
+            self.trapset_id = fold_rom_identity(
+                session_trapset_id(self.trapset_base, want, &enh.identity_bytes()),
+                &self.untrapped,
+                false,
+            );
+        }
+    }
+
+    /// Push the enhancement options into the running game (not while a
+    /// netplay session is live, for the same reason as wide gameplay).
+    fn apply_enhancements(&mut self) {
+        #[cfg(feature = "net")]
+        if self.net.is_some() {
+            return;
+        }
+        let want = self.enh.for_rom(self.rom_randomized);
+        let wide = self.wide_gameplay_margin();
+        if let Some(g) = self.game.as_mut() {
+            if *g.enhancements() != want {
+                g.set_enhancements(want);
+                // Enhancement hooks may sit on randomized fixed-bank code.
+                self.untrapped = rom_untraps(g, &self.untrapped, self.rando_bodies.as_deref());
+            }
+            self.trapset_id = fold_rom_identity(
+                session_trapset_id(self.trapset_base, wide, &want.identity_bytes()),
+                &self.untrapped,
+                false,
+            );
         }
     }
 
@@ -1678,8 +1893,9 @@ impl WebEmu {
         let mut out = Vec::new();
         self.apu.audio(&mut out);
         self.audio_fifo.extend_from_slice(&out);
-        if self.audio_fifo.len() > AUDIO_FIFO_CAP {
-            let drop = self.audio_fifo.len() - AUDIO_FIFO_CAP;
+        let cap = self.audio_rate as usize * AUDIO_FIFO_CAP_SECS;
+        if self.audio_fifo.len() > cap {
+            let drop = self.audio_fifo.len() - cap;
             self.audio_fifo.drain(..drop);
         }
     }
@@ -1944,13 +2160,9 @@ impl WebEmu {
         let (kind, role, delay) = if self.net_rollback {
             let delay = delay.min(z2_net::MAX_ROLLBACK_DELAY);
             let mut cfg = if host {
-                z2_net::RollbackConfig::host(rom::EXPECTED_BODY_CRC32, self.trapset_id, host_flags)
+                z2_net::RollbackConfig::host(self.body_crc32, self.trapset_id, host_flags)
             } else {
-                z2_net::RollbackConfig::guest(
-                    rom::EXPECTED_BODY_CRC32,
-                    self.trapset_id,
-                    guest_flags,
-                )
+                z2_net::RollbackConfig::guest(self.body_crc32, self.trapset_id, guest_flags)
             };
             cfg.input_delay = delay;
             cfg.max_prediction = self.net_max_prediction;
@@ -1965,9 +2177,9 @@ impl WebEmu {
         } else {
             let delay = delay.min(z2_net::MAX_DELAY);
             let mut cfg = if host {
-                z2_net::SessionConfig::host(rom::EXPECTED_BODY_CRC32, self.trapset_id, host_flags)
+                z2_net::SessionConfig::host(self.body_crc32, self.trapset_id, host_flags)
             } else {
-                z2_net::SessionConfig::guest(rom::EXPECTED_BODY_CRC32, self.trapset_id, guest_flags)
+                z2_net::SessionConfig::guest(self.body_crc32, self.trapset_id, guest_flags)
             };
             cfg.delay = delay;
             if host {
@@ -2403,7 +2615,9 @@ mod tests {
             emu.render_frame().expect("render");
             let black = emu
                 .frame_rgba()
-                .chunks_exact(4)
+                .as_chunks::<4>()
+                .0
+                .iter()
                 .filter(|px| px[0] == 0 && px[1] == 0 && px[2] == 0)
                 .count();
             assert!(
@@ -2498,7 +2712,7 @@ mod tests {
         assert!(!emu.frame_ptr().is_null());
         let rgba = emu.frame_rgba();
         assert_eq!(rgba.len(), FRAME_RGBA_LEN);
-        for px in rgba.chunks_exact(4) {
+        for px in rgba.as_chunks::<4>().0 {
             assert_eq!(px[3], 0xFF);
         }
         // Indexed 0 maps through the shared palette fn (read-only reuse).
@@ -2574,16 +2788,34 @@ mod tests {
         // A 48 kHz AudioContext: the synth must render 48000 samples per
         // wall-clock second too, or the worklet queue drifts by 3900
         // samples/s and the delay grows about a second every 11 seconds.
+        // Run a while at 44.1 kHz first: the page usually creates its
+        // context seconds after the ROM started (the first click), and the
+        // switch must not re-time those seconds into one burst of samples.
+        emu.step_frames(0, 300).unwrap();
         assert_eq!(emu.set_audio_rate(48_000), 48_000);
         emu.take_audio_f32(); // the switch drops samples rendered at the old rate
-        emu.step_frames(0, 60).unwrap();
+        emu.step_frames(0, 1).unwrap();
+        let first = emu.audio_queued();
+        assert!(
+            (798..=799).contains(&first),
+            "first frame after the switch: {first}"
+        );
+        emu.take_audio_f32();
+        emu.step_frames(0, 241).unwrap();
         let queued = emu.audio_queued();
-        // 60 frames at 60.0988 Hz is 0.998 s, so 48000 Hz gives ~47921
-        // samples (and 44100 would give only ~44027 — well outside this).
-        assert!((47_800..=48_050).contains(&queued), "queued={queued}");
-        // A rate the synth cannot render falls back and reports the fallback
-        // so the page can rebuild its context to match.
-        assert_eq!(emu.set_audio_rate(22_050), 44_100);
+        // 241 frames at 60.0988 Hz is 4.01 s, i.e. ~192483 samples at
+        // 48 kHz (44100 would give ~176844; the old 1/60 s per frame ~192800).
+        let want = 241.0 * 48_000.0 / 60.0988;
+        assert!(
+            (queued as f64 - want).abs() <= 2.0,
+            "queued={queued} want={want:.1}"
+        );
+        // High-end and low-end device rates render directly.
+        for rate in [22_050, 88_200, 96_000, 192_000] {
+            assert_eq!(emu.set_audio_rate(rate), rate);
+        }
+        // Out of the synth's range: falls back and reports it.
+        assert_eq!(emu.set_audio_rate(384_000), 44_100);
         assert_eq!(emu.audio_rate(), 44_100);
     }
 
@@ -2727,16 +2959,82 @@ mod tests {
 
     /// The wide-gameplay half of the cross-crate netplay pin (see below).
     #[test]
+    fn rom_identity_fold_matches_the_cross_crate_pin() {
+        assert_eq!(
+            fold_rom_identity(TRAPSET_PIN_VALUE, &[0xC358, 0xDF79], false),
+            UNTRAP_PIN_VALUE,
+            "fold_rom_identity changed: update z2-native's UNTRAP_PIN_VALUE in lockstep"
+        );
+        assert_eq!(
+            fold_rom_identity(TRAPSET_PIN_VALUE, &[], false),
+            TRAPSET_PIN_VALUE
+        );
+    }
+
+    #[test]
+    fn set_rando_validates_flags_and_clears() {
+        let mut emu = WebEmu::new();
+        assert!(emu.set_rando("seed", "not-a-flag-string").is_err());
+        assert!(emu.rando.is_none());
+        let std = z2_rando::flags::Preset::Standard.flags();
+        emu.set_rando(" seed ", &std.to_flag_string()).unwrap();
+        assert_eq!(emu.rando, Some(("seed".to_string(), std)));
+        emu.set_rando("abc", "").unwrap();
+        assert!(emu.rando.as_ref().is_some_and(|(_, f)| f.is_vanilla()));
+        emu.set_rando("", "").unwrap();
+        assert!(emu.rando.is_none());
+        assert_eq!(emu.rando_hash(), "");
+    }
+
+    #[test]
+    fn canonical_header_follows_the_body_layout() {
+        let small = canonical_ines(&vec![0u8; rom::EXPECTED_BODY_LEN]);
+        assert_eq!((small[4], small[5]), (8, 16));
+        let big = canonical_ines(&vec![0u8; z2_rando::rom::EXPANDED_BODY_LEN]);
+        assert_eq!((big[4], big[5]), (16, 16));
+        let game = Game::from_ines(&big).expect("expanded image loads");
+        assert_eq!(game.prg.len(), 256 * 1024);
+        assert_eq!(game.chr.len(), 128 * 1024);
+    }
+
+    #[test]
     fn session_trapset_id_matches_the_cross_crate_pin() {
         assert_eq!(
-            session_trapset_id(TRAPSET_PIN_VALUE, Some(11)),
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11), &[]),
             WIDE_TRAPSET_PIN_VALUE,
             "session_trapset_id changed: update z2-native's WIDE_TRAPSET_PIN_VALUE in lockstep"
         );
         assert_eq!(
-            session_trapset_id(TRAPSET_PIN_VALUE, None),
+            session_trapset_id(TRAPSET_PIN_VALUE, None, &[]),
             TRAPSET_PIN_VALUE
         );
+        let off = z2_core::enh::Enhancements::default().identity_bytes();
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11), &off),
+            WIDE_TRAPSET_PIN_VALUE,
+            "all-off enhancements leave the identity alone"
+        );
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, None, &[1, b'C', 1, 0, 0, 0]),
+            ENH_TRAPSET_PIN_VALUE,
+            "enhancement fold changed: update z2-native's ENH_TRAPSET_PIN_VALUE in lockstep"
+        );
+    }
+
+    #[test]
+    fn set_enhancements_parses_and_remembers() {
+        let mut emu = WebEmu::new();
+        assert_eq!(
+            z2_core::enh::Enhancements::from_json(&emu.enhancements_json()).unwrap(),
+            z2_core::enh::Enhancements::default()
+        );
+        emu.set_enhancements(r#"{"abilities":{"double_jump":true}}"#)
+            .expect("valid JSON");
+        assert!(emu.enh.abilities.double_jump);
+        assert!(emu.set_enhancements("{bad").is_err());
+        assert!(emu.enh.abilities.double_jump, "a bad call changes nothing");
+        emu.set_enhancements("{}").unwrap();
+        assert!(!emu.enh.any_gameplay_active());
     }
 
     #[test]

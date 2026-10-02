@@ -25,6 +25,16 @@ class LaunchArgsTest {
     }
 
     @Test
+    fun hdPackIsPassedOnlyWhenSet() {
+        val pack = "/data/user/0/com.z2rs.game/files/hd_pack/My Pack"
+        val args = LaunchArgs.build("/r.nes", "off", "fit", coopLocal = false, hdPack = pack)
+        assertEquals(listOf("--hd-pack", pack), args.takeLast(2))
+        assertFalse("--hd-pack" in LaunchArgs.build("/r.nes", "off", "fit", coopLocal = false, hdPack = null))
+        // A blank path would mean "pack off" to the parser; no pack is no flag.
+        assertFalse("--hd-pack" in LaunchArgs.build("/r.nes", "off", "fit", coopLocal = false, hdPack = " "))
+    }
+
+    @Test
     fun jsonEscaping() {
         assertEquals("[]", LaunchArgs.toJson(emptyList()))
         assertEquals("""["a","b c"]""", LaunchArgs.toJson(listOf("a", "b c")))

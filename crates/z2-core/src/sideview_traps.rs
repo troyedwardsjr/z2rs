@@ -913,14 +913,21 @@ pub fn sv_go_outside(game: &mut Game) {
     let b1 = bus_read(game, 0x6A3Fu16.wrapping_add(u16::from(y)));
     if b0 == 0 {
         // LDA #$3D : CMP $6A3F,y : BNE LCCAF (LDA #$66 : BNE LCCCC) : LDA #$51
-        lda(game, 0x3D);
-        cmp_val(&mut game.cpu.p, 0x3D, b1);
+        // The three immediates (hidden town column byte, hidden palace row,
+        // hidden town row) are read from the ROM (operands at `$CCC4`,
+        // `$CCB0`, `$CCCB`) so a randomizer that moves the hidden
+        // locations is honoured.
+        let town_col = bus_read(game, 0xCCC4);
+        lda(game, town_col);
+        cmp_val(&mut game.cpu.p, town_col, b1);
         cyc(game, 2 + 4 + cross(0x6A3F, y) + 2);
-        if b1 != 0x3D {
-            lda(game, 0x66);
+        if b1 != town_col {
+            let palace_row = bus_read(game, 0xCCB0);
+            lda(game, palace_row);
             cyc(game, 1 + 2 + 3);
         } else {
-            lda(game, 0x51);
+            let town_row = bus_read(game, 0xCCCB);
+            lda(game, town_row);
             cyc(game, 2);
         }
     } else {
@@ -3464,31 +3471,39 @@ pub fn ow_chop(game: &mut Game) {
         cmp_val(&mut game.cpu.p, x, 3);
         cycles += 2 + 2;
         if x == 3 {
+            // The hidden-town row/column compares and the four tile bytes
+            // are immediates read from the ROM (operands at `$DF9C`,
+            // `$DFA2`, `$DFA6`/`$DFAB`/`$DFB0`/`$DFB5`), so a randomizer
+            // that moves the hidden town is honoured. Vanilla: row `$33`,
+            // column `$3E`, tiles `$5C-$5F`.
             // LDA $04 : CMP #$33 : BNE LDFD1.
             let row = r(&game.ram, 0x0004);
+            let want_row = bus_read(game, 0xDF9C);
             lda(game, row);
-            cmp_val(&mut game.cpu.p, row, 0x33);
+            cmp_val(&mut game.cpu.p, row, want_row);
             cycles += 3 + 2 + 2;
-            if row != 0x33 {
+            if row != want_row {
                 game.cpu.cycles += cycles + 1 + 6;
                 return;
             }
             // LDA $00 : CMP #$3E : BNE LDFD1.
             let col = r(&game.ram, 0x0000);
+            let want_col = bus_read(game, 0xDFA2);
             lda(game, col);
-            cmp_val(&mut game.cpu.p, col, 0x3E);
+            cmp_val(&mut game.cpu.p, col, want_col);
             cycles += 3 + 2 + 2;
-            if col != 0x3E {
+            if col != want_col {
                 game.cpu.cycles += cycles + 1 + 6;
                 return;
             }
             // LDA #$5C : STA $0305 : ... : LDA #$5F : STA $030B.
-            for (v, addr) in [
-                (0x5C, 0x0305),
-                (0x5D, 0x0306),
-                (0x5E, 0x030A),
-                (0x5F, 0x030B),
+            for (operand, addr) in [
+                (0xDFA6, 0x0305),
+                (0xDFAB, 0x0306),
+                (0xDFB0, 0x030A),
+                (0xDFB5, 0x030B),
             ] {
+                let v = bus_read(game, operand);
                 lda(game, v);
                 bus_write(game, addr, v);
             }

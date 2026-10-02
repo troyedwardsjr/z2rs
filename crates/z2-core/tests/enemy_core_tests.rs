@@ -250,3 +250,24 @@ fn enemy_fuzz_self_consistency() {
     }
     eprintln!("enemy fuzz self-consistency: {checked} trajectories x {FRAMES} frames clean");
 }
+
+/// ROM-gated: the operand bytes the boss-key port reads from the ROM hold
+/// exactly the values it used to hard-code.
+#[test]
+#[ignore = "needs Z2_ROM"]
+fn boss_key_operands_match_the_vanilla_rom() {
+    let Ok(path) = std::env::var("Z2_ROM") else {
+        eprintln!("SKIP: Z2_ROM not set");
+        return;
+    };
+    let rom = std::fs::read(path).expect("read Z2_ROM");
+    let game = z2_core::game::Game::from_ines(&rom).expect("MMC1 iNES image");
+    let fixed = game.prg.len() - 0x4000;
+    let at = |addr: u16| game.prg[fixed + usize::from(addr - 0xC000)];
+    let x = at(z2_core::enemy::BOSS_KEY_X_OPERAND);
+    let item = at(z2_core::enemy::BOSS_KEY_ITEM_OPERAND);
+    assert_eq!(
+        z2_core::enemy::boss_key_drop_from(x, item),
+        z2_core::enemy::boss_key_drop()
+    );
+}

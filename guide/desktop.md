@@ -10,6 +10,8 @@ The release archives include `z2rs-launcher` (`z2rs-launcher.exe` on Windows, `z
 - an HD pack folder
 - local co-op, or online co-op as host or guest with a room name
 
+The Enhancements tab holds optional gameplay and display changes ([enhancements.md](enhancements.md)), and the ROM randomizer tab sets up a randomized game ([randomizer.md](randomizer.md)).
+
 For online co-op the launcher fills in the public signalling server, `wss://signal.z2rs.com`, so both players only need the same room name. You can point it at your own `z2-signal` instead. See [co-op.md](co-op.md).
 
 The game remembers the last ROM it loaded, whether it came from the launcher, `--rom` or a file dropped onto the window. It stores the path as `rom_path` in the config file, so starting `z2rs` with no arguments (a double-click in a file manager, for example) boots straight into the game. The ROM stays where it is. Only its path is saved.
@@ -52,7 +54,7 @@ Without a ROM, and with none remembered, the app starts in a synthetic mode with
 Both Shift keys are Select, because Select is how you cast a spell and the
 left one is easier to reach while the right hand is on the arrow keys.
 
-Other keys: `Tab` fast-forward, `F5` save state, `F7` load state, `P` pause,
+Other keys: `O` opens the in-game options menu, `Tab` fast-forward, `F5` save state, `F7` load state, `P` pause,
 `.` single-step while paused, `F11` or `Alt+Enter` to switch between a window
 and fullscreen, `Esc` quit.
 
@@ -89,12 +91,16 @@ Besides `--rom`, `--movie` and `--config`:
 | `--hd-pack DIR` | HD graphics pack (the directory with `pack.json`); `''` turns it off |
 | `--hd-scale N` | output multiplier 1 to 8 (default 1) |
 | `--hd-record DIR` | on exit, write a template pack of the tiles this session drew |
+| `--seed TEXT` / `--rando-flags STRING` | play a randomized game built from your ROM (see [randomizer.md](randomizer.md)) |
+| `--rando-spoiler PATH` | with a randomized game, write a spoiler log |
+| `--sprite-ips PATH` | with a randomized game, apply your own Link sprite patch |
+| `--enh-json JSON` / `--display-enh-json JSON` | gameplay and display enhancements as JSON, inline or `@PATH` (see [enhancements.md](enhancements.md)) |
 
 `--help` lists all of these. An unknown flag is a usage error (exit 2).
 
 ## Config file
 
-The same settings live in `<data-dir>/z2-native.json`: `rom_path` (the remembered ROM), `window_scale`, `fullscreen`, `scale_mode`, `widescreen`, `widescreen_fill_left_clip`, `widescreen_fill_right_clip`, `widescreen_margin_sprites`, `widescreen_gameplay`, `hd_pack`, `hd_scale`, `hd_record`, `coop_local`, `keys_p2`, `gamepad`, `gamepad_p2`, `gamepad_p2_index`, and a `netplay` object (`mode`, `signal_url`, `input_delay`, `stall_timeout_ms`, `ice_url`, `ice_username`, `ice_credential`). Command-line flags win over the file. Older config files still load, because every newer key has a default.
+The same settings live in `<data-dir>/z2-native.json`: `rom_path` (the remembered ROM), `window_scale`, `fullscreen`, `scale_mode`, `widescreen`, `widescreen_fill_left_clip`, `widescreen_fill_right_clip`, `widescreen_margin_sprites`, `widescreen_gameplay`, `hd_pack`, `hd_scale`, `hd_record`, `coop_local`, `keys_p2`, `gamepad`, `gamepad_p2`, `gamepad_p2_index`, `gamepads_enabled`, `allow_opposing_directions`, `gpu_backend`, `enhancements`, `display_enh`, and a `netplay` object (`mode`, `signal_url`, `input_delay`, `stall_timeout_ms`, `ice_url`, `ice_username`, `ice_credential`). Command-line flags win over the file. Older config files still load, because every newer key has a default.
 
 The data directory is `$XDG_DATA_HOME/z2rs` when `XDG_DATA_HOME` is set. Otherwise it is `~/Library/Application Support/z2rs` on macOS, `%APPDATA%/z2rs` on Windows and `~/.local/share/z2rs` elsewhere. Save states, battery saves and the config file live there. The ROM is never stored there.
 
@@ -118,5 +124,7 @@ Testing status: the mapping, the bit layout (`A,B,Select,Start,Up,Down,Left,Righ
 ## Troubleshooting
 
 - The ROM is rejected. Only the No-Intro USA dump passes the check (body CRC32 `BA322865`, SHA1 `11333adb...`). Dump your cartridge again. The desktop app reads the ROM directly. `assets.bin` is an optional product of the extractor and the app does not need it to start.
+- The game closes right after starting on Windows. z2rs tries DirectX 12 first, then Vulkan, and if one of them crashed the game while starting it skips that one next time. You can pick one yourself with `gpu_backend` in the config (`dx12`, `vulkan`, `gl` or `auto`) or the `WGPU_BACKEND` environment variable. If a controller seems to be the cause, set `gamepads_enabled` to `false`. Each run leaves a short log, `z2-native.log`, in the data directory, which shows how far startup got.
+- Link shoots backwards at high speed. That happens when Left and Right are held at the same time, which a real NES pad cannot do. z2rs lets the most recent of the two win. `allow_opposing_directions` in the config turns that filter off.
 - There is no sound. When no audio device is available, the desktop app prints `audio disabled: ...` and keeps running silently. The underrun meter in the title bar only means something while audio is up.
 - The game seems to run at the wrong speed. Game speed follows the NES clock, not the audio device, and the sound is resampled to whatever rate the output device uses, so a device set to 96 or 192 kHz plays at normal speed.

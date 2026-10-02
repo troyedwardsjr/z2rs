@@ -247,9 +247,19 @@ impl WebEmu {
 
 /// The lockstep desync hash (`ram`, `wram`, `oam`, co-op hash), also used for
 /// the rollback confirmed-hash log. Must stay identical to the desktop's.
+///
+/// While any gameplay enhancement is on, `Game::enh_hash` is mixed in too
+/// (with everything off the hash is unchanged), exactly as
+/// `z2_native::netplay::state_hash` does.
 #[must_use]
 pub fn state_hash(g: &Game) -> u64 {
-    hash_state(&[g.ram(), g.wram(), g.oam(), &g.coop_hash().to_le_bytes()])
+    let coop = g.coop_hash().to_le_bytes();
+    if g.enh_active() {
+        let enh = g.enh_hash().to_le_bytes();
+        hash_state(&[g.ram(), g.wram(), g.oam(), &coop, &enh])
+    } else {
+        hash_state(&[g.ram(), g.wram(), g.oam(), &coop])
+    }
 }
 
 /// Rollback-specific fields of the status JSON (leading comma included).

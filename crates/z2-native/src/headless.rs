@@ -102,6 +102,23 @@ pub struct HeadlessArgs {
     pub surface: Option<(u32, u32)>,
     /// `--scale-mode fit|integer` for `--surface` (default fit).
     pub scale_mode: Option<crate::app::ScaleMode>,
+    /// `--seed TEXT`: randomizer seed (turns the randomizer on).
+    pub seed: Option<String>,
+    /// `--rando-flags STRING`: randomizer flag string.
+    pub rando_flags: Option<String>,
+    /// `--rando-spoiler PATH`: write the spoiler log here.
+    pub rando_spoiler: Option<String>,
+    /// `--sprite-ips PATH`: bring-your-own player sprite patch.
+    pub sprite_ips: Option<String>,
+    /// `--no-traps`: interpret every routine.
+    pub no_traps: bool,
+    /// `--enh-json JSON|@PATH`: gameplay enhancements (off unless asked for;
+    /// unlike the windowed config key, an explicit flag applies with
+    /// `--movie` too, so features can be tested at movie-reached points).
+    pub enhancements: Option<z2_core::enh::Enhancements>,
+    /// `--display-enh-json JSON|@PATH`, kept as the validated JSON text
+    /// (`DisplayEnh` holds floats, and this struct is `Eq`).
+    pub display_enh_json: Option<String>,
 }
 
 impl HeadlessArgs {
@@ -135,6 +152,12 @@ impl HeadlessArgs {
             margin_sprites: self.margin_sprites(),
             pack_dir: self.hd_pack.as_deref().map(std::path::PathBuf::from),
             record_dir: None,
+            display_enh: self
+                .display_enh_json
+                .as_deref()
+                .and_then(|j| z2_core::enh::DisplayEnh::from_json(j).ok())
+                .unwrap_or_default()
+                .clamped(),
         }
     }
 
@@ -187,6 +210,16 @@ usage: z2-native --headless [--snapshot S] [--movie M] [--frames N] [--dump fact
   --surface WxH   draw --dump-present into a WxH screen exactly as the window /
                   fullscreen scales it (e.g. 2560x1600; black borders included)
   --scale-mode M  fit (default) | integer, for --surface
+  --seed TEXT     randomizer seed (needs a ROM; see README.md)
+  --rando-flags S randomizer flag string ('1' = no changes)
+  --rando-spoiler P
+                  write the randomizer spoiler log to P
+  --sprite-ips P  your own player-sprite IPS patch, applied by the randomizer
+  --no-traps      interpret every routine (no Rust ports; slow)
+  --enh-json J    gameplay enhancements as JSON (inline or @PATH; off by default,
+                  applies with --movie too). See README.md
+  --display-enh-json J
+                  display-only enhancements as JSON (inline or @PATH)
   --help          print this text
 exit codes: 0 ran/help, 2 usage error, 3 reserved (was: gated on oracle/PPU), 4 I/O error";
 
@@ -309,6 +342,30 @@ pub fn parse_headless_args(argv: &[String]) -> Result<ParseOutcome, String> {
                 args.scale_mode = Some(crate::app::ScaleMode::parse(&raw).ok_or_else(|| {
                     format!("--scale-mode expects fit | integer, got '{raw}'\n{HEADLESS_USAGE}")
                 })?);
+            }
+            "--seed" => args.seed = Some(value_of(&mut it, "--seed")?),
+            "--rando-flags" => {
+                let raw = value_of(&mut it, "--rando-flags")?;
+                if let Err(e) = z2_rando::flags::Flags::from_flag_string(&raw) {
+                    return Err(format!("--rando-flags: {e}\n{HEADLESS_USAGE}"));
+                }
+                args.rando_flags = Some(raw);
+            }
+            "--rando-spoiler" => args.rando_spoiler = Some(value_of(&mut it, "--rando-spoiler")?),
+            "--sprite-ips" => args.sprite_ips = Some(value_of(&mut it, "--sprite-ips")?),
+            "--no-traps" => args.no_traps = true,
+            "--enh-json" => {
+                let raw = value_of(&mut it, "--enh-json")?;
+                args.enhancements = Some(
+                    crate::app::parse_enh_arg(&raw)
+                        .map_err(|e| format!("{e}\n{HEADLESS_USAGE}"))?,
+                );
+            }
+            "--display-enh-json" => {
+                let raw = value_of(&mut it, "--display-enh-json")?;
+                let d = crate::app::parse_display_enh_arg(&raw)
+                    .map_err(|e| format!("{e}\n{HEADLESS_USAGE}"))?;
+                args.display_enh_json = Some(d.to_json());
             }
             "--hd-scale" => {
                 let raw = value_of(&mut it, "--hd-scale")?;
@@ -532,6 +589,23 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
         }
         feats.wide_gameplay = Some(display_settings.wide_tiles);
     }
+    feats.no_traps = args.no_traps;
+    feats.rando = crate::rando::RandoSpec::from_cli(
+        args.seed.as_deref(),
+        args.rando_flags.as_deref(),
+        args.rando_spoiler.as_deref(),
+        args.sprite_ips.as_deref(),
+    )
+    .map_err(HeadlessError::Usage)?
+    .map(crate::rando::RandoSpec::leak);
+    if feats.rando.is_some() && rom_path.is_none() {
+        return Err(HeadlessError::Usage(
+            "the randomizer needs a ROM (--rom PATH or $Z2_ROM)".into(),
+        ));
+    }
+    if let Some(e) = args.enhancements {
+        feats.enhancements = e;
+    }
     if args.dump_wide.is_some() && rom_path.is_none() {
         return Err(HeadlessError::Usage(
             "--dump-wide needs a ROM (--rom PATH or $Z2_ROM): margins are decoded from \
@@ -612,6 +686,20 @@ pub fn run_headless(args: &HeadlessArgs) -> Result<HeadlessReport, HeadlessError
             }
         ),
     };
+    if let Some(h) = &emu.rom.hash_code {
+        report.note.push_str(&format!(
+            "; randomized: hash code {h}, body CRC32 {:08X}, {} trap(s) disabled{}",
+            emu.rom.body_crc32,
+            emu.rom.untrapped.len(),
+            if emu.rom.no_traps {
+                ", all traps off"
+            } else {
+                ""
+            }
+        ));
+    } else if emu.rom.no_traps {
+        report.note.push_str("; all traps off");
+    }
     if let Some(path) = &args.dump_facts {
         // `Game::ram` is always exactly 2048 bytes, so this cannot fail.
         let ram = Ram::from_slice(&emu.game.ram)
@@ -852,6 +940,32 @@ mod tests {
         words.iter().map(|w| w.to_string()).collect()
     }
 
+    #[test]
+    fn enhancement_flags_parse() {
+        let ParseOutcome::Run(a) = parse_headless_args(&argv(&[
+            "--headless",
+            "--enh-json",
+            r#"{"qol":{"lives_from_dolls":true}}"#,
+            "--display-enh-json",
+            r#"{"flash_color":"green"}"#,
+        ]))
+        .expect("parses") else {
+            panic!("expected a run");
+        };
+        assert!(a.enhancements.unwrap().qol.lives_from_dolls);
+        assert_eq!(
+            a.display_settings().display_enh.flash_color,
+            z2_core::enh::FlashColor::Green
+        );
+        assert!(parse_headless_args(&argv(&["--headless", "--enh-json", "42"])).is_err());
+        let ParseOutcome::Run(plain) = parse_headless_args(&argv(&["--headless"])).expect("parses")
+        else {
+            panic!("expected a run");
+        };
+        assert_eq!(plain.enhancements, None);
+        assert!(plain.display_settings().display_enh.is_default());
+    }
+
     /// Unique scratch dir per test (tests run parallel in one process, so
     /// the process id alone is not unique — the `tag` must differ).
     fn scratch(tag: &str) -> std::path::PathBuf {
@@ -947,6 +1061,38 @@ mod tests {
         }
         assert!(parse_dump_at("all frames").is_err());
         assert!(parse_dump_at("1,").is_err());
+    }
+
+    #[test]
+    fn parses_randomizer_flags() {
+        let ParseOutcome::Run(a) = parse_headless_args(&argv(&[
+            "z2-native",
+            "--headless",
+            "--seed",
+            "test",
+            "--rando-flags",
+            "1",
+            "--no-traps",
+            "--rando-spoiler",
+            "s.txt",
+        ]))
+        .expect("parses") else {
+            panic!("not a run");
+        };
+        assert_eq!(a.seed.as_deref(), Some("test"));
+        assert_eq!(a.rando_flags.as_deref(), Some("1"));
+        assert_eq!(a.rando_spoiler.as_deref(), Some("s.txt"));
+        assert!(a.no_traps);
+        assert!(
+            parse_headless_args(&argv(&["z2-native", "--headless", "--rando-flags", "x"])).is_err()
+        );
+        // The randomizer refuses to run without a cartridge.
+        let no_rom = HeadlessArgs {
+            seed: Some("x".into()),
+            rom: Some("/no/such/rom.nes".into()),
+            ..HeadlessArgs::default()
+        };
+        assert!(run_headless(&no_rom).is_err());
     }
 
     #[test]

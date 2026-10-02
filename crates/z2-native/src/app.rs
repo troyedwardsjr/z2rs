@@ -43,6 +43,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use z2_core::enh::{DisplayEnh, Enhancements};
 use z2_core::game::{Game, FRAME_H as GAME_H, FRAME_W as GAME_W};
 
 use crate::audio::SharedAudio;
@@ -393,7 +394,7 @@ pub fn blit_viewport(rgba: &[u8], tex: (u32, u32), surface: (u32, u32), vp: &Vie
     let (sw, sh) = (surface.0 as usize, surface.1 as usize);
     let (tw, th) = (tex.0 as usize, tex.1 as usize);
     let mut out = vec![0u8; sw * sh * 4];
-    for px in out.chunks_exact_mut(4) {
+    for px in out.as_chunks_mut::<4>().0.iter_mut() {
         px[3] = 0xFF;
     }
     if tw == 0 || th == 0 || rgba.len() < tw * th * 4 || vp.w == 0 || vp.h == 0 {
@@ -436,6 +437,52 @@ pub struct Emu {
     /// [`trapset_id`] of the default groups alone, the base
     /// [`Emu::trapset_id`] is derived from when wide gameplay changes.
     pub trapset_base: u64,
+    /// What cartridge image this emulator runs (vanilla or a randomized
+    /// seed) and which traps that image forced off.
+    pub rom: RomIdentity,
+}
+
+/// Identity of the cartridge image an [`Emu`] was built from.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RomIdentity {
+    /// CRC32 of the body actually running (the netplay `Hello` value).
+    /// `0` for the synthetic no-ROM emulator.
+    pub body_crc32: u32,
+    /// Randomizer hash code when the body is a randomized seed.
+    pub hash_code: Option<String>,
+    /// Fixed-bank traps disabled because the randomizer patched their code
+    /// ([`z2_rando::trap_policy::untrap_list`]).
+    pub untrapped: Vec<u16>,
+    /// `--no-traps`: the whole trap table is off (pure interpretation).
+    pub no_traps: bool,
+    /// The running body differs from the verified vanilla one (a ROM
+    /// randomizer seed that changed something). Gameplay enhancements that
+    /// assume the original world are dropped ([`Enhancements::for_rom`]).
+    pub randomized: bool,
+    /// `(vanilla, running)` bodies of a randomized image, kept so the
+    /// untrap list can be recomputed when the enhancements (and so the
+    /// registered hooks) change at run time. `None` for the vanilla game.
+    pub bodies: Option<Arc<(Vec<u8>, Vec<u8>)>>,
+}
+
+/// Disable every fixed-bank trap whose code the ROM randomizer changed
+/// ([`z2_rando::trap_policy::untrap_list`] over the traps registered now,
+/// enhancement hooks included), first re-enabling the ones `rom` disabled
+/// before. Returns the new list (empty for the vanilla game).
+pub fn apply_rom_untraps(game: &mut Game, rom: &RomIdentity) -> Vec<u16> {
+    for &a in &rom.untrapped {
+        game.set_untrapped(a, false);
+    }
+    let Some(bodies) = &rom.bodies else {
+        return Vec::new();
+    };
+    let (vanilla, body) = (&bodies.0, &bodies.1);
+    let addrs: Vec<u16> = game.traps.iter().map(|t| t.addr).collect();
+    let list = z2_rando::trap_policy::untrap_list(&addrs, vanilla, body);
+    for &a in &list {
+        game.set_untrapped(a, true);
+    }
+    list
 }
 
 impl std::fmt::Debug for Emu {
@@ -475,6 +522,17 @@ pub struct Features {
     /// display-only observer: the game itself runs byte-identically, and the
     /// observer stays out of [`trapset_id`], so netplay peers may differ.
     pub margin_sprites: bool,
+    /// Randomize the verified vanilla body with this spec before building
+    /// (`--seed` / `--rando-flags`). Shared by every rebuild path (ROM drop,
+    /// netplay restart), so the same seed is regenerated each time.
+    pub rando: Option<&'static crate::rando::RandoSpec>,
+    /// `--no-traps`: run every routine as interpreted ROM code (slow; for
+    /// checking ported routines against patched ROMs).
+    pub no_traps: bool,
+    /// ZALiA-inspired gameplay enhancements (all off by default;
+    /// [`Game::set_enhancements`]). Changes gameplay, so it is part of the
+    /// netplay identity ([`session_trapset_id`]) and forced off for movies.
+    pub enhancements: Enhancements,
 }
 
 /// Arm or disarm the PPU render record on an existing emulator.
@@ -491,9 +549,30 @@ pub fn apply_features(emu: &mut Emu, feats: Features) {
     if emu.game.coop_status().is_some() != feats.coop {
         emu.game.set_coop(feats.coop);
     }
-    if emu.game.wide_gameplay_tiles() != feats.wide_gameplay {
-        emu.game.set_wide_gameplay(feats.wide_gameplay);
-        emu.trapset_id = session_trapset_id(emu.trapset_base, feats.wide_gameplay);
+    let enhancements = feats.enhancements.for_rom(emu.rom.randomized);
+    if emu.game.wide_gameplay_tiles() != feats.wide_gameplay
+        || *emu.game.enhancements() != enhancements
+    {
+        if emu.game.wide_gameplay_tiles() != feats.wide_gameplay {
+            emu.game.set_wide_gameplay(feats.wide_gameplay);
+        }
+        if *emu.game.enhancements() != enhancements {
+            for line in feats.enhancements.rom_conflicts(emu.rom.randomized) {
+                eprintln!("{line}");
+            }
+            emu.game.set_enhancements(enhancements);
+            // Enhancement hooks may sit on randomized fixed-bank code.
+            emu.rom.untrapped = apply_rom_untraps(&mut emu.game, &emu.rom);
+        }
+        emu.trapset_id = fold_rom_identity(
+            session_trapset_id(
+                emu.trapset_base,
+                feats.wide_gameplay,
+                &enhancements.identity_bytes(),
+            ),
+            &emu.rom.untrapped,
+            emu.rom.no_traps,
+        );
     }
     arm_record(emu, feats.record);
     emu.game.set_margin_sprites(feats.margin_sprites);
@@ -535,28 +614,78 @@ pub fn trapset_id(game: &Game) -> u64 {
 }
 
 /// Session identity: [`trapset_id`] with the wide-gameplay margin folded in
-/// (the same FNV-1a continued over `"wide_gameplay"` and the tile count).
-/// `None` leaves the id untouched, so a peer without wide gameplay keeps the
-/// identity it always had.
+/// (the same FNV-1a continued over `"wide_gameplay"` and the tile count),
+/// then the enhancement identity
+/// ([`z2_core::enh::Enhancements::identity_bytes`], continued over `"enh"`
+/// and the bytes). `None` / empty bytes leave the id untouched, so a peer
+/// without wide gameplay or enhancements keeps the identity it always had.
 ///
 /// **Duplicated in `z2-web` (`session_trapset_id` there)**; both are pinned to
-/// [`WIDE_TRAPSET_PIN_VALUE`].
+/// [`WIDE_TRAPSET_PIN_VALUE`] and [`ENH_TRAPSET_PIN_VALUE`].
 #[must_use]
-pub fn session_trapset_id(base: u64, wide_tiles: Option<u8>) -> u64 {
-    let Some(tiles) = wide_tiles else {
-        return base;
+pub fn session_trapset_id(base: u64, wide_tiles: Option<u8>, enh_identity: &[u8]) -> u64 {
+    let fold = |mut h: u64, bytes: &mut dyn Iterator<Item = u8>| {
+        for b in bytes {
+            h ^= u64::from(b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        h
     };
     let mut h = base;
-    for b in b"wide_gameplay".iter().chain(core::iter::once(&tiles)) {
-        h ^= u64::from(*b);
-        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    if let Some(tiles) = wide_tiles {
+        h = fold(
+            h,
+            &mut b"wide_gameplay"
+                .iter()
+                .copied()
+                .chain(core::iter::once(tiles)),
+        );
+    }
+    if !enh_identity.is_empty() {
+        h = fold(h, &mut b"enh".iter().chain(enh_identity).copied());
     }
     h
 }
 
+/// Cross-crate pin for the enhancement fold of [`session_trapset_id`]:
+/// `session_trapset_id(TRAPSET_PIN_VALUE, None, &[1, b'C', 1, 0, 0, 0])`.
+pub const ENH_TRAPSET_PIN_VALUE: u64 = 0x8781_1390_773e_5234;
+
 /// Cross-crate pin for [`session_trapset_id`]:
 /// `session_trapset_id(TRAPSET_PIN_VALUE, Some(11))`.
 pub const WIDE_TRAPSET_PIN_VALUE: u64 = 0x1094_c616_9aeb_24b9;
+
+/// Fold the traps a randomized ROM forced off (and `--no-traps`) into a
+/// session identity, continuing the same FNV-1a over `"untrap"` and each
+/// address, then `"no_traps"`. Nothing to fold leaves the id untouched, so
+/// vanilla peers keep the identity they always had.
+///
+/// **Duplicated in `z2-web` (`fold_rom_identity` there)**; both are pinned
+/// to [`UNTRAP_PIN_VALUE`].
+#[must_use]
+pub fn fold_rom_identity(id: u64, untrapped: &[u16], no_traps: bool) -> u64 {
+    let mut h = id;
+    let mut eat = |bytes: &[u8]| {
+        for b in bytes {
+            h ^= u64::from(*b);
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    };
+    if !untrapped.is_empty() {
+        eat(b"untrap");
+        for a in untrapped {
+            eat(&a.to_le_bytes());
+        }
+    }
+    if no_traps {
+        eat(b"no_traps");
+    }
+    h
+}
+
+/// Cross-crate pin for [`fold_rom_identity`]:
+/// `fold_rom_identity(TRAPSET_PIN_VALUE, &[0xC358, 0xDF79], false)`.
+pub const UNTRAP_PIN_VALUE: u64 = 0xb2a6_b81c_e697_bbc5;
 
 /// Cross-crate pin for [`trapset_id`]: the value both `z2-native` and
 /// `z2-web` must produce for the entries
@@ -705,6 +834,7 @@ pub fn new_emu(audio_rate: u32) -> Emu {
         apu: z2_apu::Apu::new(crate::audio::clamp_rate(audio_rate)),
         trapset_id: 0,
         trapset_base: 0,
+        rom: RomIdentity::default(),
     }
 }
 
@@ -723,12 +853,12 @@ pub fn new_emu_with(audio_rate: u32, feats: Features) -> Emu {
     emu
 }
 
-/// Build an emulator from a header-stripped ROM body (262144 bytes).
+/// Build an emulator from a header-stripped vanilla ROM body (262144 bytes).
 ///
 /// The body is verified with the `z2-assets` hash gate, then wrapped in a
-/// synthetic MMC1 iNES header (PRG 8×16 KiB + CHR 16×8 KiB, mapper 1) for
-/// [`Game::from_ines`]. The caller's ROM bytes are never stored — only the
-/// parsed banks live in the returned `Game`.
+/// synthetic MMC1 iNES header for [`Game::from_ines`]. The caller's ROM
+/// bytes are never stored — only the parsed banks live in the returned
+/// `Game`.
 ///
 /// The CPU is `reset()` to the reset vector: without this the interpreter
 /// would execute from address 0 (BRK soup) and the game would never boot.
@@ -738,29 +868,69 @@ pub fn emu_from_rom_body(body: &[u8], audio_rate: u32) -> Result<Emu, String> {
 
 /// [`emu_from_rom_body`] with optional features applied at the right moments.
 ///
-/// Ordering matters and is the whole reason this function exists: the co-op
-/// trap group must be registered **after** the nine default groups (it
-/// overrides three of them and inherits their cycle costs) and **before**
-/// `Game::reset`, exactly like the default groups. The trap-set identity is
-/// captured before co-op registration so it describes the parity-relevant
-/// table only.
+/// This is the hash-gate seam: the vanilla body is verified here, then (with
+/// [`Features::rando`]) randomized, and the result is built by
+/// [`emu_from_trusted_body_with`] without a second hash check. Callers keep
+/// passing the **vanilla** body, so every rebuild regenerates the same seed.
 pub fn emu_from_rom_body_with(
     body: &[u8],
     audio_rate: u32,
     feats: Features,
 ) -> Result<Emu, String> {
     z2_assets::rom::verify_body(body).map_err(|e| format!("ROM gate: {e}"))?;
-    // Zelda II SNROM: 128 KiB PRG + 128 KiB CHR.
-    if body.len() != z2_assets::rom::EXPECTED_BODY_LEN {
-        return Err(format!("ROM body is {} bytes, want 262144", body.len()));
+    match feats.rando {
+        None => emu_from_trusted_body_with(body, None, None, audio_rate, feats),
+        Some(spec) => {
+            let out = spec.run(body)?;
+            emu_from_trusted_body_with(
+                &out.body,
+                Some(body),
+                Some(out.hash_code),
+                audio_rate,
+                feats,
+            )
+        }
     }
+}
+
+/// Build an emulator from a body that is already trusted: the verified
+/// vanilla body, or the randomizer's output for it. Accepts the vanilla
+/// layout (128 KiB PRG) and the expanded one (256 KiB PRG); CHR is 128 KiB
+/// either way.
+///
+/// `vanilla` is the verified original when `body` is a patched image: the
+/// fixed-bank traps whose code the patch changed are disabled
+/// ([`z2_rando::trap_policy::untrap_list`]) before reset, and folded into the
+/// session identity ([`fold_rom_identity`]).
+///
+/// Ordering matters and is the whole reason this function exists: the co-op
+/// trap group must be registered **after** the nine default groups (it
+/// overrides three of them and inherits their cycle costs) and **before**
+/// `Game::reset`, exactly like the default groups. The trap-set identity is
+/// captured before co-op registration so it describes the parity-relevant
+/// table only.
+pub fn emu_from_trusted_body_with(
+    body: &[u8],
+    vanilla: Option<&[u8]>,
+    hash_code: Option<String>,
+    audio_rate: u32,
+    feats: Features,
+) -> Result<Emu, String> {
+    const CHR_LEN: usize = 128 * 1024;
+    let Some(prg_units) = z2_rando::rom::prg_units_for_body_len(body.len()) else {
+        return Err(format!(
+            "ROM body is {} bytes, want {} (vanilla) or {} (expanded)",
+            body.len(),
+            z2_rando::rom::VANILLA_BODY_LEN,
+            z2_rando::rom::EXPANDED_BODY_LEN
+        ));
+    };
+    let prg_len = usize::from(prg_units) * 0x4000;
     let mut ines = Vec::with_capacity(16 + body.len());
-    ines.extend_from_slice(b"NES\x1A");
-    ines.push(8u8); // PRG units of 16 KiB = 128 KiB.
-    ines.push(16u8); // CHR units of 8 KiB = 128 KiB.
-    ines.push(0x10u8); // flags6: mapper low nibble 1 (MMC1).
-    ines.push(0x00u8); // flags7: mapper high nibble 0.
-    ines.extend_from_slice(&[0u8; 8]); // padding.
+    ines.extend_from_slice(&z2_rando::rom::ines_header(
+        prg_units,
+        (CHR_LEN / 0x2000) as u8,
+    ));
     ines.extend_from_slice(body);
     let mut game = Game::from_ines(&ines).map_err(|e| format!("load ROM: {e}"))?;
     // The native frontend must use the same trap wiring as the verification
@@ -776,18 +946,52 @@ pub fn emu_from_rom_body_with(
     // Wide gameplay: its own trap pair and the townsfolk PRG patch, also
     // before `reset`; the margin goes into the session identity.
     game.set_wide_gameplay(feats.wide_gameplay);
+    // Enhancements last (they may wrap any trap above), before `reset`. All
+    // off registers nothing and leaves the identity untouched. They run on
+    // top of the randomized image (their PRG patches see its tables); the
+    // options that assume the original world are dropped first
+    // ([`Enhancements::for_rom`]).
+    let randomized = vanilla.is_some_and(|v| v != body);
+    let enhancements = feats.enhancements.for_rom(randomized);
+    for line in feats.enhancements.rom_conflicts(randomized) {
+        eprintln!("{line}");
+    }
+    game.set_enhancements(enhancements);
+    let mut rom = RomIdentity {
+        body_crc32: z2_assets::rom::crc32_ieee(body),
+        hash_code,
+        untrapped: Vec::new(),
+        no_traps: feats.no_traps,
+        randomized,
+        bodies: vanilla.map(|v| Arc::new((v.to_vec(), body.to_vec()))),
+    };
+    // Randomized code inside a trapped fixed-bank routine only runs when
+    // that trap is off. Computed over every registered trap (enhancement
+    // hooks included) against the randomizer's own output, never against
+    // the enhancement-patched PRG.
+    rom.untrapped = apply_rom_untraps(&mut game, &rom);
+    if feats.no_traps {
+        game.traps.enabled = false;
+    }
     let trapset_base = trapset_id;
-    let trapset_id = session_trapset_id(trapset_base, feats.wide_gameplay);
+    let trapset_id = fold_rom_identity(
+        session_trapset_id(
+            trapset_base,
+            feats.wide_gameplay,
+            &enhancements.identity_bytes(),
+        ),
+        &rom.untrapped,
+        feats.no_traps,
+    );
     game.reset();
     let mut apu = z2_apu::Apu::new(crate::audio::clamp_rate(audio_rate));
-    apu.install_dmc_source(Box::new(z2_apu::PrgSource::new(
-        body[..128 * 1024].to_vec(),
-    )));
+    apu.install_dmc_source(Box::new(z2_apu::PrgSource::new(body[..prg_len].to_vec())));
     let mut emu = Emu {
         game,
         apu,
         trapset_id,
         trapset_base,
+        rom,
     };
     arm_record(&mut emu, feats.record);
     emu.game.set_margin_sprites(feats.margin_sprites);
@@ -878,11 +1082,25 @@ pub fn step_frames2(emu: &mut Emu, pads: &[(u8, u8)], audio: Option<&SharedAudio
 /// Factored out of [`step_frames`] so the two-pad and netplay paths render
 /// audio identically instead of growing their own copies.
 pub fn drain_audio_frame(emu: &mut Emu, pcm: &mut Vec<i16>, audio: Option<&SharedAudio>) {
-    for (addr, val) in emu.game.apu.drain_log() {
-        emu.apu.write_reg(addr, val);
-    }
+    let log = emu.game.apu.drain_log();
     pcm.clear();
-    emu.apu.audio(pcm);
+    // Display enhancements (volumes, M/N mutes, low-HP beep): only frames
+    // headed for an audio ring, and neutral settings take the original path
+    // untouched (`display_enh::with_audio_fx`).
+    let fx_done = audio.is_some()
+        && crate::display_enh::with_audio_fx(|fx| {
+            let active = !fx.is_neutral();
+            if active {
+                fx.render_frame(&log, emu.game.ram(), &mut emu.apu, pcm);
+            }
+            active
+        });
+    if !fx_done {
+        for (addr, val) in log {
+            emu.apu.write_reg(addr, val);
+        }
+        emu.apu.audio(pcm);
+    }
     if let Some(ring) = audio {
         ring.push_frame(pcm);
     }
@@ -1159,6 +1377,38 @@ pub fn load_savestate(game: &mut Game, data_dir: &Path, slot: u8) -> Result<(), 
     load_state_file(game, &savestate_path(data_dir, slot))
 }
 
+/// Save-state path for `slot`, kept apart per randomizer seed (`hash` is
+/// [`RomIdentity::hash_code`]; `None` = the vanilla game, same file as
+/// [`savestate_path`]).
+pub fn savestate_path_for(data_dir: &Path, slot: u8, hash: Option<&str>) -> PathBuf {
+    data_dir.join(crate::rando::savestate_file_name(hash, slot))
+}
+
+/// [`save_savestate`] into the per-seed file ([`savestate_path_for`]).
+pub fn save_savestate_for(
+    game: &Game,
+    data_dir: &Path,
+    slot: u8,
+    hash: Option<&str>,
+) -> Result<PathBuf, String> {
+    std::fs::create_dir_all(data_dir).map_err(|e| format!("create {}: {e}", data_dir.display()))?;
+    let snap = snapshot_from_game(game, Vec::new())?;
+    let bytes = snap.encode().map_err(|e| format!("encode: {e}"))?;
+    let path = savestate_path_for(data_dir, slot, hash);
+    std::fs::write(&path, &bytes).map_err(|e| format!("write {}: {e}", path.display()))?;
+    Ok(path)
+}
+
+/// [`load_savestate`] from the per-seed file ([`savestate_path_for`]).
+pub fn load_savestate_for(
+    game: &mut Game,
+    data_dir: &Path,
+    slot: u8,
+    hash: Option<&str>,
+) -> Result<(), String> {
+    load_state_file(game, &savestate_path_for(data_dir, slot, hash))
+}
+
 /// Battery-RAM file name in the data dir.
 pub const SRAM_FILE: &str = "sram.sav";
 
@@ -1203,7 +1453,13 @@ pub fn save_sram_named(game: &mut Game, data_dir: &Path, name: &str) -> Result<P
 /// a present file returns `Ok(true)`. Slots that look corrupted by the old
 /// autosave are reported on stderr (see [`suspicious_slots`]).
 pub fn load_sram(game: &mut Game, data_dir: &Path) -> Result<bool, String> {
-    let path = sram_path(data_dir);
+    load_sram_named(game, data_dir, SRAM_FILE)
+}
+
+/// [`load_sram`] from a named file in `data_dir` (per-seed saves use
+/// [`crate::rando::sram_file_name`]).
+pub fn load_sram_named(game: &mut Game, data_dir: &Path, name: &str) -> Result<bool, String> {
+    let path = data_dir.join(name);
     let Ok(bytes) = std::fs::read(&path) else {
         return Ok(false);
     };
@@ -1302,6 +1558,12 @@ pub fn window_title(
     } else {
         NO_ROM_TITLE.to_string()
     }
+}
+
+/// Window-title suffix naming the randomizer seed by its hash code.
+#[must_use]
+pub fn rando_suffix(hash_code: &str) -> String {
+    format!(" [rando {hash_code}]")
 }
 
 /// How a file dropped onto the window is routed (pure — no window needed).
@@ -1436,7 +1698,7 @@ pub fn blit_indexed_to_rgba(indexed: &[u8; FRAME_LEN], rgba: &mut [u8]) {
 /// palette lookup.
 pub fn blit_indexed_slice_to_rgba(indexed: &[u8], rgba: &mut [u8]) {
     debug_assert_eq!(rgba.len(), indexed.len() * 4);
-    for (dst, &px) in rgba.chunks_exact_mut(4).zip(indexed.iter()) {
+    for (dst, &px) in rgba.as_chunks_mut::<4>().0.iter_mut().zip(indexed.iter()) {
         dst.copy_from_slice(&z2_ppu::palette::indexed_to_rgba(px));
     }
 }
@@ -1460,7 +1722,7 @@ pub fn coop_suffix(status: Option<&z2_core::coop::CoopStatus>) -> String {
 
 /// Purely visual settings. None of these reach the game: `Game::step` and
 /// `Game::frame_indexed` are byte-identical whatever is set here.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Default, PartialEq)]
 pub struct DisplaySettings {
     /// Widescreen margin tiles per side (0 = off, max 16).
     pub wide_tiles: u8,
@@ -1482,6 +1744,10 @@ pub struct DisplaySettings {
     pub pack_dir: Option<PathBuf>,
     /// Write a recorded template pack here when the app exits.
     pub record_dir: Option<PathBuf>,
+    /// Display-only enhancements (screen shake, flash colour, post effects,
+    /// volumes, dev overlays; see [`crate::display_enh`]). Never part of the
+    /// netplay identity.
+    pub display_enh: DisplayEnh,
 }
 
 impl DisplaySettings {
@@ -1503,6 +1769,9 @@ impl DisplaySettings {
             wide_gameplay: None,
             record: self.needs_record(),
             margin_sprites: self.wide_tiles > 0 && self.margin_sprites,
+            rando: None,
+            no_traps: false,
+            enhancements: Enhancements::default(),
         }
     }
 }
@@ -1523,6 +1792,9 @@ pub struct Display {
     empty_record: z2_ppu::FrameRecord,
     /// One-line description of the loaded pack, for the startup log.
     pack_note: Option<String>,
+    /// Display-enhancement state ([`crate::display_enh`]); untouched while
+    /// `settings.display_enh` is the default.
+    fx: crate::display_enh::DisplayFx,
 }
 
 impl std::fmt::Debug for Display {
@@ -1581,6 +1853,7 @@ impl Display {
             recorder,
             empty_record: z2_ppu::FrameRecord::new(),
             pack_note,
+            fx: crate::display_enh::DisplayFx::default(),
         })
     }
 
@@ -1588,6 +1861,12 @@ impl Display {
     #[must_use]
     pub fn settings(&self) -> &DisplaySettings {
         &self.settings
+    }
+
+    /// Replace the display-only enhancements (the options overlay; takes
+    /// effect on the next presented frame).
+    pub fn set_display_enh(&mut self, d: DisplayEnh) {
+        self.settings.display_enh = d;
     }
 
     /// Texture size to allocate, in pixels. **Re-read after every change**:
@@ -1660,9 +1939,35 @@ impl Display {
             rec.observe(record);
             rec.end_frame();
         }
-        self.presenter
-            .present(game.frame_indexed(), record, &game.chr)
-            .map_err(|e| format!("present: {e}"))
+        let enh = self.settings.display_enh;
+        if enh.is_default() {
+            return self
+                .presenter
+                .present(game.frame_indexed(), record, &game.chr)
+                .map_err(|e| format!("present: {e}"));
+        }
+        // Display enhancements: observe, maybe recolour the flash, compose,
+        // then post effects / shake / overlays on a copy.
+        self.fx.observe(game, &enh);
+        let (w, h) = (
+            self.presenter.width() as u32,
+            self.presenter.height() as u32,
+        );
+        let scale = self.presenter.effective_scale();
+        let (frame, record) = self.fx.frame_inputs(game, record);
+        let rgba = self
+            .presenter
+            .present(frame, record, &game.chr)
+            .map_err(|e| format!("present: {e}"))?;
+        Ok(self
+            .fx
+            .finish(rgba, w, h, scale, u32::from(tiles) * 8, game, &enh))
+    }
+
+    /// Scanline strength for the window blit ([`crate::display_enh`]).
+    #[must_use]
+    pub fn scanline_strength(&self) -> f32 {
+        crate::display_enh::scanline_strength(&self.settings.display_enh)
     }
 
     /// Write the recorded template pack, if `--hd-record` asked for one.
@@ -1793,6 +2098,69 @@ pub struct NativeArgs {
     /// `--scale-mode fit|integer` (overrides the `scale_mode` config key).
     /// Display only.
     pub scale_mode: Option<ScaleMode>,
+    /// `--seed TEXT`: randomizer seed (turns the randomizer on).
+    pub seed: Option<String>,
+    /// `--rando-flags STRING`: randomizer flag string (turns it on).
+    pub rando_flags: Option<String>,
+    /// `--rando-spoiler PATH`: write the spoiler log here.
+    pub rando_spoiler: Option<String>,
+    /// `--sprite-ips PATH`: bring-your-own player sprite patch.
+    pub sprite_ips: Option<String>,
+    /// `--no-traps`: interpret every routine (no Rust ports).
+    pub no_traps: bool,
+    /// `--enh-json JSON|@PATH`: gameplay enhancements (overrides the
+    /// `enhancements` config key, and applies even with `--movie`).
+    pub enhancements: Option<Enhancements>,
+    /// `--display-enh-json JSON|@PATH`: display-only enhancements (overrides
+    /// the `display_enh` config key).
+    pub display_enh: Option<DisplayEnh>,
+}
+
+impl NativeArgs {
+    /// The randomizer spec these flags ask for (`None` = vanilla game).
+    ///
+    /// # Errors
+    /// A bad flag string or an unreadable sprite IPS file.
+    pub fn rando_spec(&self) -> Result<Option<crate::rando::RandoSpec>, String> {
+        crate::rando::RandoSpec::from_cli(
+            self.seed.as_deref(),
+            self.rando_flags.as_deref(),
+            self.rando_spoiler.as_deref(),
+            self.sprite_ips.as_deref(),
+        )
+    }
+}
+
+/// Text of a `--enh-json` / `--display-enh-json` value: inline JSON, or
+/// `@PATH` to read it from a file.
+///
+/// # Errors
+/// An unreadable `@PATH`.
+pub fn json_arg_text(flag: &str, v: &str) -> Result<String, String> {
+    match v.strip_prefix('@') {
+        Some(path) => std::fs::read_to_string(path).map_err(|e| format!("{flag} {path}: {e}")),
+        None => Ok(v.to_string()),
+    }
+}
+
+/// Parse a `--enh-json` value (inline JSON or `@PATH`).
+///
+/// # Errors
+/// An unreadable file or JSON that does not describe [`Enhancements`].
+pub fn parse_enh_arg(v: &str) -> Result<Enhancements, String> {
+    Enhancements::from_json(&json_arg_text("--enh-json", v)?)
+        .map_err(|e| format!("--enh-json: {e}"))
+}
+
+/// Parse a `--display-enh-json` value (inline JSON or `@PATH`); values are
+/// clamped into range.
+///
+/// # Errors
+/// An unreadable file or JSON that does not describe [`DisplayEnh`].
+pub fn parse_display_enh_arg(v: &str) -> Result<DisplayEnh, String> {
+    DisplayEnh::from_json(&json_arg_text("--display-enh-json", v)?)
+        .map(DisplayEnh::clamped)
+        .map_err(|e| format!("--display-enh-json: {e}"))
 }
 
 pub const NATIVE_USAGE: &str = "\
@@ -1805,7 +2173,10 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                  [--scale N] [--fullscreen] [--scale-mode fit|integer]
                  [--coop-local] [--coop-host ROOM | --coop-join ROOM]
                  [--signal URL] [--net-mode rollback|lockstep] [--net-delay N]
-                 [--ice SPEC] [--p2-pad INDEX] [--p2-follow N] [--headless ...]
+                 [--ice SPEC] [--p2-pad INDEX] [--p2-follow N]
+                 [--seed TEXT] [--rando-flags STRING] [--rando-spoiler PATH]
+                 [--sprite-ips PATH] [--no-traps]
+                 [--enh-json JSON|@PATH] [--display-enh-json JSON|@PATH] [--headless ...]
   --rom PATH       Zelda II .nes ROM (else config rom_path / $Z2_ROM). Never stored.
   --movie PATH     .fm2/.bk2 demo playback (oracle-free: steps Game, no verify).
   --config PATH    JSON config override (default: <data-dir>/z2-native.json).
@@ -1853,10 +2224,25 @@ usage: z2-native [--rom PATH] [--movie M.fm2|.bk2] [--config PATH]
                    and Select are dropped). For demo and trailer captures.
   --load-state P   load this .z2snap save state before the first frame (as F7
                    does), so a --movie plays from there.
+  --seed TEXT      randomizer seed (any text). With --rando-flags, plays a randomized
+                   game generated from your ROM; the window title shows its hash code.
+  --rando-flags S  randomizer flag string (see README.md); '1' = no changes.
+  --rando-spoiler P
+                   write the randomizer spoiler log to P.
+  --sprite-ips P   your own player-sprite IPS patch, applied by the randomizer.
+  --no-traps       run every routine as interpreted ROM code (slow; for testing).
+  --enh-json J     ZALiA-inspired gameplay enhancements as JSON (inline, or @PATH for a
+                   file); missing keys stay off. Overrides the config key enhancements;
+                   the config value is ignored with --movie. Changes gameplay, so both
+                   netplay peers must agree. See README.md.
+  --display-enh-json J
+                   display-only enhancements (screen shake, flash colour, effects,
+                   volumes, dev overlays) as JSON or @PATH. Config key display_enh.
   --headless ...   windowless CI surface (see --headless --help).
 keys P1: Z=A X=B Enter=Start RightShift=Select arrows=dpad
 keys P2: G=A F=B T=Start R=Select W/A/S/D=dpad (local co-op only; see keys_p2)
 Tab=fast-forward F5=save F7=load F6/digits=slot (1-9,0; shown in title) P=pause .=step
+M=mute music N=mute sound O=options menu (or LB+RB+Y on a gamepad)
 F11/Alt+Enter=fullscreen Esc=leave fullscreen, or quit when windowed; drop a .nes ROM/movie \
 file onto the window (a dropped or --rom ROM is remembered in the config for next time). Save states, movies, pause and fast-forward are disabled \
 during netplay.";
@@ -2030,6 +2416,29 @@ pub fn parse_native_args(argv: &[String]) -> Result<NativeArgs, String> {
             "--wide-gameplay" => {
                 out.wide_gameplay = Some(native_on_off(&mut it, "--wide-gameplay")?);
             }
+            "--seed" => out.seed = Some(native_arg_value(&mut it, "--seed")?),
+            "--rando-flags" => {
+                let v = native_arg_value(&mut it, "--rando-flags")?;
+                if let Err(e) = z2_rando::flags::Flags::from_flag_string(&v) {
+                    return Err(format!("--rando-flags: {e}\n{NATIVE_USAGE}"));
+                }
+                out.rando_flags = Some(v);
+            }
+            "--rando-spoiler" => {
+                out.rando_spoiler = Some(native_arg_value(&mut it, "--rando-spoiler")?);
+            }
+            "--sprite-ips" => out.sprite_ips = Some(native_arg_value(&mut it, "--sprite-ips")?),
+            "--no-traps" => out.no_traps = true,
+            "--enh-json" => {
+                let v = native_arg_value(&mut it, "--enh-json")?;
+                out.enhancements =
+                    Some(parse_enh_arg(&v).map_err(|e| format!("{e}\n{NATIVE_USAGE}"))?);
+            }
+            "--display-enh-json" => {
+                let v = native_arg_value(&mut it, "--display-enh-json")?;
+                out.display_enh =
+                    Some(parse_display_enh_arg(&v).map_err(|e| format!("{e}\n{NATIVE_USAGE}"))?);
+            }
             "--help" | "-h" => return Err(NATIVE_USAGE.to_string()),
             other => return Err(format!("unknown flag '{other}'\n{NATIVE_USAGE}")),
         }
@@ -2057,7 +2466,60 @@ pub fn parse_native_args(argv: &[String]) -> Result<NativeArgs, String> {
     if out.coop.is_online() && !crate::netplay::supported() {
         return Err(format!("{}\n{NATIVE_USAGE}", crate::netplay::NO_TRANSPORT));
     }
+    if out.rando_spoiler.is_some()
+        && out.seed.is_none()
+        && out.rando_flags.is_none()
+        && out.sprite_ips.is_none()
+    {
+        return Err(format!(
+            "--rando-spoiler needs --seed and/or --rando-flags\n{NATIVE_USAGE}"
+        ));
+    }
     Ok(out)
+}
+
+/// Start the gamepad library, never fatally: disabled by config, an error
+/// or a panic inside it all leave the game keyboard-only. Logs the backend
+/// and every pad already connected.
+#[cfg(not(target_os = "android"))]
+fn open_gamepads(enabled: bool) -> Option<gilrs::Gilrs> {
+    use crate::diag::breadcrumb;
+    if !enabled {
+        breadcrumb("gamepad: disabled (\"gamepads_enabled\": false); keyboard only");
+        return None;
+    }
+    let backend = if cfg!(target_os = "windows") {
+        "XInput"
+    } else if cfg!(target_os = "macos") {
+        "IOKit"
+    } else if cfg!(target_os = "linux") {
+        "evdev"
+    } else {
+        "default"
+    };
+    breadcrumb(format_args!("gamepad: starting gilrs ({backend})"));
+    let built =
+        std::panic::catch_unwind(|| crate::input::new_gilrs(true).map_err(|e| e.to_string()));
+    let g = match built {
+        Ok(Ok(g)) => g,
+        Ok(Err(e)) => {
+            breadcrumb(format_args!("gamepad: unavailable ({e}); keyboard only"));
+            return None;
+        }
+        Err(_) => {
+            breadcrumb("gamepad: the gamepad library panicked (see above); keyboard only");
+            return None;
+        }
+    };
+    let pads: Vec<String> = g
+        .gamepads()
+        .map(|(id, gp)| format!("{id}: '{}' ({:?})", gp.name(), gp.power_info()))
+        .collect();
+    breadcrumb(format_args!(
+        "gamepad: ready, {} connected {pads:?}",
+        pads.len()
+    ));
+    Some(g)
 }
 
 /// Run the windowed frontend. Opens a window + audio device; never call in
@@ -2087,6 +2549,12 @@ pub fn run_windowed_with(
     let data_dir = config.effective_data_dir();
     std::fs::create_dir_all(&data_dir)
         .map_err(|e| format!("create {}: {e}", data_dir.display()))?;
+    // Crash breadcrumbs from here on (`<data-dir>/z2-native.log`).
+    crate::diag::init(&data_dir);
+    crate::diag::breadcrumb(format_args!(
+        "args: {:?}",
+        std::env::args().skip(1).collect::<Vec<_>>()
+    ));
     // Persist defaults on first run so users can discover the file.
     if args.config.is_none() && !config_path_exists() {
         let _ = config.save();
@@ -2099,11 +2567,15 @@ pub fn run_windowed_with(
     let display_settings = resolve_display(args, &config)?;
     let coop = resolve_coop(args, &config);
     let display = Display::new(display_settings.clone())?;
+    let rando = args.rando_spec()?.map(crate::rando::RandoSpec::leak);
     let feats = Features {
         coop,
         wide_gameplay: resolve_wide_gameplay(args, &config, display_settings.wide_tiles),
         record: display.needs_record(),
         margin_sprites: display_settings.features(coop).margin_sprites,
+        rando,
+        no_traps: args.no_traps,
+        enhancements: resolve_enhancements(args, &config),
     };
     let coop_local = feats.coop && !args.coop.is_online();
     if args.p2_follow.is_some() && !coop_local {
@@ -2150,7 +2622,25 @@ pub fn run_windowed_with(
             (new_emu_with(rate, feats), false, None)
         }
     };
-    let _ = load_sram(&mut emu.game, &data_dir);
+    let _ = load_sram_named(
+        &mut emu.game,
+        &data_dir,
+        &crate::rando::sram_file_name(emu.rom.hash_code.as_deref(), false),
+    );
+    if let Some(h) = &emu.rom.hash_code {
+        eprintln!(
+            "randomizer: seed {:?}, hash code {h}{}",
+            rando.map(|r| r.seed.as_str()).unwrap_or_default(),
+            if emu.rom.untrapped.is_empty() {
+                String::new()
+            } else {
+                format!(
+                    ", {} ported routines disabled for patched code",
+                    emu.rom.untrapped.len()
+                )
+            }
+        );
+    }
     // `load_sram` replaced WRAM under a possibly live co-op state.
     emu.game.coop_reset_area();
     if let Some(p) = &args.load_state {
@@ -2276,7 +2766,20 @@ pub fn resolve_display(
             Some(s) => non_empty(s),
             None => config.hd_record.as_ref().and_then(non_empty),
         },
+        display_enh: args.display_enh.unwrap_or(config.display_enh).clamped(),
     })
+}
+
+/// The gameplay enhancements for this run: `--enh-json` wins; otherwise the
+/// `enhancements` config key, except for `--movie` playback, where the
+/// config value is ignored (it changes gameplay, so the movie would desync).
+#[must_use]
+pub fn resolve_enhancements(args: &NativeArgs, config: &NativeConfig) -> Enhancements {
+    match args.enhancements {
+        Some(e) => e,
+        None if args.movie.is_some() => Enhancements::default(),
+        None => config.enhancements,
+    }
 }
 
 /// The wide-gameplay margin for an interactive run: the widescreen margin
@@ -2317,6 +2820,7 @@ pub fn resolve_features(args: &NativeArgs, config: &NativeConfig) -> Result<Feat
     let display = resolve_display(args, config)?;
     let mut feats = display.features(resolve_coop(args, config));
     feats.wide_gameplay = resolve_wide_gameplay(args, config, display.wide_tiles);
+    feats.enhancements = resolve_enhancements(args, config);
     Ok(feats)
 }
 
@@ -2382,8 +2886,16 @@ fn run_event_loop(
         window: Option<Arc<Window>>,
         pixels: Option<pixels::Pixels<'static>>,
         keyboard: crate::input::KeyboardState,
+        /// Per-player opposing-direction filters for live input (issue #7);
+        /// bypassed when `config.allow_opposing_directions` is set.
+        socd: [crate::input::OpposingFilter; 2],
         #[cfg(not(target_os = "android"))]
         gilrs: Option<gilrs::Gilrs>,
+        /// Pads whose first input has been logged (crash breadcrumbs).
+        #[cfg(not(target_os = "android"))]
+        pads_heard: Vec<gilrs::GamepadId>,
+        /// The first presented frame has been logged (crash breadcrumbs).
+        presented_once: bool,
         /// Gamepad that most recently pressed a button (drives player 1).
         #[cfg(not(target_os = "android"))]
         active_pad: Option<gilrs::GamepadId>,
@@ -2466,6 +2978,10 @@ fn run_event_loop(
         /// Live rollback netplay session, if any (the default online mode).
         #[cfg(feature = "netplay")]
         rollback: Option<crate::netplay::RollbackLink<z2_net::MatchboxTransport>>,
+        /// In-game options menu (`O` / LB+RB+Y; see `crate::overlay`).
+        overlay: crate::overlay::Overlay,
+        /// Config file the overlay saves to (`--config`, else the default).
+        config_file: PathBuf,
     }
 
     impl Handler {
@@ -2532,6 +3048,24 @@ fn run_event_loop(
             let mut names: Vec<(gilrs::GamepadId, String)> = Vec::new();
             if let Some(g) = self.gilrs.as_mut() {
                 while let Some(ev) = g.next_event() {
+                    // Crash breadcrumb: the first input event from each pad.
+                    let is_input = !matches!(
+                        ev.event,
+                        gilrs::EventType::Connected
+                            | gilrs::EventType::Disconnected
+                            | gilrs::EventType::Dropped
+                    );
+                    if is_input && !self.pads_heard.contains(&ev.id) {
+                        self.pads_heard.push(ev.id);
+                        let name = g
+                            .connected_gamepad(ev.id)
+                            .map(|gp| gp.name().to_string())
+                            .unwrap_or_default();
+                        crate::diag::breadcrumb(format_args!(
+                            "gamepad: first input from '{name}' ({:?})",
+                            ev.event
+                        ));
+                    }
                     match ev.event {
                         gilrs::EventType::Connected => {
                             if let Some(gp) = g.connected_gamepad(ev.id) {
@@ -2540,7 +3074,14 @@ fn run_event_loop(
                             evs.push(PadEv::Conn(ev.id));
                         }
                         gilrs::EventType::ButtonPressed(..) => evs.push(PadEv::Press(ev.id)),
-                        gilrs::EventType::Disconnected => evs.push(PadEv::Disc(ev.id)),
+                        gilrs::EventType::Disconnected => {
+                            crate::diag::breadcrumb(format_args!(
+                                "gamepad: {} disconnected",
+                                ev.id
+                            ));
+                            self.pads_heard.retain(|&p| p != ev.id);
+                            evs.push(PadEv::Disc(ev.id));
+                        }
                         _ => {}
                     }
                 }
@@ -2554,7 +3095,9 @@ fn run_event_loop(
                     let idx = order.iter().position(|p| *p == id).unwrap_or(0);
                     // Logged so a user can discover which pad is which when
                     // pinning one with `--p2-pad`.
-                    eprintln!("gamepad connected: '{name}' (index {idx})");
+                    crate::diag::breadcrumb(format_args!(
+                        "gamepad connected: '{name}' (index {idx})"
+                    ));
                 }
             };
             for e in evs {
@@ -2652,10 +3195,19 @@ fn run_event_loop(
             } else {
                 gp2
             };
-            (
+            let raw = (
                 crate::input::combine_inputs(kb1, gp1),
                 crate::input::combine_inputs(kb2, gp2),
-            )
+            );
+            // Live input only (movie playback returned above): resolve
+            // keyboard-rollover Left+Right / Up+Down to the newest press
+            // before the pad reaches the game or a netplay session, so every
+            // peer and any recording sees the same filtered byte.
+            if self.config.allow_opposing_directions {
+                raw
+            } else {
+                (self.socd[0].apply(raw.0), self.socd[1].apply(raw.1))
+            }
         }
 
         /// Apply one netplay session event.
@@ -2677,9 +3229,7 @@ fn run_event_loop(
                     let rate = self.config.effective_audio_rate();
                     let feats = Features {
                         coop: coop_flags & z2_net::COOP_TWO_LINKS != 0,
-                        wide_gameplay: self.feats.wide_gameplay,
-                        record: self.feats.record,
-                        margin_sprites: self.feats.margin_sprites,
+                        ..self.feats
                     };
                     let Some(body) = self.rom_body.clone() else {
                         eprintln!("netplay: no ROM body available to start a session");
@@ -2811,7 +3361,7 @@ fn run_event_loop(
                 // separate file so its own solo save is never overwritten.
                 if frames != 0 && frames.is_multiple_of(600) && self.emu.game.exec_errors == 0 {
                     let name = self.sram_file();
-                    let _ = save_sram_named(&mut self.emu.game, &self.data_dir, name);
+                    let _ = save_sram_named(&mut self.emu.game, &self.data_dir, &name);
                 }
             }
             // Flush the pads just latched so the peer is not left waiting a
@@ -2843,13 +3393,8 @@ fn run_event_loop(
                         return;
                     };
                     let rate = self.config.effective_audio_rate();
-                    match crate::netplay::session_emu(
-                        body,
-                        rate,
-                        self.feats.record,
-                        self.feats.wide_gameplay,
-                        coop_flags,
-                        &wram,
+                    match crate::netplay::session_emu_with(
+                        body, rate, self.feats, coop_flags, &wram,
                     ) {
                         Ok(mut fresh) => {
                             fresh.game.set_margin_sprites(self.feats.margin_sprites);
@@ -2983,7 +3528,7 @@ fn run_event_loop(
                     && self.emu.game.exec_errors == 0
                 {
                     let name = self.sram_file();
-                    let _ = save_sram_named(&mut self.emu.game, &self.data_dir, name);
+                    let _ = save_sram_named(&mut self.emu.game, &self.data_dir, &name);
                 }
             }
         }
@@ -3021,7 +3566,8 @@ fn run_event_loop(
             // from a wedged state (faulted RAM would poison the save file).
             let frames = self.emu.game.frame_count();
             if frames != 0 && frames.is_multiple_of(600) && self.exec_errors_seen == 0 {
-                let _ = save_sram(&mut self.emu.game, &self.data_dir);
+                let name = self.sram_file();
+                let _ = save_sram_named(&mut self.emu.game, &self.data_dir, &name);
             }
         }
 
@@ -3037,6 +3583,9 @@ fn run_event_loop(
                 // content survives unocclude.
                 return;
             }
+            // Options overlay UI (no-op while closed). First, because it can
+            // change the presented size (widescreen).
+            self.run_overlay(&window);
             // The presented size can change after startup — a ROM dropped on a
             // cartridge-less window rebuilds the emulator, and an HD pack can
             // raise the effective scale — so the texture is re-checked on every
@@ -3066,6 +3615,8 @@ fn run_event_loop(
                 surface_size,
                 scale_mode,
                 tex_size,
+                overlay,
+                presented_once,
                 ..
             } = self;
             let Some(pixels) = pixels.as_mut() else {
@@ -3108,13 +3659,24 @@ fn run_event_loop(
                 *scale_mode,
                 fill_crop_texels(display.settings().wide_tiles, display.effective_scale()),
             );
+            if let Some(r) = renderer.as_ref() {
+                r.set_scanlines(display.scanline_strength());
+            }
             let result = match renderer.as_ref() {
                 Some(r) => pixels.render_with(|encoder, target, ctx| {
                     r.render(encoder, target, &ctx.queue, &vp, tex);
+                    overlay.paint(&ctx.device, &ctx.queue, encoder, target, *surface_size);
                     Ok(())
                 }),
                 None => pixels.render(),
             };
+            if !*presented_once {
+                *presented_once = true;
+                crate::diag::breadcrumb(format_args!("gpu: first frame presented ({result:?})"));
+                // The backend survived start-up and its first present: clear
+                // the crash-loop guard (`gpu_guard`).
+                crate::gpu_guard::confirm();
+            }
             if let Err(e) = result {
                 // A swallowed render error leaves the last good (or the initial
                 // grey) frame up while the title keeps moving - exactly the
@@ -3180,8 +3742,9 @@ fn run_event_loop(
         /// asked for. Both quit paths (window close and `Esc`) call this, so
         /// neither can grow a half-copy of the other.
         fn on_quit(&mut self) {
+            self.save_overlay_config();
             let name = self.sram_file();
-            let _ = save_sram_named(&mut self.emu.game, &self.data_dir, name);
+            let _ = save_sram_named(&mut self.emu.game, &self.data_dir, &name);
             match self.display.write_recorded_pack(&self.emu.game.chr) {
                 Ok(Some(dir)) => eprintln!(
                     "HD recording written to {} — edit the sheets, then run with \
@@ -3224,16 +3787,17 @@ fn run_event_loop(
         /// A netplay guest plays on the host's save, so writing `sram.sav`
         /// would overwrite its own solo progress. It autosaves the session to
         /// `sram-coop.sav` instead, which can be renamed to continue solo.
-        fn sram_file(&self) -> &'static str {
+        fn sram_file(&self) -> String {
+            let hash = self.emu.rom.hash_code.as_deref();
             #[cfg(feature = "netplay")]
             {
                 if self.net.as_ref().is_some_and(|n| !n.is_host())
                     || self.rollback.as_ref().is_some_and(|r| !r.is_host())
                 {
-                    return SRAM_COOP_FILE;
+                    return crate::rando::sram_file_name(hash, true);
                 }
             }
-            SRAM_FILE
+            crate::rando::sram_file_name(hash, false)
         }
 
         /// Apply the pause / save-state requests a non-winit host posted to
@@ -3264,14 +3828,16 @@ fn run_event_loop(
             }
             // Save before load, so "save then load" in one iteration is a
             // round trip rather than a load of the previous contents.
+            let hash = self.emu.rom.hash_code.clone();
             if let Some(slot) = save {
-                match save_savestate(&self.emu.game, &self.data_dir, slot) {
+                match save_savestate_for(&self.emu.game, &self.data_dir, slot, hash.as_deref()) {
                     Ok(p) => eprintln!("saved {}", p.display()),
                     Err(e) => eprintln!("save failed: {e}"),
                 }
             }
             if let Some(slot) = load {
-                match load_savestate(&mut self.emu.game, &self.data_dir, slot) {
+                match load_savestate_for(&mut self.emu.game, &self.data_dir, slot, hash.as_deref())
+                {
                     Ok(()) => eprintln!("loaded savestate{slot}"),
                     Err(e) => eprintln!("load failed: {e}"),
                 }
@@ -3298,6 +3864,78 @@ fn run_event_loop(
             }
         }
 
+        /// The options overlay opened or closed: mute and stop the game
+        /// while it is open offline, and save its edits when it closes.
+        fn on_overlay_toggled(&mut self, open: bool) {
+            self.keyboard.clear();
+            self.fast_forward = false;
+            let hold = self.overlay.pauses(self.net_active());
+            self.audio.set_paused(self.paused || hold);
+            if !open {
+                if !self.paused {
+                    self.audio.clear();
+                }
+                self.save_overlay_config();
+            }
+        }
+
+        /// Write the overlay's edits to the config file, if any.
+        fn save_overlay_config(&mut self) {
+            if self.overlay.take_dirty() {
+                if let Err(e) = self.config.save_to(&self.config_file) {
+                    eprintln!("options: could not save the config: {e}");
+                }
+            }
+        }
+
+        /// One overlay UI frame, applying whatever it changed.
+        fn run_overlay(&mut self, window: &Window) {
+            use crate::overlay::{apply, Lock, Model, Targets};
+            if !self.overlay.is_open() {
+                return;
+            }
+            let lock = if self.net_active() {
+                Lock::Netplay
+            } else if self.movie_pos < self.movie.len() {
+                Lock::Movie
+            } else {
+                Lock::None
+            };
+            let before = Model::capture(
+                &self.config,
+                &self.feats,
+                &self.display,
+                self.scale_mode,
+                self.is_fullscreen(),
+                lock,
+            );
+            let mut after = before.clone();
+            let info = self.compose_title();
+            let closed = self.overlay.run(window, &mut after, &info);
+            if after != before {
+                let applied = apply(
+                    &before,
+                    &after,
+                    Targets {
+                        config: &mut self.config,
+                        emu: &mut self.emu,
+                        feats: &mut self.feats,
+                        display: &mut self.display,
+                        scale_mode: &mut self.scale_mode,
+                    },
+                );
+                if applied.config_changed {
+                    self.overlay.mark_dirty();
+                }
+                if let Some(on) = applied.fullscreen {
+                    self.set_fullscreen(on);
+                }
+            }
+            if closed {
+                self.on_overlay_toggled(false);
+            }
+        }
+
         /// Window title: meters + audio + co-op + netplay suffixes.
         fn compose_title(&self) -> String {
             let mut t = format!(
@@ -3316,6 +3954,9 @@ fn run_event_loop(
                     self.audio.overruns()
                 )
             );
+            if let Some(h) = &self.emu.rom.hash_code {
+                t.push_str(&rando_suffix(h));
+            }
             if self.feats.coop {
                 t.push_str(&coop_suffix(self.emu.game.coop_status().as_ref()));
             }
@@ -3377,10 +4018,14 @@ fn run_event_loop(
                     self.start_fullscreen
                         .then_some(winit::window::Fullscreen::Borderless(None)),
                 );
+            crate::diag::breadcrumb(format_args!(
+                "window: creating {lw}x{lh} logical (monitor {monitor:?}, fullscreen {})",
+                self.start_fullscreen
+            ));
             let window = match event_loop.create_window(attrs) {
                 Ok(w) => w,
                 Err(e) => {
-                    eprintln!("create window: {e}");
+                    crate::diag::breadcrumb(format_args!("create window failed: {e}"));
                     event_loop.exit();
                     return;
                 }
@@ -3392,14 +4037,27 @@ fn run_event_loop(
             let window = Arc::new(window);
             let size = window.inner_size();
             let (sw, sh) = clamp_surface_size(size.width, size.height);
-            let surface = pixels::SurfaceTexture::new(sw, sh, Arc::clone(&window));
-            match pixels::Pixels::new(tex_w, tex_h, surface) {
+            crate::diag::breadcrumb(format_args!(
+                "window: created, {}x{} physical, scale factor {}",
+                size.width,
+                size.height,
+                window.scale_factor()
+            ));
+            match crate::gpu_present::create_pixels(
+                (tex_w, tex_h),
+                (sw, sh),
+                Arc::clone(&window),
+                &self.config.gpu_backend,
+            ) {
                 Ok(p) => {
+                    crate::diag::breadcrumb("gpu: building the viewport pipeline");
                     self.renderer = Some(crate::gpu_present::ViewportRenderer::new(&p));
+                    self.overlay.attach(&window, &p);
                     self.pixels = Some(p);
+                    crate::diag::breadcrumb("gpu: ready");
                 }
                 Err(e) => {
-                    eprintln!("create pixels surface: {e}");
+                    crate::diag::breadcrumb(format_args!("create pixels surface: {e}"));
                     event_loop.exit();
                     return;
                 }
@@ -3434,6 +4092,7 @@ fn run_event_loop(
                 return;
             }
             self.renderer = None;
+            self.overlay.detach();
             self.pixels = None;
             self.window = None;
             self.tex_size = (0, 0);
@@ -3447,7 +4106,7 @@ fn run_event_loop(
             // RAM over a good save.
             if self.exec_errors_seen == 0 {
                 let name = self.sram_file();
-                if let Err(e) = save_sram_named(&mut self.emu.game, &self.data_dir, name) {
+                if let Err(e) = save_sram_named(&mut self.emu.game, &self.data_dir, &name) {
                     eprintln!("suspend: SRAM save failed: {e}");
                 }
             }
@@ -3462,6 +4121,18 @@ fn run_event_loop(
             _id: winit::window::WindowId,
             event: WindowEvent,
         ) {
+            // The options overlay sees events first: `O` toggles it, and
+            // while it is open the keyboard, mouse and touch are its own.
+            if let Some(w) = self.window.clone() {
+                match self.overlay.on_window_event(&w, &event) {
+                    crate::overlay::EventUse::Pass => {}
+                    crate::overlay::EventUse::Consumed => return,
+                    crate::overlay::EventUse::Toggled(open) => {
+                        self.on_overlay_toggled(open);
+                        return;
+                    }
+                }
+            }
             match event {
                 WindowEvent::CloseRequested => {
                     #[cfg(feature = "netplay")]
@@ -3535,7 +4206,8 @@ fn run_event_loop(
                             Ok((fresh, body)) => {
                                 self.emu = fresh;
                                 self.rom_body = Some(body);
-                                let _ = load_sram(&mut self.emu.game, &self.data_dir);
+                                let name = self.sram_file();
+                                let _ = load_sram_named(&mut self.emu.game, &self.data_dir, &name);
                                 self.emu.game.coop_reset_area();
                                 self.movie.clear();
                                 self.movie_pos = 0;
@@ -3698,6 +4370,18 @@ fn run_event_loop(
                                         }
                                     }
                                 }
+                                KC::KeyM | KC::KeyN => {
+                                    // Display-only audio mutes (music / sound
+                                    // effects); never part of netplay.
+                                    let (what, on) = crate::display_enh::with_audio_fx(|fx| {
+                                        if code == KC::KeyM {
+                                            ("music", fx.toggle_music_mute())
+                                        } else {
+                                            ("sound effects", fx.toggle_sfx_mute())
+                                        }
+                                    });
+                                    eprintln!("{what} {}", if on { "muted" } else { "on" });
+                                }
                                 KC::Tab => {
                                     if self.net_active() {
                                         self.refuse_during_netplay("fast-forward");
@@ -3747,16 +4431,24 @@ fn run_event_loop(
                                         eprintln!("{why}");
                                     } else if code == KC::F5 {
                                         let slot = self.savestate_slot;
-                                        match save_savestate(&self.emu.game, &self.data_dir, slot) {
+                                        let hash = self.emu.rom.hash_code.clone();
+                                        match save_savestate_for(
+                                            &self.emu.game,
+                                            &self.data_dir,
+                                            slot,
+                                            hash.as_deref(),
+                                        ) {
                                             Ok(p) => eprintln!("saved {}", p.display()),
                                             Err(e) => eprintln!("save failed: {e}"),
                                         }
                                     } else {
                                         let slot = self.savestate_slot;
-                                        match load_savestate(
+                                        let hash = self.emu.rom.hash_code.clone();
+                                        match load_savestate_for(
                                             &mut self.emu.game,
                                             &self.data_dir,
                                             slot,
+                                            hash.as_deref(),
                                         ) {
                                             Ok(()) => eprintln!("loaded savestate{slot}"),
                                             Err(e) => eprintln!("load failed: {e}"),
@@ -3806,12 +4498,36 @@ fn run_event_loop(
             } else {
                 1.0
             };
-            let mut steps = self.timer.advance(dt.as_secs_f64(), speed, self.paused);
+            // LB + RB + Y on any gamepad toggles the options overlay. While
+            // it holds the game still nothing else drains gilrs, so drain
+            // here to keep the button state current.
+            #[cfg(not(target_os = "android"))]
+            {
+                let holding = self.overlay.pauses(self.net_active());
+                let chord = self.gilrs.as_mut().is_some_and(|g| {
+                    if holding {
+                        while g.next_event().is_some() {}
+                    }
+                    g.gamepads().any(|(_, gp)| {
+                        gp.is_pressed(gilrs::Button::LeftTrigger)
+                            && gp.is_pressed(gilrs::Button::RightTrigger)
+                            && gp.is_pressed(gilrs::Button::North)
+                    })
+                });
+                if self.overlay.chord(chord) {
+                    let open = !self.overlay.is_open();
+                    self.overlay.set_open(open);
+                    self.on_overlay_toggled(open);
+                }
+            }
+            // The open overlay holds the game still (except during netplay).
+            let paused = self.paused || self.overlay.pauses(self.net_active());
+            let mut steps = self.timer.advance(dt.as_secs_f64(), speed, paused);
             // Only with a live output stream draining the ring: without a
             // device the ring never empties and the nudge would hold the
             // emulator back. Rate limited: audio is a soft sync, never the
             // clock (see `AudioPacer`).
-            if !self.paused && self.device_rate.is_some() {
+            if !paused && self.device_rate.is_some() {
                 steps = self.pacer.apply(
                     steps,
                     dt.as_secs_f64(),
@@ -3852,10 +4568,22 @@ fn run_event_loop(
     let window_scale = config.effective_window_scale();
     let config_scale_mode = config.effective_scale_mode();
     let start_fullscreen = config.fullscreen;
+    crate::diag::breadcrumb("creating the event loop");
     event_loop.set_control_flow(ControlFlow::Poll);
 
     let audio = SharedAudio::new(config.effective_audio_rate());
-    let (stream, device_rate) = match crate::audio::open_output_stream(&audio) {
+    crate::display_enh::with_audio_fx(|fx| fx.configure(&display.settings().display_enh));
+    crate::diag::breadcrumb(format_args!(
+        "audio: opening the default output device (game rate {} Hz)",
+        audio.rate()
+    ));
+    // A panic inside the audio library (cpal has a few `expect`s on COM
+    // calls) must not stop the game: it runs silent instead.
+    let opened = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+        crate::audio::open_output_stream(&audio)
+    }))
+    .unwrap_or_else(|_| Err("the audio library panicked (see the log)".to_string()));
+    let (stream, device_rate) = match opened {
         Ok((s, r)) => {
             if r != audio.rate() {
                 eprintln!(
@@ -3868,12 +4596,12 @@ fn run_event_loop(
             (Some(s), Some(r))
         }
         Err(e) => {
-            eprintln!("audio disabled: {e}");
+            crate::diag::breadcrumb(format_args!("audio disabled: {e}"));
             (None, None)
         }
     };
     #[cfg(not(target_os = "android"))]
-    let gilrs = crate::input::new_gilrs(true).ok();
+    let gilrs = open_gamepads(config.gamepads_enabled);
 
     let initial = WindowUiState::new(has_rom);
     // -- netplay session ----------------------------------------------------
@@ -3892,14 +4620,10 @@ fn run_event_loop(
         // TWO_LINKS is mandatory: a session whose co-op flags were zero would
         // give the guest a pad the ROM never reads, i.e. no gameplay at all.
         let mut cfg = if host {
-            z2_net::SessionConfig::host(
-                z2_assets::rom::EXPECTED_BODY_CRC32,
-                emu.trapset_id,
-                z2_net::COOP_TWO_LINKS,
-            )
+            z2_net::SessionConfig::host(emu.rom.body_crc32, emu.trapset_id, z2_net::COOP_TWO_LINKS)
         } else {
             z2_net::SessionConfig::guest(
-                z2_assets::rom::EXPECTED_BODY_CRC32,
+                emu.rom.body_crc32,
                 emu.trapset_id,
                 z2_net::COOP_TWO_LINKS | z2_net::COOP_SPRITE_UNLIMITED,
             )
@@ -3940,14 +4664,10 @@ fn run_event_loop(
         let url = z2_net::room_url(&signal, &room).map_err(|e| format!("netplay: {e}"))?;
         let delay = crate::netplay::rollback_delay(args.net_delay, config.netplay.input_delay)?;
         let mut cfg = if host {
-            z2_net::RollbackConfig::host(
-                z2_assets::rom::EXPECTED_BODY_CRC32,
-                emu.trapset_id,
-                z2_net::COOP_TWO_LINKS,
-            )
+            z2_net::RollbackConfig::host(emu.rom.body_crc32, emu.trapset_id, z2_net::COOP_TWO_LINKS)
         } else {
             z2_net::RollbackConfig::guest(
-                z2_assets::rom::EXPECTED_BODY_CRC32,
+                emu.rom.body_crc32,
                 emu.trapset_id,
                 z2_net::COOP_TWO_LINKS | z2_net::COOP_SPRITE_UNLIMITED,
             )
@@ -3987,6 +4707,7 @@ fn run_event_loop(
         window: None,
         pixels: None,
         keyboard: crate::input::KeyboardState::new(),
+        socd: Default::default(),
         #[cfg(not(target_os = "android"))]
         gilrs,
         #[cfg(not(target_os = "android"))]
@@ -4024,6 +4745,9 @@ fn run_event_loop(
         surface_size: (1, 1),
         renderer: None,
         lifecycle_suspended: false,
+        #[cfg(not(target_os = "android"))]
+        pads_heard: Vec::new(),
+        presented_once: false,
         remember_rom: args.config.is_none(),
         modifiers: winit::keyboard::ModifiersState::empty(),
         #[cfg(feature = "netplay")]
@@ -4032,14 +4756,21 @@ fn run_event_loop(
         net,
         #[cfg(feature = "netplay")]
         rollback,
+        overlay: crate::overlay::Overlay::new(),
+        config_file: args
+            .config
+            .as_ref()
+            .map_or_else(crate::config::config_path, PathBuf::from),
     };
     // Keep audio in lockstep with the initial UI state.  Both cartless and
     // ROM launches now start running; the normal frame path produces audio,
     // while explicit pause/focus transitions still mute the ring.
     handler.audio.set_paused(handler.paused);
+    crate::diag::breadcrumb("starting the event loop");
     event_loop
         .run_app(&mut handler)
         .map_err(|e| format!("event loop: {e}"))?;
+    crate::diag::breadcrumb("event loop ended; exiting normally");
     Ok(())
 }
 
@@ -4283,8 +5014,8 @@ mod tests {
         let mut emu = new_emu(44100);
         step_frames(&mut emu, &[0u8; 60], Some(&audio));
         let depth = audio.depth() as u64;
-        // 60 frames ≈ 60*735 ±60 jitter.
-        assert!(depth.abs_diff(60 * 735) <= 60, "depth={depth}, want ~44100");
+        // 60 frames at 60.0988 Hz: 60 * 44100 / 60.0988 ≈ 44027.6 samples.
+        assert!(depth.abs_diff(44_028) <= 2, "depth={depth}, want ~44028");
     }
 
     #[test]
@@ -4410,7 +5141,7 @@ mod tests {
         let mut rgba = vec![0u8; FRAME_RGBA_LEN];
         blit_indexed_to_rgba(&indexed, &mut rgba);
         assert_eq!(&rgba[0..4], &[0xFC, 0xFC, 0xFC, 0xFF]);
-        assert!(rgba.chunks_exact(4).all(|p| p[3] == 0xFF));
+        assert!(rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0xFF));
     }
 
     #[test]
@@ -4749,7 +5480,10 @@ mod tests {
         let mut rgba = vec![0u8; FRAME_RGBA_LEN];
         blit_indexed_to_rgba(emu.game.frame_indexed(), &mut rgba);
         assert!(
-            rgba.chunks_exact(4).all(|p| p == [0x7C, 0x7C, 0x7C, 0xFF]),
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0x7C, 0x7C, 0x7C, 0xFF]),
             "index 0 blits to uniform opaque grey"
         );
     }
@@ -4763,7 +5497,10 @@ mod tests {
         let indexed = [0x30u8; FRAME_LEN]; // near-white.
         blit_indexed_to_rgba(&indexed, &mut rgba);
         assert!(
-            rgba.chunks_exact(4).all(|p| p == [0xFC, 0xFC, 0xFC, 0xFF]),
+            rgba.as_chunks::<4>()
+                .0
+                .iter()
+                .all(|p| *p == [0xFC, 0xFC, 0xFC, 0xFF]),
             "every pixel overwritten, none of the sentinel survives"
         );
         // Distinct indexed frames present distinctly (pause re-presents the
@@ -4788,7 +5525,7 @@ mod tests {
         let wide = vec![0x21u8; wide_len];
         let mut rgba = vec![0u8; wide_len * 4];
         blit_indexed_slice_to_rgba(&wide, &mut rgba);
-        assert!(rgba.chunks_exact(4).all(|p| p[3] == 0xFF));
+        assert!(rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0xFF));
         assert_eq!(rgba.len(), 432 * 240 * 4);
     }
 
@@ -4825,20 +5562,35 @@ mod tests {
     #[test]
     fn session_trapset_id_matches_the_cross_crate_pin() {
         assert_eq!(
-            session_trapset_id(TRAPSET_PIN_VALUE, Some(11)),
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11), &[]),
             WIDE_TRAPSET_PIN_VALUE,
             "session_trapset_id changed: update z2-web's WIDE_TRAPSET_PIN_VALUE in \
              lockstep or native and web peers can no longer connect"
         );
         // Off leaves the identity alone; margins differ from each other.
         assert_eq!(
-            session_trapset_id(TRAPSET_PIN_VALUE, None),
+            session_trapset_id(TRAPSET_PIN_VALUE, None, &[]),
             TRAPSET_PIN_VALUE
         );
         assert_ne!(
-            session_trapset_id(TRAPSET_PIN_VALUE, Some(8)),
-            session_trapset_id(TRAPSET_PIN_VALUE, Some(11))
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(8), &[]),
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11), &[])
         );
+        // Enhancements: all off is empty identity bytes, so nothing moves.
+        let off = Enhancements::default().identity_bytes();
+        assert!(off.is_empty());
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, Some(11), &off),
+            WIDE_TRAPSET_PIN_VALUE
+        );
+        assert_eq!(
+            session_trapset_id(TRAPSET_PIN_VALUE, None, &[1, b'C', 1, 0, 0, 0]),
+            ENH_TRAPSET_PIN_VALUE,
+            "enhancement fold changed: update z2-web's ENH_TRAPSET_PIN_VALUE in lockstep"
+        );
+        let mut cheat = Enhancements::default();
+        cheat.cheats.invincible = true;
+        assert_eq!(cheat.identity_bytes(), [1, b'C', 1, 0, 0, 0]);
     }
 
     #[test]
@@ -4882,6 +5634,78 @@ mod tests {
     }
 
     #[test]
+    fn enhancement_flags_parse_and_resolve() {
+        let argv = |words: &[&str]| {
+            std::iter::once("z2-native")
+                .chain(words.iter().copied())
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        let p = parse_native_args(&argv(&[])).expect("parses");
+        assert_eq!(p.enhancements, None);
+        assert_eq!(p.display_enh, None);
+        let p = parse_native_args(&argv(&[
+            "--enh-json",
+            r#"{"cheats":{"invincible":true}}"#,
+            "--display-enh-json",
+            r#"{"screen_shake":true,"music_volume":99}"#,
+        ]))
+        .expect("parses");
+        assert!(p.enhancements.unwrap().cheats.invincible);
+        let d = p.display_enh.unwrap();
+        assert!(d.screen_shake);
+        assert_eq!(d.music_volume, 10, "clamped");
+        assert!(parse_native_args(&argv(&["--enh-json", "{nope"])).is_err());
+        assert!(parse_native_args(&argv(&["--enh-json", "@/no/such/enh.json"])).is_err());
+        let dir = std::env::temp_dir().join(format!("z2-enh-arg-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let f = dir.join("enh.json");
+        std::fs::write(&f, Enhancements::zalia_preset().to_json()).unwrap();
+        let at = format!("@{}", f.display());
+        let p = parse_native_args(&argv(&["--enh-json", &at])).expect("@path parses");
+        assert_eq!(p.enhancements, Some(Enhancements::zalia_preset()));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Config value applies interactively, not under --movie; the flag
+        // always wins.
+        let config = NativeConfig {
+            enhancements: Enhancements::zalia_preset(),
+            display_enh: DisplayEnh::zalia_preset(),
+            ..NativeConfig::default()
+        };
+        let none = NativeArgs::default();
+        assert_eq!(
+            resolve_enhancements(&none, &config),
+            Enhancements::zalia_preset()
+        );
+        assert_eq!(
+            resolve_enhancements(&none, &NativeConfig::default()),
+            Enhancements::default()
+        );
+        let movie = NativeArgs {
+            movie: Some("run.fm2".into()),
+            ..NativeArgs::default()
+        };
+        assert_eq!(
+            resolve_enhancements(&movie, &config),
+            Enhancements::default()
+        );
+        let explicit = NativeArgs {
+            enhancements: Some(Enhancements::zalia_preset()),
+            ..movie.clone()
+        };
+        assert_eq!(
+            resolve_enhancements(&explicit, &config),
+            Enhancements::zalia_preset()
+        );
+        let feats = resolve_features(&movie, &config).unwrap();
+        assert_eq!(feats.enhancements, Enhancements::default());
+        // Display enhancements are cosmetic: they follow the config even for movies.
+        let d = resolve_display(&movie, &config).unwrap();
+        assert_eq!(d.display_enh, DisplayEnh::zalia_preset());
+    }
+
+    #[test]
     fn p2_follow_parses_and_bounds_the_delay() {
         let argv = |v: &str| {
             ["z2-native", "--p2-follow", v]
@@ -4918,6 +5742,90 @@ mod tests {
         assert_eq!(follow_pad(&movie, 1, 0), BTN_RIGHT | BTN_A);
         assert_eq!(follow_pad(&movie, 2, 0), 0);
         assert_eq!(follow_pad(&movie, 3, 0), BTN_A);
+    }
+
+    #[test]
+    fn rom_identity_fold_is_pinned_and_neutral_when_empty() {
+        assert_eq!(
+            fold_rom_identity(TRAPSET_PIN_VALUE, &[], false),
+            TRAPSET_PIN_VALUE
+        );
+        assert_eq!(
+            fold_rom_identity(TRAPSET_PIN_VALUE, &[0xC358, 0xDF79], false),
+            UNTRAP_PIN_VALUE
+        );
+        assert_ne!(
+            fold_rom_identity(TRAPSET_PIN_VALUE, &[], true),
+            TRAPSET_PIN_VALUE,
+            "--no-traps splits peers"
+        );
+    }
+
+    #[test]
+    fn randomizer_flags_parse_and_validate() {
+        let argv = |v: &[&str]| -> Vec<String> {
+            std::iter::once("z2-native")
+                .chain(v.iter().copied())
+                .map(String::from)
+                .collect()
+        };
+        let std_flags = z2_rando::flags::Preset::Standard.flags().to_flag_string();
+        let a = parse_native_args(&argv(&[
+            "--seed",
+            "race 1",
+            "--rando-flags",
+            &std_flags,
+            "--rando-spoiler",
+            "/tmp/s.txt",
+            "--no-traps",
+        ]))
+        .unwrap();
+        assert_eq!(a.seed.as_deref(), Some("race 1"));
+        assert_eq!(a.rando_flags.as_deref(), Some(std_flags.as_str()));
+        assert!(a.no_traps);
+        let spec = a.rando_spec().unwrap().unwrap();
+        assert_eq!(spec.flags, z2_rando::flags::Preset::Standard.flags());
+        assert!(parse_native_args(&argv(&["--rando-flags", "zzz"])).is_err());
+        assert!(parse_native_args(&argv(&["--rando-spoiler", "x"])).is_err());
+        let plain = parse_native_args(&argv(&[])).unwrap();
+        assert_eq!(plain.rando_spec().unwrap(), None);
+        assert!(NATIVE_USAGE.contains("--rando-flags"));
+        assert_eq!(rando_suffix("AB12CD"), " [rando AB12CD]");
+    }
+
+    #[test]
+    fn trusted_body_builder_accepts_both_layouts() {
+        // Synthetic cartridges (no ROM): an RTS at the reset target, in the
+        // vanilla 8-bank layout and the expanded 16-bank one.
+        for units in [8usize, 16] {
+            let prg = units * 0x4000;
+            let mut body = vec![0u8; prg + 128 * 1024];
+            body[prg - 0x4000] = 0x60;
+            body[prg - 4] = 0x00;
+            body[prg - 3] = 0xC0;
+            let emu = emu_from_trusted_body_with(&body, None, None, 44_100, Features::default())
+                .expect("builds");
+            assert_eq!(emu.game.prg.len(), prg);
+            assert_eq!(emu.rom.body_crc32, z2_assets::rom::crc32_ieee(&body));
+            assert!(emu.rom.untrapped.is_empty());
+        }
+        assert!(
+            emu_from_trusted_body_with(&[0u8; 1000], None, None, 44_100, Features::default())
+                .is_err()
+        );
+        let no_traps = Features {
+            no_traps: true,
+            ..Features::default()
+        };
+        let mut body = vec![0u8; 8 * 0x4000 + 128 * 1024];
+        body[8 * 0x4000 - 0x4000] = 0x60;
+        body[8 * 0x4000 - 3] = 0xC0;
+        let emu = emu_from_trusted_body_with(&body, None, None, 44_100, no_traps).unwrap();
+        assert!(!emu.game.traps.enabled);
+        assert_eq!(
+            emu.trapset_id,
+            fold_rom_identity(emu.trapset_base, &[], true)
+        );
     }
 
     #[test]
@@ -4983,6 +5891,9 @@ mod tests {
                 wide_gameplay: None,
                 record: true,
                 margin_sprites: true,
+                rando: None,
+                no_traps: false,
+                enhancements: Default::default(),
             },
         );
         assert!(emu.game.record_enabled(), "the decoder needs the record");
@@ -5040,6 +5951,7 @@ mod tests {
                     pack_dir: None,
                     record_dir: None,
                     margin_sprites: false,
+                    display_enh: Default::default(),
                 })
                 .expect("no pack: cannot fail");
                 assert_eq!(d.size(), present_size_scaled(tiles, scale));
@@ -5073,6 +5985,7 @@ mod tests {
                         pack_dir: None,
                         record_dir: None,
                         margin_sprites: false,
+                        display_enh: Default::default(),
                     };
                     let feats = settings.features(coop);
                     let mut emu = new_emu_with(44_100, feats);
@@ -5084,7 +5997,10 @@ mod tests {
                     // Before any frame is stepped …
                     let rgba = d.present(&emu.game).expect("present at power-on");
                     assert_eq!(rgba.len() as u32, w * h * 4);
-                    assert!(rgba.chunks_exact(4).all(|p| p[3] == 0xFF), "opaque");
+                    assert!(
+                        rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0xFF),
+                        "opaque"
+                    );
                     // … and after real frames through the shared primitive.
                     step_frames(&mut emu, &[0u8; 3], None);
                     let rgba = d.present(&emu.game).expect("present after stepping");

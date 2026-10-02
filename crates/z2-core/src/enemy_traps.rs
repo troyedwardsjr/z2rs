@@ -213,6 +213,8 @@ const TBL_ELEVATOR_Y: u16 = 0xD8BF;
 const TBL_EXP_LO: u16 = 0xDDC0;
 const TBL_EXP_HI: u16 = 0xDDDC;
 const TBL_DROP: u16 = 0xE870;
+/// Operand of `CMP #$06` in `bank7_monster_death` (kills per drop).
+pub const DROP_FREQUENCY_OPERAND: u16 = 0xE8A0;
 
 // ---------------------------------------------------------------------------
 // Small helpers (register file, addressing, stack, flags, cycles).
@@ -613,7 +615,11 @@ pub fn en_death_exp(game: &mut Game) {
     }
     // Boss: BNE not taken (2), then the key conversion.
     charge(game, base + extra + 2);
-    let (kx, ky, item) = en::boss_key_drop();
+    // Operands read from the ROM so a patched drop is honoured (vanilla:
+    // `en::boss_key_drop()`).
+    let kx_op = bus_read(game, en::BOSS_KEY_X_OPERAND);
+    let item_op = bus_read(game, en::BOSS_KEY_ITEM_OPERAND);
+    let (kx, ky, item) = en::boss_key_drop_from(kx_op, item_op);
     lda(game, kx);
     wzpx(game, 0x4E, x, kx);
     lsr_a(game);
@@ -660,9 +666,12 @@ pub fn en_death(game: &mut Game) {
         set_nz(&mut game.cpu.p, n);
         wabs(game, 0x05DE, g, n);
         lda(game, n);
-        cmp_val(&mut game.cpu.p, n, 0x06);
+        // `CMP #$06` operand (`$E8A0`) read from the ROM so a patched drop
+        // frequency is honoured; the vanilla byte gives 6.
+        let every = bus_read(game, DROP_FREQUENCY_OPERAND);
+        cmp_val(&mut game.cpu.p, n, every);
         cyc += 12 + 2 + 2 + 7 + 4 + 2;
-        if n != 0x06 {
+        if n != every {
             cyc += 3;
         } else {
             cyc += 2;

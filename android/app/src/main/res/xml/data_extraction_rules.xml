@@ -1,14 +1,22 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 12 and newer. The ROM copy is excluded from cloud backup and device transfer. -->
+<!-- Android 12 and newer. The ROM copy and the imported HD pack are excluded from cloud backup and device transfer. -->
 <data-extraction-rules>
     <cloud-backup>
         <exclude domain="file" path="rom.nes" />
         <exclude domain="file" path="rom.nes.tmp" />
         <exclude domain="file" path="launch_args.json" />
+        <exclude domain="file" path="last_game_error.txt" />
+        <exclude domain="file" path="hd_pack" />
+        <exclude domain="file" path="hd_pack.staging" />
+        <exclude domain="file" path="hd_pack.old" />
     </cloud-backup>
     <device-transfer>
         <exclude domain="file" path="rom.nes" />
         <exclude domain="file" path="rom.nes.tmp" />
         <exclude domain="file" path="launch_args.json" />
+        <exclude domain="file" path="last_game_error.txt" />
+        <exclude domain="file" path="hd_pack" />
+        <exclude domain="file" path="hd_pack.staging" />
+        <exclude domain="file" path="hd_pack.old" />
     </device-transfer>
 </data-extraction-rules>

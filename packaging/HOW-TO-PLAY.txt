@@ -101,6 +101,11 @@ it, pick your own Zelda II (USA) .nes file, and play. The app keeps a private
 copy of the ROM so it can start straight into the game next time; that copy is
 never backed up and is deleted when you uninstall.
 
+To play with an HD graphics pack, open the launcher's HD graphics pack section
+and choose Import pack (.zip), or Import unzipped folder for a pack you have
+already unzipped. The app checks the pack and keeps its own copy; Remove HD
+pack goes back to the original graphics. The app comes with no pack.
+
 A touch gamepad is shown until you connect a controller. The first controller
 to connect is player 1 and the second is player 2. Back opens the pause menu,
 where you can save and load states. Online co-op is not available on Android

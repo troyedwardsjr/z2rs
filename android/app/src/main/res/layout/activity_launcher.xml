@@ -209,6 +209,91 @@
                 android:text="@string/scale_integer" />
         </RadioGroup>
 
+        <!-- HD graphics pack -->
+        <TextView
+            style="@style/Z2rs.SectionHeading"
+            android:text="@string/section_hd_pack" />
+
+        <TextView
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="@string/hd_pack_intro"
+            android:textAppearance="?attr/textAppearanceBodyMedium" />
+
+        <TextView
+            android:id="@+id/hd_pack_status"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:accessibilityLiveRegion="polite"
+            android:gravity="center_vertical"
+            android:minHeight="48dp"
+            android:text="@string/hd_pack_none"
+            android:textAppearance="?attr/textAppearanceBodyLarge" />
+
+        <com.google.android.material.progressindicator.LinearProgressIndicator
+            android:id="@+id/hd_pack_progress"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:importantForAccessibility="no"
+            android:indeterminate="true"
+            android:visibility="gone" />
+
+        <!-- Running counts; not a live region, so TalkBack is not flooded. -->
+        <TextView
+            android:id="@+id/hd_pack_detail"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="4dp"
+            android:textAppearance="?attr/textAppearanceBodyMedium"
+            android:visibility="gone" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/hd_pack_import_zip"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:contentDescription="@string/hd_pack_import_zip_desc"
+            android:minHeight="56dp"
+            android:text="@string/hd_pack_import_zip"
+            android:textSize="18sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/hd_pack_import_folder"
+            style="@style/Widget.Material3.Button.OutlinedButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:contentDescription="@string/hd_pack_import_folder_desc"
+            android:minHeight="56dp"
+            android:text="@string/hd_pack_import_folder"
+            android:textSize="18sp" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/hd_pack_cancel"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:minHeight="56dp"
+            android:text="@string/hd_pack_cancel"
+            android:textSize="18sp"
+            android:visibility="gone" />
+
+        <com.google.android.material.button.MaterialButton
+            android:id="@+id/hd_pack_remove"
+            style="@style/Widget.Material3.Button.TextButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:layout_marginTop="8dp"
+            android:contentDescription="@string/hd_pack_remove_desc"
+            android:minHeight="56dp"
+            android:text="@string/hd_pack_remove"
+            android:textSize="18sp"
+            android:visibility="gone" />
+
         <!-- Players -->
         <TextView
             style="@style/Z2rs.SectionHeading"

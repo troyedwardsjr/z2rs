@@ -7,6 +7,7 @@
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
+pub use z2_core::enh::{DisplayEnh, Enhancements};
 
 /// Application dir leaf (same as the game's).
 pub const APP_DIR_NAME: &str = "z2rs";
@@ -156,11 +157,43 @@ impl NetMode {
     }
 }
 
+/// Randomizer choices (the "Randomizer" tab).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct RandoSettings {
+    /// Play a randomized game.
+    pub enabled: bool,
+    /// Seed text (any text; the same seed and flags give the same game).
+    pub seed: String,
+    /// Every randomizer option.
+    pub flags: z2_rando::flags::Flags,
+    /// The preset last picked (informational; the combo shows the preset
+    /// that matches [`RandoSettings::flags`], or "Custom").
+    pub preset: Option<z2_rando::flags::Preset>,
+    /// Where the game writes the spoiler log; empty = no spoiler.
+    pub spoiler_path: String,
+    /// The player's own sprite IPS patch; empty = none.
+    pub sprite_ips: String,
+}
+
+impl Default for RandoSettings {
+    fn default() -> Self {
+        RandoSettings {
+            enabled: false,
+            seed: String::new(),
+            flags: z2_rando::flags::Preset::Beginner.flags(),
+            preset: Some(z2_rando::flags::Preset::Beginner),
+            spoiler_path: String::new(),
+            sprite_ips: String::new(),
+        }
+    }
+}
+
 /// Everything the launcher remembers between runs (`<data-dir>/launcher.json`).
 ///
 /// Unknown or missing fields fall back to defaults, so older and newer
 /// launchers can share one file.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Settings {
     /// The player's own Zelda II (USA) ROM file. Only its path is stored.
@@ -200,6 +233,14 @@ pub struct Settings {
     pub game_bin_override: String,
     /// Close the launcher once the game has started.
     pub close_on_start: bool,
+    /// Randomizer tab.
+    pub rando: RandoSettings,
+    /// ZALiA-inspired gameplay enhancements (all off = the original game).
+    /// Sent as `--enh-json` only when something is on.
+    pub enhancements: Enhancements,
+    /// Display-only enhancements. Sent as `--display-enh-json` only when
+    /// something differs from the default.
+    pub display_enh: DisplayEnh,
 }
 
 impl Default for Settings {
@@ -223,6 +264,9 @@ impl Default for Settings {
             ice: String::new(),
             game_bin_override: String::new(),
             close_on_start: false,
+            rando: RandoSettings::default(),
+            enhancements: Enhancements::default(),
+            display_enh: DisplayEnh::default(),
         }
     }
 }
@@ -311,7 +355,87 @@ pub fn build_args(s: &Settings) -> Vec<String> {
             }
         }
     }
+    let r = &s.rando;
+    if r.enabled {
+        push("--seed", Some(r.seed.trim().to_string()));
+        push("--rando-flags", Some(r.flags.to_flag_string()));
+        let spoiler = r.spoiler_path.trim();
+        if !spoiler.is_empty() {
+            push("--rando-spoiler", Some(spoiler.to_string()));
+        }
+        let sprite = r.sprite_ips.trim();
+        if !sprite.is_empty() {
+            push("--sprite-ips", Some(sprite.to_string()));
+        }
+    }
+    // Only when something is on, so a plain launch stays a plain command
+    // line. (Off is also what the game assumes without the flag, unless its
+    // own config file says otherwise; the launcher leaves that file alone.)
+    if s.enhancements != Enhancements::default() {
+        push("--enh-json", Some(s.enhancements.to_json()));
+    }
+    if !s.display_enh.is_default() {
+        push("--display-enh-json", Some(s.display_enh.to_json()));
+    }
     a
+}
+
+/// A random seed for the "Random seed" button: nine decimal digits from the
+/// clock and a counter. Not used for anything that needs to be
+/// unpredictable; the seed is just a name for a game.
+pub fn random_seed() -> String {
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos() as u64)
+        .unwrap_or(0);
+    let mut x = nanos ^ COUNTER.fetch_add(0x9E37_79B9_7F4A_7C15, Ordering::Relaxed);
+    // SplitMix64 finalizer, so consecutive presses look unrelated.
+    x = (x ^ (x >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    x = (x ^ (x >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    x ^= x >> 31;
+    format!("{:09}", x % 1_000_000_000)
+}
+
+/// Problems with the randomizer settings (empty = fine or randomizer off).
+pub fn validate_rando(r: &RandoSettings) -> Vec<String> {
+    let mut out = Vec::new();
+    if !r.enabled {
+        return out;
+    }
+    if r.seed.trim().is_empty() {
+        out.push("Type a seed for the randomizer, or press Random seed.".to_string());
+    }
+    let text = r.flags.to_flag_string();
+    match z2_rando::flags::Flags::from_flag_string(&text) {
+        Ok(back) if back == r.flags => {}
+        Ok(_) | Err(_) => out.push(format!(
+            "The randomizer options do not make a valid flag string ({text})."
+        )),
+    }
+    let mut normalized = r.flags.clone();
+    normalized.normalize();
+    if normalized != r.flags {
+        out.push(
+            "A randomizer minimum is above its maximum (starting hearts, magic or palaces)."
+                .to_string(),
+        );
+    }
+    let sprite = r.sprite_ips.trim();
+    if !sprite.is_empty() && !Path::new(sprite).is_file() {
+        out.push(format!("The sprite patch was not found: {sprite}"));
+    }
+    let spoiler = r.spoiler_path.trim();
+    if !spoiler.is_empty() {
+        let parent = Path::new(spoiler)
+            .parent()
+            .filter(|p| !p.as_os_str().is_empty());
+        if parent.is_some_and(|p| !p.is_dir()) {
+            out.push(format!("The spoiler folder does not exist: {spoiler}"));
+        }
+    }
+    out
 }
 
 fn on_off(b: bool) -> String {
@@ -431,6 +555,7 @@ pub fn validate(s: &Settings) -> Vec<String> {
             ));
         }
     }
+    out.extend(validate_rando(&s.rando));
     out
 }
 
@@ -526,6 +651,69 @@ mod tests {
         let p = dir.join("fake.nes");
         std::fs::write(&p, b"NES\x1a\x08\x10\x12\0\0\0\0\0\0\0\0\0").unwrap();
         p
+    }
+
+    #[test]
+    fn rando_args_only_when_enabled() {
+        let mut s = Settings::default();
+        assert!(!build_args(&s).iter().any(|a| a.starts_with("--seed")));
+        s.rando.enabled = true;
+        s.rando.seed = " 12345 ".into();
+        s.rando.flags = z2_rando::flags::Preset::Standard.flags();
+        s.rando.spoiler_path = "/tmp/spoiler.txt".into();
+        let a = build_args(&s);
+        let at = |k: &str| a.iter().position(|x| x == k).map(|i| a[i + 1].clone());
+        assert_eq!(at("--seed").as_deref(), Some("12345"));
+        let flags = at("--rando-flags").unwrap();
+        assert_eq!(
+            z2_rando::flags::Flags::from_flag_string(&flags).unwrap(),
+            z2_rando::flags::Preset::Standard.flags()
+        );
+        assert_eq!(at("--rando-spoiler").as_deref(), Some("/tmp/spoiler.txt"));
+        assert!(!a.iter().any(|x| x == "--sprite-ips"));
+    }
+
+    #[test]
+    fn rando_validation() {
+        let mut r = RandoSettings::default();
+        assert!(validate_rando(&r).is_empty(), "off = nothing to check");
+        r.enabled = true;
+        assert!(validate_rando(&r).iter().any(|p| p.contains("seed")));
+        r.seed = "x".into();
+        assert!(validate_rando(&r).is_empty());
+        r.flags.start.heart_containers_min = 8;
+        r.flags.start.heart_containers_max = 2;
+        assert!(validate_rando(&r).iter().any(|p| p.contains("minimum")));
+        r.flags.start.heart_containers_max = 8;
+        r.sprite_ips = "/no/such/sprite.ips".into();
+        assert!(validate_rando(&r).iter().any(|p| p.contains("sprite")));
+        r.sprite_ips.clear();
+        r.spoiler_path = "/no/such/dir/spoiler.txt".into();
+        assert!(validate_rando(&r).iter().any(|p| p.contains("spoiler")));
+    }
+
+    #[test]
+    fn rando_settings_round_trip_and_old_files_load() {
+        let mut s = Settings::default();
+        s.rando.enabled = true;
+        s.rando.seed = "abc".into();
+        s.rando.flags = z2_rando::flags::Preset::MaxRando.flags();
+        let json = serde_json::to_string(&s).unwrap();
+        let back: Settings = serde_json::from_str(&json).unwrap();
+        assert_eq!(back, s);
+        // A launcher.json from before the randomizer existed.
+        let old: Settings = serde_json::from_str(r#"{"rom_path":"/x.nes","scale":2}"#).unwrap();
+        assert_eq!(old.rando, RandoSettings::default());
+        assert_eq!(old.scale, 2);
+    }
+
+    #[test]
+    fn random_seeds_are_nine_digits_and_vary() {
+        let a = random_seed();
+        let b = random_seed();
+        assert_eq!(a.len(), 9);
+        assert!(a.bytes().all(|c| c.is_ascii_digit()));
+        assert_ne!(a, b);
     }
 
     #[test]
@@ -756,6 +944,55 @@ mod tests {
         let loaded = Settings::load(&p);
         assert_eq!(loaded.rom_path, "/y.nes");
         assert_eq!(loaded.signal_url, DEFAULT_SIGNAL_URL);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    #[test]
+    fn enhancement_args_only_when_changed() {
+        let s = Settings::default();
+        let a = build_args(&s);
+        assert!(!a.contains(&"--enh-json".to_string()));
+        assert!(!a.contains(&"--display-enh-json".to_string()));
+
+        let mut s = Settings::default();
+        s.enhancements.qol.lives_from_dolls = true;
+        let a = build_args(&s);
+        let i = a.iter().position(|x| x == "--enh-json").expect("flag sent");
+        let sent = Enhancements::from_json(&a[i + 1]).expect("valid JSON");
+        assert_eq!(sent, s.enhancements);
+        assert!(!a.contains(&"--display-enh-json".to_string()));
+
+        let s = Settings {
+            display_enh: DisplayEnh::zalia_preset(),
+            ..Settings::default()
+        };
+        let a = build_args(&s);
+        assert!(!a.contains(&"--enh-json".to_string()));
+        let i = a
+            .iter()
+            .position(|x| x == "--display-enh-json")
+            .expect("flag sent");
+        assert_eq!(
+            DisplayEnh::from_json(&a[i + 1]).unwrap(),
+            DisplayEnh::zalia_preset()
+        );
+    }
+
+    #[test]
+    fn enhancements_persist_and_old_files_load_them_off() {
+        let d = temp_dir("enh");
+        let p = Settings::path_in(&d);
+        let s = Settings {
+            enhancements: Enhancements::zalia_preset(),
+            display_enh: DisplayEnh::zalia_preset(),
+            ..Settings::default()
+        };
+        s.save(&p).unwrap();
+        assert_eq!(Settings::load(&p), s);
+        std::fs::write(&p, r#"{"rom_path":"/y.nes","scale":2}"#).unwrap();
+        let old = Settings::load(&p);
+        assert_eq!(old.enhancements, Enhancements::default());
+        assert!(old.display_enh.is_default());
         let _ = std::fs::remove_dir_all(&d);
     }
 

@@ -287,6 +287,7 @@ fn present_size_follows_the_widescreen_preset_and_scale() {
                 pack_dir: None,
                 record_dir: None,
                 margin_sprites: false,
+                display_enh: Default::default(),
             })
             .expect("no pack");
             assert_eq!(d.size(), app::present_size_scaled(tiles, scale));
@@ -347,6 +348,7 @@ fn no_rom_start_is_consistent_under_every_feature_combination() {
                     pack_dir: None,
                     record_dir: None,
                     margin_sprites: false,
+                    display_enh: Default::default(),
                 };
                 let what = format!("tiles={tiles} scale={scale} coop={coop}");
                 let feats = settings.features(coop);
@@ -363,7 +365,10 @@ fn no_rom_start_is_consistent_under_every_feature_combination() {
                 assert_eq!((w, h), app::present_size_scaled(tiles, scale), "{what}");
                 let rgba = display.present(&emu.game).expect("power-on present");
                 assert_eq!(rgba.len() as u32, w * h * 4, "{what}");
-                assert!(rgba.chunks_exact(4).all(|p| p[3] == 0xFF), "{what}: opaque");
+                assert!(
+                    rgba.as_chunks::<4>().0.iter().all(|p| p[3] == 0xFF),
+                    "{what}: opaque"
+                );
                 // And after real frames through the shared stepping primitive.
                 app::step_frames(&mut emu, &[0u8; 4], None);
                 let rgba = display.present(&emu.game).expect("stepped present");
@@ -384,6 +389,7 @@ fn no_rom_two_pad_stepping_and_present_is_safe() {
         pack_dir: None,
         record_dir: None,
         margin_sprites: false,
+        display_enh: Default::default(),
     };
     let mut emu = app::new_emu_with(44_100, settings.features(true));
     let mut display = Display::new(settings).expect("no pack");
@@ -410,6 +416,9 @@ fn rom_build_applies_features_and_reports_a_trapset() {
         wide_gameplay: None,
         record: true,
         margin_sprites: false,
+        rando: None,
+        no_traps: false,
+        enhancements: Default::default(),
     };
     let (emu, body) = app::emu_from_rom_file_with(&path, 44_100, feats).expect("build");
     assert_eq!(
@@ -460,6 +469,7 @@ fn hd_recording_round_trips_into_a_loadable_pack() {
         pack_dir: None,
         record_dir: Some(dir.clone()),
         margin_sprites: false,
+        display_enh: Default::default(),
     };
     let feats = settings.features(false);
     assert!(feats.record, "recording needs the PPU render record");
@@ -493,6 +503,7 @@ fn hd_recording_round_trips_into_a_loadable_pack() {
         pack_dir: Some(dir.clone()),
         record_dir: None,
         margin_sprites: false,
+        display_enh: Default::default(),
     };
     let mut hd = Display::new(reload).expect("the recorded pack loads");
     assert_eq!(hd.size(), app::present_size_scaled(11, 2));
@@ -571,4 +582,46 @@ fn env_rom_path_counts_as_absent_when_unusable() {
     assert_eq!(app::env_path_if_usable(var).as_deref(), Some(f.as_path()));
     std::env::remove_var(var);
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Enhancements: all off builds the exact plain game (same trap table and
+/// identity, same frames); a preset moves the session identity and turns the
+/// end-of-frame hook on; apply_features toggles both ways cleanly.
+#[test]
+fn rom_build_with_enhancements_keeps_off_identical() {
+    let Some(path) = app::env_path_if_usable("Z2_ROM") else {
+        eprintln!("SKIP rom_build_with_enhancements_keeps_off_identical: Z2_ROM unset");
+        return;
+    };
+    let (mut plain, body) =
+        app::emu_from_rom_file_with(&path, 44_100, Features::default()).expect("build");
+    let zalia = z2_core::enh::Enhancements::zalia_preset();
+    let feats = Features {
+        enhancements: zalia,
+        ..Features::default()
+    };
+    let mut enh = app::emu_from_rom_body_with(&body, 44_100, feats).expect("enh build");
+    assert!(!plain.game.enh_active());
+    assert!(enh.game.enh_active());
+    assert_eq!(enh.trapset_base, plain.trapset_base);
+    assert_eq!(
+        plain.trapset_id, plain.trapset_base,
+        "all off: identity unchanged"
+    );
+    assert_eq!(
+        enh.trapset_id,
+        app::session_trapset_id(enh.trapset_base, None, &zalia.identity_bytes())
+    );
+    assert_ne!(enh.trapset_id, plain.trapset_id);
+
+    // Off again: back to the plain identity and the plain netplay hash.
+    app::apply_features(&mut enh, Features::default());
+    assert!(!enh.game.enh_active());
+    assert_eq!(enh.trapset_id, plain.trapset_id);
+    app::step_frames(&mut plain, &[0u8; 30], None);
+    app::step_frames(&mut enh, &[0u8; 30], None);
+    assert_eq!(
+        netplay::state_hash(&plain.game),
+        netplay::state_hash(&enh.game)
+    );
 }

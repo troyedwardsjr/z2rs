@@ -322,6 +322,7 @@ fn synthetic_emu() -> Emu {
         apu: z2_apu::Apu::new(44_100),
         trapset_id: 1,
         trapset_base: 1,
+        rom: Default::default(),
     }
 }
 
@@ -397,6 +398,9 @@ fn rom_run(raw: &[u8]) {
             wide_gameplay: None,
             record: false,
             margin_sprites: false,
+            rando: None,
+            no_traps: false,
+            enhancements: Default::default(),
         };
         let emu = app::emu_from_rom_body_with(&body, 44_100, feats).expect("emulator");
         let body = body.clone();

@@ -86,6 +86,8 @@ As of the first public commit the repository holds 277 text files and one submod
 | `ram-map.toml` | RAM map | Data Crystal's RAM map plus the disassembly's `ram-map.txt` and `src/variables.asm`, with a source recorded per entry. |
 | `crates/z2-assets/src/extract_tables.rs` | ROM section offsets and lengths | Data Crystal's ROM map, disassembly labels and Dwedit's notes. |
 | `crates/z2-web/site` | HTML, JavaScript and test scripts for the browser build | Written for z2rs. |
+| `crates/z2-rando` | The randomizer: generators, item logic, 6502 patches and a small assembler for them | Written for z2rs. The options follow the community Z2Randomizer, which has no license. Its documentation and source were read to write down how each option behaves, and the z2rs code was written from that description. None of its code, room files, sprites, hint text or other data is here. The rooms, maps and text the randomizer works with are read from your ROM at run time. The source holds ROM offsets, table sizes and the opcodes of the new patches, not game data. |
+| `crates/z2-core/src/enh`, `crates/z2-enh-ui` | Optional gameplay and display enhancements and their settings widgets | Written for z2rs. Many options are modelled on features of ZALiA, HoverBat's Zelda II remake, used only as a list of ideas. None of ZALiA's code or assets is here. |
 | `tools/mesen_probe.lua` | Lua script for Mesen 2 | Written for z2rs. |
 | `third_party/z2disassembly` | Submodule pointer | The community disassembly described above. |
 | `vendor/matchbox_socket` | Vendored crate | Upstream matchbox_socket 0.14.0 plus three marked patches. |

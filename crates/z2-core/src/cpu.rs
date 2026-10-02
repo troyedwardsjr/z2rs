@@ -612,6 +612,7 @@ pub(crate) fn bus_write(game: &mut Game, addr: u16, val: u8) {
             // Display only: latch the widescreen margin sprites drawn since
             // the last DMA (no effect on the game; see `wide_sprites`).
             crate::wide_sprites::on_oam_dma(game);
+            crate::wide_gameplay::on_oam_dma(game);
             game.cpu.cycles += if game.cpu.cycles & 1 == 1 { 514 } else { 513 };
         }
         0x4016 => game.set_strobe(val),

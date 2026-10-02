@@ -130,7 +130,7 @@ fn observer_is_display_only_and_fills_the_margins() {
             // them with its column mask).
             if (249..256).contains(&s.x) {
                 let oam = seen.oam();
-                let hit = oam.chunks_exact(4).any(|e| {
+                let hit = oam.as_chunks::<4>().0.iter().any(|e| {
                     e[0] == s.y && e[1] == s.tile && e[2] == s.attr && i16::from(e[3]) == s.x
                 });
                 edge_hits += usize::from(hit);

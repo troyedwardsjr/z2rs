@@ -388,6 +388,44 @@ pub struct NativeConfig {
     /// `fit`. Display only.
     #[serde(default = "default_scale_mode")]
     pub scale_mode: String,
+    /// ZALiA-inspired gameplay enhancements (all off by default; see
+    /// README.md). `--enh-json` overrides it; ignored for
+    /// `--movie` playback (it would desync the movie). Changes gameplay, so
+    /// netplay peers must agree.
+    #[serde(default)]
+    pub enhancements: z2_core::enh::Enhancements,
+    /// Display-only enhancements (screen shake, flash colour, post effects,
+    /// volumes, dev overlays). `--display-enh-json` overrides it. Never part
+    /// of any netplay identity.
+    #[serde(default)]
+    pub display_enh: z2_core::enh::DisplayEnh,
+    /// Graphics API: `"auto"` (default), `"dx12"`, `"vulkan"`, `"gl"` or
+    /// `"metal"`. `auto` tries DirectX 12, then Vulkan on Windows (OpenGL
+    /// only when named), skipping one that crashed the game while starting
+    /// last time (`crate::gpu_guard`), and lets wgpu choose elsewhere. A
+    /// named backend is tried alone. The `WGPU_BACKEND` environment variable
+    /// overrides both. Display only. See
+    /// `crate::gpu_present::backend_attempts`.
+    #[serde(default = "default_gpu_backend")]
+    pub gpu_backend: String,
+    /// Read gamepads at all. Turning it off skips the gamepad library
+    /// entirely (keyboard only), which rules the controller driver in or out
+    /// when chasing a crash. Default on.
+    #[serde(default = "default_true")]
+    pub gamepads_enabled: bool,
+    /// Let live input hold Left+Right (or Up+Down) at once. Default off:
+    /// a real NES d-pad cannot press opposite directions, and Zelda II's
+    /// walking code treats Left+Right as a third direction that shoves
+    /// Link backwards at high speed (issue #7) — keyboard rollover and
+    /// worn pads produce it by accident. When off, the most recently
+    /// pressed direction of each pair wins ([`crate::input::OpposingFilter`]).
+    /// Movie playback is never filtered either way.
+    #[serde(default)]
+    pub allow_opposing_directions: bool,
+}
+
+fn default_gpu_backend() -> String {
+    "auto".to_string()
 }
 
 fn default_scale_mode() -> String {
@@ -444,6 +482,11 @@ impl Default for NativeConfig {
             window_scale: None,
             fullscreen: false,
             scale_mode: default_scale_mode(),
+            enhancements: z2_core::enh::Enhancements::default(),
+            display_enh: z2_core::enh::DisplayEnh::default(),
+            gpu_backend: default_gpu_backend(),
+            gamepads_enabled: true,
+            allow_opposing_directions: false,
         }
     }
 }
@@ -638,6 +681,10 @@ mod tests {
         assert!(c.widescreen_fill_right_clip);
         assert!(c.widescreen_gameplay);
         assert!(c.hd_pack.is_none());
+        assert_eq!(c.enhancements, z2_core::enh::Enhancements::default());
+        assert!(c.display_enh.is_default());
+        assert_eq!(c.gpu_backend, "auto");
+        assert!(c.gamepads_enabled);
         assert_eq!(c.hd_scale, 1);
         assert!(c.hd_record.is_none());
         assert!(c.gamepad_p2_index.is_none());
@@ -814,5 +861,27 @@ mod tests {
         std::fs::write(&p, b"{not json").unwrap();
         assert_eq!(NativeConfig::load_from(&p), NativeConfig::default());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Enhancement keys round-trip through the config file, and a file with
+    /// only part of them fills the rest with the original-game defaults.
+    #[test]
+    fn enhancement_keys_round_trip() {
+        let c = NativeConfig {
+            enhancements: z2_core::enh::Enhancements::zalia_preset(),
+            display_enh: z2_core::enh::DisplayEnh::zalia_preset(),
+            ..NativeConfig::default()
+        };
+        let back: NativeConfig =
+            serde_json::from_str(&serde_json::to_string_pretty(&c).unwrap()).unwrap();
+        assert_eq!(back, c);
+        let partial: NativeConfig = serde_json::from_str(
+            r#"{"enhancements":{"fixes":{"xp_drain_fix":true}},"display_enh":{"screen_shake":true}}"#,
+        )
+        .unwrap();
+        assert!(partial.enhancements.fixes.xp_drain_fix);
+        assert!(!partial.enhancements.fixes.levelup_softlocks);
+        assert!(partial.display_enh.screen_shake);
+        assert_eq!(partial.audio_rate, 44100);
     }
 }

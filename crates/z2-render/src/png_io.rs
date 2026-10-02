@@ -126,14 +126,16 @@ pub fn decode_png_rgba(bytes: &[u8]) -> Result<RgbaImage, PngError> {
         png::ColorType::Rgba => buf,
         png::ColorType::GrayscaleAlpha => {
             let mut v = Vec::with_capacity(pixels * 4);
-            for ga in buf.chunks_exact(2) {
+            for ga in buf.as_chunks::<2>().0 {
                 v.extend_from_slice(&[ga[0], ga[0], ga[0], ga[1]]);
             }
             v
         }
         png::ColorType::Grayscale => buf.iter().flat_map(|&g| [g, g, g, 0xFF]).collect(),
         png::ColorType::Rgb => buf
-            .chunks_exact(3)
+            .as_chunks::<3>()
+            .0
+            .iter()
             .flat_map(|c| [c[0], c[1], c[2], 0xFF])
             .collect(),
         png::ColorType::Indexed => {

@@ -521,6 +521,18 @@ fn chop_fixture(runs: &[u8], col: u8, row: u8) -> Game {
     put(&mut blob, 0xDF62, &[0x01, 0x01, 0x03, 0x00]);
     put(&mut blob, 0xDF66, &[0x21, 0x22]);
     put(&mut blob, 0xDF68, &[0x77, 0x88]);
+    // The hidden-town immediates `ow_chop` reads from the ROM (row, column
+    // and the four tile bytes), with their values from the original code.
+    for (addr, v) in [
+        (0xDF9Cu16, 0x33u8),
+        (0xDFA2, 0x3E),
+        (0xDFA6, 0x5C),
+        (0xDFAB, 0x5D),
+        (0xDFB0, 0x5E),
+        (0xDFB5, 0x5F),
+    ] {
+        put(&mut blob, addr, &[v]);
+    }
     for stub in [0x8368u16, 0x879B, 0x83A1] {
         put(&mut blob, stub, &[0x60]);
     }

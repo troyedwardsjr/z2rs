@@ -82,6 +82,30 @@ impl LauncherApp {
                     self.state.error = Some(format!("Could not open {}: {e}", dir.display()));
                 }
             }
+            Action::BrowseSpriteIps => {
+                let mut dlg = rfd::FileDialog::new()
+                    .set_title("Choose your sprite patch")
+                    .add_filter("IPS patch", &["ips", "IPS"])
+                    .add_filter("All files", &["*"]);
+                if let Some(dir) = existing_parent(&s.rando.sprite_ips) {
+                    dlg = dlg.set_directory(dir);
+                }
+                if let Some(p) = dlg.pick_file() {
+                    s.rando.sprite_ips = p.to_string_lossy().into_owned();
+                }
+            }
+            Action::BrowseSpoiler => {
+                let mut dlg = rfd::FileDialog::new()
+                    .set_title("Save the spoiler log as")
+                    .add_filter("Text", &["txt"])
+                    .set_file_name("z2rs-spoiler.txt");
+                if let Some(dir) = existing_parent(&s.rando.spoiler_path) {
+                    dlg = dlg.set_directory(dir);
+                }
+                if let Some(p) = dlg.save_file() {
+                    s.rando.spoiler_path = p.to_string_lossy().into_owned();
+                }
+            }
             Action::RescanPacks => self.state.rescan_packs(),
             Action::OpenDataFolder => {
                 if let Err(e) = game::open_folder(&self.state.data_dir) {

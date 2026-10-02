@@ -273,6 +273,21 @@
      The document goes fullscreen (so the touch controller, fixed to the
      viewport, comes along) and #room.fs pins the screen over everything. On
      browsers without the Fullscreen API (iPhone) the class alone fills the tab. */
+  /* The browser keeps sound off until a click, tap or key press, and a
+     gamepad button does not count, so while a game runs without sound this
+     strip sits on the glass. Any click or key anywhere on the page unlocks it;
+     the strip itself is just the obvious place to click. */
+  #soundHint {
+    position: absolute; left: 50%; bottom: 6%; transform: translateX(-50%); z-index: 4;
+    max-width: 90%; padding: calc(var(--u) * 10) calc(var(--u) * 22); border: 0; cursor: pointer;
+    border-radius: calc(var(--u) * 8); color: var(--gold); background: rgba(8, 14, 50, 0.82);
+    box-shadow: 0 0 0 2px rgba(255, 220, 120, 0.55), 0 calc(var(--u) * 4) calc(var(--u) * 18) rgba(0, 0, 0, 0.6);
+    font: 700 max(12px, calc(var(--u) * 22)) / 1.1 var(--pixel); letter-spacing: 0.5px;
+    text-shadow: 0 calc(var(--u) * 2) 0 #7a3b12; animation: blink 1.2s steps(2) infinite;
+  }
+  #soundHint[hidden] { display: none; }
+  #soundHint:hover, #soundHint:focus-visible { background: rgba(30, 50, 130, 0.9); outline: none; }
+  @media (prefers-reduced-motion: reduce) { #soundHint { animation: none; } }
   #fsExit { display: none; }
   #room.fs #drop {
     position: fixed; inset: 0; width: auto; height: auto; z-index: 15; border-radius: 0;
@@ -386,13 +401,14 @@
       <p class="legal">No ROM is provided. It is checked in this tab and never leaves your browser.</p>
       <input type="file" id="romFile" class="vh" accept=".nes,.bin" />
     </div>
+    <button type="button" id="soundHint" hidden>Click or press any key for sound</button>
     <button type="button" id="fsExit" title="Leave fullscreen (Esc)">✕ Exit fullscreen</button>
   </div>
   <span id="led"></span>
   <span class="badge bits">8-BIT GOODNESS</span>
   <span class="badge brand">z2rs</span>
   <button type="button" class="tv-btn menu" data-click="pauseBtn" title="Pause / resume" aria-label="Pause or resume"></button>
-  <button type="button" class="tv-btn vol" data-click="audioBtn" title="Enable audio" aria-label="Enable audio"></button>
+  <button type="button" class="tv-btn vol" id="volBtn" title="Sound on / mute" aria-label="Sound on or mute"></button>
   <button type="button" class="tv-btn chd" data-channel="-1" title="Previous screen shape" aria-label="Previous screen shape"></button>
   <button type="button" class="tv-btn chu" data-channel="1" title="Next screen shape" aria-label="Next screen shape"></button>
   <button type="button" class="tv-btn knob" data-click="fsBtn" title="Fullscreen (F11)" aria-label="Fullscreen"></button>
@@ -424,6 +440,8 @@
       <button id="fsBtn" title="Fullscreen (F11, or double-click the picture)">Fullscreen</button>
       <button id="touchBtn" title="On-screen controller for touch screens (player 1)">Touch pad</button>
     </div>
+    <p><label><input type="checkbox" id="muteChk" /> Mute</label></p>
+    <p class="sub" id="audioDiag" title="Sound diagnostics: include this line in a bug report">sound: off</p>
     <p><label><input type="checkbox" id="coopChk" /> Local co-op (2 players on this keyboard)</label></p>
     <span class="hidden-controls"><button id="zoomOut" tabindex="-1">−</button><button id="zoomIn" tabindex="-1">+</button></span>
   </section>
@@ -542,6 +560,22 @@
       <div class="row"><label title="STUN/TURN servers, space-separated. Empty or 'none' = same machine or LAN only (fastest). TURN needs username=... credential=... (see README)">ICE
         <input id="netIce" size="34" placeholder="none (same machine / LAN only)" /></label></div>
     </details>
+  </section>
+
+  <section class="card" id="randoBox">
+    <h2>Randomizer</h2>
+    <div class="row">
+      <label>Seed <input type="text" id="randoSeed" placeholder="any text" autocomplete="off" spellcheck="false" /></label>
+      <button id="randoDice" title="Pick a random seed">Random seed</button>
+    </div>
+    <div class="row">
+      <label>Flags <input type="text" id="randoFlags" placeholder="1 = no changes" autocomplete="off" spellcheck="false" /></label>
+    </div>
+    <div id="randoInfo" class="sub"></div>
+    <p class="note">Leave both empty to play the original game. Seed and flags are
+      applied when the ROM is loaded (drop it again after changing them); build a flag
+      string with the desktop launcher's Randomizer tab. Netplay partners need the
+      same seed and flags.</p>
   </section>
 
   <section class="card">

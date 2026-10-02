@@ -212,14 +212,19 @@ pub fn step_session<T: Transport>(
 /// Including `coop_hash` catches a P2 divergence that has not yet reached RAM
 /// (the second Link's parked block lives outside the 2 KiB mirror while it is
 /// swapped out).
+///
+/// While any gameplay enhancement is on, the enhancement runtime state
+/// (`Game::enh_hash`) is mixed in too; with everything off the hash is
+/// exactly what it always was. **Mirrored in `z2-web` (`netroll::state_hash`).**
 #[must_use]
 pub fn state_hash(game: &Game) -> u64 {
-    hash_state(&[
-        game.ram(),
-        game.wram(),
-        game.oam(),
-        &game.coop_hash().to_le_bytes(),
-    ])
+    let coop = game.coop_hash().to_le_bytes();
+    if game.enh_active() {
+        let enh = game.enh_hash().to_le_bytes();
+        hash_state(&[game.ram(), game.wram(), game.oam(), &coop, &enh])
+    } else {
+        hash_state(&[game.ram(), game.wram(), game.oam(), &coop])
+    }
 }
 
 /// Why a save-state action is refused, or `None` when it is allowed.
@@ -603,11 +608,29 @@ pub fn session_emu(
     coop_flags: u32,
     wram: &[u8],
 ) -> Result<Emu, String> {
-    let feats = Features {
-        coop: coop_flags & COOP_TWO_LINKS != 0,
+    let base = Features {
         wide_gameplay,
         record,
-        margin_sprites: false,
+        ..Features::default()
+    };
+    session_emu_with(body, audio_rate, base, coop_flags, wram)
+}
+
+/// [`session_emu`] keeping every other feature of `base` (the randomizer
+/// spec, `--no-traps`, this peer's gameplay enhancements, margin sprites):
+/// co-op comes from the session flags, so both peers regenerate the same
+/// randomized game. The handshake already matched the randomized ROM and
+/// the enhancements through the trap-set identity.
+pub fn session_emu_with(
+    body: &[u8],
+    audio_rate: u32,
+    base: Features,
+    coop_flags: u32,
+    wram: &[u8],
+) -> Result<Emu, String> {
+    let feats = Features {
+        coop: coop_flags & COOP_TWO_LINKS != 0,
+        ..base
     };
     let mut emu = emu_from_rom_body_with(body, audio_rate, feats)?;
     if wram.len() == emu.game.wram.len() {

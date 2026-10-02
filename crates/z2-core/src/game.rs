@@ -300,6 +300,22 @@ pub struct Game {
     /// Wide-gameplay state (off by default; see [`crate::wide_gameplay`]).
     #[cfg(feature = "interp")]
     pub wide_game: crate::wide_gameplay::WideGameplayState,
+    /// ZALiA-inspired enhancement options (all off by default; see
+    /// [`crate::enh`]). Static configuration like the trap table: set it
+    /// through [`Game::set_enhancements`], which installs the hooks.
+    #[cfg(feature = "interp")]
+    pub enh: crate::enh::Enhancements,
+    /// Enhancement runtime counters (captured in save states, mixed into the
+    /// netplay hash while any enhancement is on).
+    #[cfg(feature = "interp")]
+    pub enh_state: crate::enh::EnhState,
+    /// What the enhancements hooked / patched (undone on the next
+    /// [`Game::set_enhancements`]). Not part of any save state.
+    #[cfg(feature = "interp")]
+    pub(crate) enh_hooks: crate::enh::EnhHooks,
+    /// `enh.any_gameplay_active()` cached: the cheap guard in [`Game::step`].
+    #[cfg(feature = "interp")]
+    pub(crate) enh_on: bool,
     pub(crate) pad1: u8,
     /// Pad-2 latch + controller shift state (interp only; the bus is gone
     /// without it, so these fields compile out too).
@@ -360,6 +376,14 @@ impl Game {
             #[cfg(feature = "interp")]
             margin_sprites: crate::wide_sprites::MarginSpriteState::default(),
             wide_game: crate::wide_gameplay::WideGameplayState::default(),
+            #[cfg(feature = "interp")]
+            enh: crate::enh::Enhancements::default(),
+            #[cfg(feature = "interp")]
+            enh_state: crate::enh::EnhState::default(),
+            #[cfg(feature = "interp")]
+            enh_hooks: crate::enh::EnhHooks::default(),
+            #[cfg(feature = "interp")]
+            enh_on: false,
             pad1: 0,
             #[cfg(feature = "interp")]
             pad2: 0,
@@ -586,6 +610,9 @@ impl Game {
             }
             if self.wide_game.enabled {
                 crate::wide_gameplay::end_of_frame(self);
+            }
+            if self.enh_on {
+                crate::enh::end_of_frame(self);
             }
         }
         self.frame_count += 1;
@@ -1174,6 +1201,38 @@ impl Game {
     #[cfg(feature = "interp")]
     pub fn wide_gameplay_hash(&self) -> u64 {
         crate::wide_gameplay::hash(&self.wide_game)
+    }
+
+    /// Replace the ZALiA-inspired enhancement options (see [`crate::enh`]):
+    /// undoes every hook and PRG patch the previous options installed, then
+    /// registers the groups `e` turns on. All off (the default) leaves the
+    /// trap table and PRG exactly as they were. Call it after the default
+    /// trap groups (and co-op / wide gameplay), ideally before `reset`.
+    /// Never called by verification. Gameplay options change the netplay
+    /// identity ([`crate::enh::Enhancements::identity_bytes`]).
+    #[cfg(feature = "interp")]
+    pub fn set_enhancements(&mut self, e: crate::enh::Enhancements) {
+        crate::enh::apply(self, &e);
+    }
+
+    /// The enhancement options in effect.
+    #[cfg(feature = "interp")]
+    pub fn enhancements(&self) -> &crate::enh::Enhancements {
+        &self.enh
+    }
+
+    /// Whether any gameplay enhancement is on (the frontends mix
+    /// [`Game::enh_hash`] into the netplay hash only then).
+    #[cfg(feature = "interp")]
+    pub fn enh_active(&self) -> bool {
+        self.enh_on
+    }
+
+    /// FNV-1a of [`Game::enh_state`] (mix into a netplay desync hash while
+    /// [`Game::enh_active`]).
+    #[cfg(feature = "interp")]
+    pub fn enh_hash(&self) -> u64 {
+        self.enh_state.hash()
     }
 
     // ------------------------------------------------ cpu state (tests)

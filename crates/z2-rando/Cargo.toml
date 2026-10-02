@@ -1,0 +1,19 @@
+[package]
+name = "z2-rando"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs randomizer: original Rust reimplementation of Zelda II randomizer features over the player's own ROM (see README.md)"
+authors = ["troyedwardsjr"]
+license = "MIT"
+
+[lib]
+name = "z2_rando"
+path = "src/lib.rs"
+
+[dependencies]
+# std-only hash gate + CRC32/SHA1 helpers (no further dependencies, wasm-clean).
+z2-assets = { path = "../z2-assets" }
+serde = { version = "1", features = ["derive"] }
+
+[dev-dependencies]
+serde_json = "1"

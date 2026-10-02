@@ -1,7 +1,11 @@
 <?xml version="1.0" encoding="utf-8"?>
-<!-- Android 11 and older (android:fullBackupContent). The ROM copy never leaves the device. -->
+<!-- Android 11 and older (android:fullBackupContent). The ROM copy and the imported HD pack never leave the device. -->
 <full-backup-content>
     <exclude domain="file" path="rom.nes" />
     <exclude domain="file" path="rom.nes.tmp" />
     <exclude domain="file" path="launch_args.json" />
+    <exclude domain="file" path="last_game_error.txt" />
+    <exclude domain="file" path="hd_pack" />
+    <exclude domain="file" path="hd_pack.staging" />
+    <exclude domain="file" path="hd_pack.old" />
 </full-backup-content>

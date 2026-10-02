@@ -18,8 +18,9 @@
 
     <!--
       No INTERNET permission: netplay is disabled in the Android build.
-      Backup: the ROM copy (rom.nes) is excluded from cloud backup and device
-      transfer by the rules files; battery saves and settings may be backed up.
+      Backup: the ROM copy (rom.nes) and an imported HD pack (hd_pack/) are
+      excluded from cloud backup and device transfer by the rules files;
+      battery saves and settings may be backed up.
     -->
     <application
         android:allowBackup="true"

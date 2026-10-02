@@ -36,6 +36,8 @@
 //! | `apu` counters (`reads`, `writes`, `last_write`) | diagnostic | never read back by emulation |
 //! | `coop` | captured | whole [`CoopState`]: flag, options, swap block, contact state, respawn, counters, saved sprite limit |
 //! | `wide_game` | captured | whole [`WideGameplayState`]: flag, margin, per-blob extended X and tracking, both margin-sprite lists, counters. Loading re-registers (or drops) the two wide traps and re-applies (or restores) the townsfolk PRG patch to match |
+//! | `enh_state` | captured | [`EnhState`] runtime counters of the enhancements (length-prefixed blob, so appended fields need no version bump; images before version 3 load with the default) |
+//! | `enh`, `enh_hooks` | static | enhancement options and what they hooked (like the trap table: must match between the saving and loading `Game`) |
 //! | `pad1`, `pad2`, `strobe`, `shift1`, `shift2` | captured | controller latches (pad 2 stays latched across frames) |
 //! | `frame_end_dots`, `frame_count` | captured | dot-exact frame clock |
 //! | `exec_errors`, `last_exec_error` | captured | frontends pause on a changed count, so a re-simulated fault must not double count |
@@ -75,6 +77,7 @@
 
 use crate::coop::{CoopOptions, CoopState, ENEMY_SLOTS, SWAP_LEN};
 use crate::cpu::{Cpu, ExecError, Mmc1};
+use crate::enh::EnhState;
 use crate::game::{Game, FRAME_LEN};
 use crate::ppu_bind::PpuBind;
 use crate::wide_gameplay::{WideGameplayState, DEMON_SLOTS, MAX_MARGIN_SPRITES};
@@ -84,7 +87,7 @@ use z2_ppu::SpriteLimit;
 /// Magic prefix of [`GameState::to_bytes`].
 pub const STATE_MAGIC: [u8; 4] = *b"Z2GS";
 /// Format version of [`GameState::to_bytes`].
-pub const STATE_VERSION: u16 = 2;
+pub const STATE_VERSION: u16 = 3;
 
 /// Complete snapshot of a [`Game`]'s live emulation state (see the module
 /// docs for the per-field capture table).
@@ -100,6 +103,7 @@ pub struct GameState {
     ppu: PpuBind,
     coop: CoopState,
     wide_game: WideGameplayState,
+    enh_state: EnhState,
     pad1: u8,
     pad2: u8,
     strobe: bool,
@@ -134,6 +138,7 @@ impl GameState {
             ppu: PpuBind::new(),
             coop: CoopState::default(),
             wide_game: WideGameplayState::default(),
+            enh_state: EnhState::default(),
             pad1: 0,
             pad2: 0,
             strobe: false,
@@ -195,6 +200,9 @@ impl GameState {
         self.ppu.write_state(&mut w);
         write_coop(&mut w, &self.coop);
         write_wide(&mut w, &self.wide_game);
+        let enh = self.enh_state.to_bytes();
+        w.u16(enh.len() as u16);
+        w.bytes(&enh);
         w.bytes(&[self.pad1, self.pad2]);
         w.bool(self.strobe);
         w.bytes(&[self.shift1, self.shift2]);
@@ -223,7 +231,8 @@ impl GameState {
         }
         let version = r.u16()?;
         // Version 1 predates the wide-gameplay block and decodes with the
-        // mode off.
+        // mode off; versions before 3 predate the enhancement-state block and
+        // decode with the default.
         if !(1..=STATE_VERSION).contains(&version) {
             return Err(StateError::Version(version));
         }
@@ -257,6 +266,10 @@ impl GameState {
         s.coop = read_coop(&mut r)?;
         if version >= 2 {
             s.wide_game = read_wide(&mut r)?;
+        }
+        if version >= 3 {
+            let n = usize::from(r.u16()?);
+            s.enh_state = EnhState::read(r.take(n)?).map_err(StateError::Invalid)?;
         }
         s.pad1 = r.u8()?;
         s.pad2 = r.u8()?;
@@ -542,6 +555,7 @@ impl Game {
         s.ppu.copy_state_from(&self.ppu);
         s.coop.clone_from(&self.coop);
         s.wide_game.clone_from(&self.wide_game);
+        s.enh_state = self.enh_state;
         s.pad1 = self.pad1;
         s.pad2 = self.pad2;
         s.strobe = self.strobe;
@@ -573,6 +587,7 @@ impl Game {
         self.coop.clone_from(&s.coop);
         self.wide_game.clone_from(&s.wide_game);
         crate::wide_gameplay::after_load(self);
+        self.enh_state = s.enh_state;
         self.pad1 = s.pad1;
         self.pad2 = s.pad2;
         self.strobe = s.strobe;

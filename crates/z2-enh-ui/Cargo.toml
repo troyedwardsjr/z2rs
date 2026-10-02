@@ -1,0 +1,20 @@
+[package]
+name = "z2-enh-ui"
+version = "0.1.0"
+edition = "2021"
+description = "z2rs enhancement option widgets (egui), shared by the launcher and the in-game options overlay (see README.md)"
+authors = ["troyedwardsjr"]
+license = "MIT"
+publish = false
+
+[lib]
+name = "z2_enh_ui"
+path = "src/lib.rs"
+
+[dependencies]
+# One egui for both users: the launcher (eframe 0.36) and the game's options
+# overlay (egui-winit 0.36 plus its own wgpu 0.19 painter, see
+# z2-native/src/overlay.rs).
+egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
+# Only the enhancement option types (`z2_core::enh`).
+z2-core = { path = "../z2-core" }

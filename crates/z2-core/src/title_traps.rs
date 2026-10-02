@@ -371,8 +371,13 @@ pub fn tt_title_mode(game: &mut Game) {
 /// `bank7_Reset_Number_of_Lives__to_3_` (bank 7 `$C358`): `LDA #$03 :
 /// STA $0700 : INC $0760`, falling into `LC360` (`INC $076C : RTS`).
 /// Exit `A = 3`, `N`/`Z` from the new `$076C`. 24 cycles.
+///
+/// The lives count is the `LDA #imm` operand at `$C359`, read through the
+/// bus so a ROM that patches it (randomizer starting lives) is honoured;
+/// on the vanilla ROM it is `$03`.
 pub fn tt_lives3(game: &mut Game) {
-    lda(game, 0x03);
+    let lives = bus_read(game, 0xC359);
+    lda(game, lives);
     sta(game, 0x0700);
     inc_mem(game, 0x0760);
     inc_mem(game, 0x076C);

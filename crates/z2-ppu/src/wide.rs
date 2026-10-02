@@ -313,15 +313,33 @@ pub fn right_edge_masked(record: &FrameRecord, y: usize, chr_rom: &[u8]) -> bool
     if rec.mask & PPUMASK_SHOW_SPRITES == 0 {
         return false;
     }
-    record.sprites_on(y).iter().any(|s| {
-        usize::from(s.x) == WIDTH - 8
-            && !s.behind
-            && chr_row(chr_rom, s.page, s.tile, s.fine_row).is_some_and(|(lo, hi)| lo | hi == 0xFF)
-    })
+    record
+        .sprites_on(y)
+        .iter()
+        .any(|s| is_edge_mask_sprite(s, chr_rom))
+}
+
+/// True when `s` is an edge-mask sprite row ([`right_edge_masked`]): in
+/// front, parked at x 248, and opaque in all eight pixels.
+fn is_edge_mask_sprite(s: &SpriteRef, chr_rom: &[u8]) -> bool {
+    usize::from(s.x) == WIDTH - 8
+        && !s.behind
+        && chr_row(chr_rom, s.page, s.tile, s.fine_row).is_some_and(|(lo, hi)| lo | hi == 0xFF)
 }
 
 /// Which of the window's edge strips the wide image repaints on one line.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+///
+/// A strip is the hidden 8 columns (x 0-7 or 248-255), widened to the whole
+/// of the edge slots when the margin provider supplied its own identities
+/// for them ([`MarginLine::edge_left`] / [`MarginLine::edge_right`]): slots
+/// 0-1 on the left (x `0..16 - fine_x`) and 31-32 on the right
+/// (x `248 - fine_x..256`). The overworld streams each new column into slot
+/// 1 or 31 (tiles and attributes in different frames), and with `fine_x !=
+/// 0` part of that half-written slot lies *outside* the hidden 8 columns.
+/// On the NES it is a sliver next to a black bar; beside a painted margin it
+/// reads as a flashing stick in the middle of the picture, so the wide image
+/// repaints the whole slot from the map.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct EdgeFill {
     /// Window x 0-7 ([`Margins::fill_left_clip`] on a line that clipped both
     /// left-edge background and sprites).
@@ -329,6 +347,51 @@ pub struct EdgeFill {
     /// Window x 248-255 ([`Margins::fill_right_clip`] on a line covered by
     /// the edge-mask sprite column, see [`right_edge_masked`]).
     pub right: bool,
+    /// Repainted window pixels on the left are `0..left_end` (0 without
+    /// [`EdgeFill::left`], 8 for the plain strip).
+    pub left_end: i32,
+    /// Repainted window pixels on the right are `right_start..256` (256
+    /// without [`EdgeFill::right`], 248 for the plain strip).
+    pub right_start: i32,
+}
+
+impl Default for EdgeFill {
+    fn default() -> Self {
+        Self::NONE
+    }
+}
+
+impl EdgeFill {
+    /// Nothing repainted.
+    pub const NONE: EdgeFill = EdgeFill {
+        left: false,
+        right: false,
+        left_end: 0,
+        right_start: WIDTH as i32,
+    };
+
+    /// The plain 8-column strips, as the flags say.
+    #[must_use]
+    pub const fn strips(left: bool, right: bool) -> Self {
+        EdgeFill {
+            left,
+            right,
+            left_end: if left { 8 } else { 0 },
+            right_start: if right {
+                WIDTH as i32 - 8
+            } else {
+                WIDTH as i32
+            },
+        }
+    }
+
+    /// Whether window pixel `wx` is repainted by the wide image (background
+    /// from [`wide_bg_tile`], sprites re-muxed by [`window_sprite_pixel`]).
+    #[must_use]
+    pub const fn repaints(&self, wx: i32) -> bool {
+        (self.left && wx >= 0 && wx < self.left_end)
+            || (self.right && wx >= self.right_start && wx < WIDTH as i32)
+    }
 }
 
 /// The edge strips line `y` repaints. Both need a line whose margins are
@@ -344,13 +407,24 @@ pub fn edge_fill(record: &FrameRecord, margins: &Margins, y: usize, chr_rom: &[u
             .get(y)
             .is_some_and(|ml| ml.fill == MarginFill::Tiles);
     if !tiles_line {
-        return EdgeFill::default();
+        return EdgeFill::NONE;
     }
-    EdgeFill {
-        left: margins.fill_left_clip
+    let mut fill = EdgeFill::strips(
+        margins.fill_left_clip
             && rec.mask & (PPUMASK_SHOW_LEFT_BG | PPUMASK_SHOW_LEFT_SPRITES) == 0,
-        right: margins.fill_right_clip && right_edge_masked(record, y, chr_rom),
+        margins.fill_right_clip && right_edge_masked(record, y, chr_rom),
+    );
+    // The provider knows the real scenery of the edge slots: repaint the
+    // whole of slots 0-1 / 31-32, not just the hidden 8 columns.
+    let ml = &margins.lines[y];
+    let fine_x = i32::from(rec.fine_x & 7);
+    if fill.left && ml.edge_left.iter().all(|id| id.fetched) {
+        fill.left_end = 16 - fine_x;
     }
+    if fill.right && ml.edge_right.iter().all(|id| id.fetched) {
+        fill.right_start = WIDTH as i32 - 8 - fine_x;
+    }
+    fill
 }
 
 /// Background tile identity and pattern column behind wide pixel `wx` of
@@ -407,20 +481,20 @@ pub fn wide_bg_tile(
                 .copied()
                 .unwrap_or(BgTileId::NONE),
         }
-    } else if wx < 8 {
-        if fill.left {
-            or_record(
-                ml_tiles.and_then(|ml| ml.edge_left.get(k as usize).copied()),
-                k,
-            )
-        } else if rec.mask & PPUMASK_SHOW_LEFT_BG == 0 {
-            BgTileId::NONE
-        } else {
-            record_slot(k)
-        }
-    } else if wx >= WIDTH as i32 - 8 && fill.right {
+    } else if fill.left && wx < fill.left_end {
         or_record(
-            ml_tiles.and_then(|ml| ml.edge_right.get((k - 31) as usize).copied()),
+            ml_tiles.and_then(|ml| ml.edge_left.get(k as usize).copied()),
+            k,
+        )
+    } else if wx < 8 && rec.mask & PPUMASK_SHOW_LEFT_BG == 0 {
+        BgTileId::NONE
+    } else if fill.right && wx >= fill.right_start {
+        or_record(
+            ml_tiles.and_then(|ml| {
+                usize::try_from(k - 31)
+                    .ok()
+                    .and_then(|j| ml.edge_right.get(j).copied())
+            }),
             k,
         )
     } else {
@@ -557,12 +631,59 @@ pub fn left_sprite_fill(margins: &Margins, rec: &LineRecord) -> bool {
 /// Whether a margin sprite pixel at window x `wx` is drawn: inside a margin
 /// `margin_px` wide, or — for a row starting left of the window
 /// (`row_x < 0`) when `left_fill` ([`left_sprite_fill`]) — in window
-/// columns 0-7.
+/// columns 0-7, or — for a row starting in the masked right strip
+/// (`row_x >= 248`) on a line whose right strip is repainted
+/// (`right_fill`, [`EdgeFill::right`]) — in window columns 248-255, where
+/// the game hid it behind its edge mask and a provider may describe it as a
+/// margin sprite instead of an OAM entry.
 #[must_use]
-pub fn margin_sprite_paints(wx: i32, row_x: i32, margin_px: i32, left_fill: bool) -> bool {
+pub fn margin_sprite_paints(
+    wx: i32,
+    row_x: i32,
+    margin_px: i32,
+    left_fill: bool,
+    right_fill: bool,
+) -> bool {
+    let strip = WIDTH as i32 - 8;
     (-margin_px..0).contains(&wx)
         || (WIDTH as i32..WIDTH as i32 + margin_px).contains(&wx)
         || (left_fill && row_x < 0 && (0..8).contains(&wx))
+        || (right_fill && row_x >= strip && (strip..WIDTH as i32).contains(&wx))
+}
+
+/// Whether a repainted right strip drops window sprite `s` (one of
+/// `line_sprites`, the line's recorded sprites). Only on a line whose right
+/// strip is recovered ([`EdgeFill::right`]), and only a sprite whose left
+/// column lies in the strip (OAM X >= 248) that is either
+///
+/// * the edge-mask column itself ([`right_edge_masked`]), or
+/// * the wrapped part of an object crossing the *left* edge: another row of
+///   the same sprite line starts exactly 8 px further right modulo 256, at
+///   x 0-7. On the overworld that is the left half of a blob whose 8-bit X
+///   went below zero; the ROM removes such a blob (any OAM X >= `$F8`), and
+///   the mask hid it the one frame it is still drawn. Showing it would flash
+///   a sliver of blob at the wrong edge.
+///
+/// Everything else in the strip (the right half of a blob walking off the
+/// right edge) is kept and drawn over the recovered background.
+#[must_use]
+pub fn edge_drops_window_sprite(
+    fill: EdgeFill,
+    s: &SpriteRef,
+    line_sprites: &[SpriteRef],
+    chr_rom: &[u8],
+) -> bool {
+    if !fill.right || usize::from(s.x) < WIDTH - 8 {
+        return false;
+    }
+    let wrapped_to = s.x.wrapping_add(8);
+    is_edge_mask_sprite(s, chr_rom)
+        || line_sprites.iter().any(|o| {
+            o.oam_index != s.oam_index
+                && o.x == wrapped_to
+                && usize::from(o.x) < 8
+                && o.row_in_sprite == s.row_in_sprite
+        })
 }
 
 /// Whether a real (recorded) sprite drew an opaque pixel at window x `x` of
@@ -592,6 +713,57 @@ pub fn window_sprite_opaque(record: &FrameRecord, y: usize, chr_rom: &[u8], x: u
     })
 }
 
+/// The window sprite the PPU's mux would show at window x `x` of line `y`
+/// in the wide image: the first recorded sprite in OAM order with an opaque
+/// pixel there, and that pixel's pattern value (1-3).
+///
+/// Used for the pixels an [`EdgeFill`] repaints, where the frame's own
+/// sprite composite cannot be reused (its background changed). Two of the
+/// game's own hiding rules are lifted there, since hiding is what the fill
+/// undoes: the left-column sprite clip (`PPUMASK` bit 2) on a line whose
+/// left strip is repainted, and the edge-mask sprite column at x 248 on a
+/// line whose right strip is (and the wrapped despawn ghost there, see
+/// [`edge_drops_window_sprite`]). Overworld blobs crossing the
+/// picture edge stay visible that way instead of vanishing behind the
+/// strips.
+#[must_use]
+pub fn window_sprite_pixel(
+    record: &FrameRecord,
+    y: usize,
+    chr_rom: &[u8],
+    fill: EdgeFill,
+    x: usize,
+) -> Option<(SpriteRef, u8)> {
+    let rec = record.line(y);
+    if rec.mask & PPUMASK_SHOW_SPRITES == 0
+        || x >= WIDTH
+        || (x < 8 && rec.mask & PPUMASK_SHOW_LEFT_SPRITES == 0 && !fill.left)
+    {
+        return None;
+    }
+    let line_sprites = record.sprites_on(y);
+    line_sprites.iter().find_map(|s| {
+        let left = usize::from(s.x);
+        if !(left..left + 8).contains(&x)
+            || edge_drops_window_sprite(fill, s, line_sprites, chr_rom)
+        {
+            return None;
+        }
+        let dx = (x - left) as u8;
+        let col = if s.flip_h { 7 - dx } else { dx };
+        let id = BgTileId {
+            page: s.page,
+            tile: s.tile,
+            fine_y: s.fine_row & 7,
+            fetched: true,
+            ..BgTileId::NONE
+        };
+        chr_sub(chr_rom, id, col)
+            .filter(|&v| v != 0)
+            .map(|v| (*s, v))
+    })
+}
+
 /// Draw [`Margins::sprites`] into one wide row (`mp` = margin pixels).
 fn paint_margin_sprites(
     record: &FrameRecord,
@@ -608,7 +780,7 @@ fn paint_margin_sprites(
     let mut claimed = [false; WIDTH + 2 * 8 * MAX_MARGIN_TILES];
     if left_fill {
         for x in 0..8 {
-            claimed[mp + x] = window_sprite_opaque(record, y, chr_rom, x);
+            claimed[mp + x] = window_sprite_pixel(record, y, chr_rom, fill, x).is_some();
         }
     }
     let grey = rec.mask & PPUMASK_GRAYSCALE != 0;
@@ -617,7 +789,7 @@ fn paint_margin_sprites(
         let id = r.pattern();
         for dx in 0..8i32 {
             let wx = r.x + dx;
-            if !margin_sprite_paints(wx, r.x, mp as i32, left_fill) {
+            if !margin_sprite_paints(wx, r.x, mp as i32, left_fill, fill.right) {
                 continue;
             }
             let col = if s.flip_h { 7 - dx } else { dx } as u8;
@@ -693,12 +865,27 @@ pub fn render_wide_indexed(
         // Margins: window x in [-8M, 0) and [256, 256 + 8M).
         (-8 * m..0).for_each(&mut paint_px);
         (WIDTH as i32..WIDTH as i32 + 8 * m).for_each(&mut paint_px);
-        // The edge strips the game hid, only where the fill applies.
-        if fill.left {
-            (0..8).for_each(&mut paint_px);
-        }
-        if fill.right {
-            (WIDTH as i32 - 8..WIDTH as i32).for_each(&mut paint_px);
+        // The edge strips the game hid (and the rest of the edge slots when
+        // the provider knows them), only where the fill applies. Background
+        // from the provider, then the window's sprites re-muxed over it.
+        let grey = rec.mask & PPUMASK_GRAYSCALE != 0;
+        let edge = (0..fill.left_end).chain(fill.right_start..WIDTH as i32);
+        for wx in edge.filter(|&wx| fill.repaints(wx)) {
+            let (id, sub_x) = wide_bg_tile(rec, Some(ml), fill, wx);
+            let bg_opaque = chr_sub(chr_rom, id, sub_x).is_some_and(|v| v != 0);
+            let px = match window_sprite_pixel(record, y, chr_rom, fill, wx as usize) {
+                Some((s, sub)) if !(s.behind && bg_opaque) => {
+                    let px =
+                        rec.palette_entry(0x10 + usize::from(s.pal & 3) * 4 + usize::from(sub));
+                    if grey {
+                        px & 0x30
+                    } else {
+                        px
+                    }
+                }
+                _ => tile_pixel(chr_rom, rec, id, sub_x),
+            };
+            row[(wx + 8 * m) as usize] = px;
         }
         if !margins.sprites.is_empty() {
             paint_margin_sprites(record, y, margins, chr_rom, mp, row);
@@ -952,6 +1139,63 @@ mod tests {
         rec
     }
 
+    /// With provider edge identities the strips widen to the whole edge
+    /// slots (the overworld's half-written slot 1 / 31 reaches past the
+    /// hidden 8 columns when `fine_x != 0`), and the window's sprites are
+    /// re-muxed over the recovered background: the left clip and the mask
+    /// column are lifted, a blob reaching into the right strip stays, and
+    /// the wrapped ghost of a blob crossing the left edge is dropped.
+    #[test]
+    fn edge_slots_repaint_whole_and_keep_real_sprites() {
+        let frame = Box::new([0x0Fu8; WIDTH * HEIGHT]);
+        let chr = chr_image();
+        // Tile 5, pattern row 3: pixels 0 and 7 opaque (value 1).
+        let sprite = |oam_index: u8, x: u8| SpriteRef {
+            oam_index,
+            x,
+            page: 2,
+            tile: 5,
+            fine_row: 3,
+            row_in_sprite: 3,
+            pal: 0,
+            tall: true,
+            ..SpriteRef::default()
+        };
+        let mut rec = edge_record(&[
+            mask_sprite(6, false),
+            sprite(32, 244), // a blob's right half reaching into the strip
+            sprite(33, 254), // a wrapped left half (ghost) ...
+            sprite(34, 6),   // ... whose right half is at x 6
+        ]);
+        rec.lines[0].fine_x = 3;
+        let mut m = Margins::new(1);
+        m.fill_left_clip = true;
+        m.fill_right_clip = true;
+        m.lines[0].fill = MarginFill::Tiles;
+        m.lines[0].edge_left = [id(6, 2); 2];
+        m.lines[0].edge_right = [id(6, 2); 2];
+        let fill = edge_fill(&rec, &m, 0, &chr);
+        assert_eq!((fill.left_end, fill.right_start), (13, 245));
+        let mut out = WideFrame::new(1);
+        render_wide_indexed(&frame, &rec, &m, &chr, &mut out);
+        let row = &out.row(0)[8..8 + WIDTH];
+        let map = 0x20 + 8 + 3; // edge identity: palette group 2, pattern 3
+        let spr = 0x20 + 0x11; // sprite palette 0, value 1
+        for x in 0..WIDTH {
+            let want = match x {
+                6 | 251 => spr, // real sprite pixels, clip and mask lifted
+                0..=12 | 245..=255 => map,
+                _ => frame[x],
+            };
+            assert_eq!(row[x], want, "x {x}");
+        }
+        // Without the provider's identities only the 8 hidden columns move.
+        m.lines[0].edge_left = [BgTileId::NONE; 2];
+        m.lines[0].edge_right = [BgTileId::NONE; 2];
+        let fill = edge_fill(&rec, &m, 0, &chr);
+        assert_eq!((fill.left_end, fill.right_start), (8, 248));
+    }
+
     #[test]
     fn right_clip_fill_is_opt_in_and_only_under_an_edge_mask_sprite() {
         let frame = Box::new([0x0Fu8; WIDTH * HEIGHT]);
@@ -1045,13 +1289,7 @@ mod tests {
         );
         m.lines[0].fill = MarginFill::Tiles;
         let fill = edge_fill(&rec, &m, 0, &chr);
-        assert_eq!(
-            fill,
-            EdgeFill {
-                left: true,
-                right: true
-            }
-        );
+        assert_eq!(fill, EdgeFill::strips(true, true));
         rec.lines[0].mask |= PPUMASK_SHOW_LEFT_SPRITES;
         assert!(!edge_fill(&rec, &m, 0, &chr).left, "left sprites shown");
         rec.lines[0].mask &= !PPUMASK_SHOW_LEFT_SPRITES;

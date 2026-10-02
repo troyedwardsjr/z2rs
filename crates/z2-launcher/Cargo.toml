@@ -26,3 +26,11 @@ egui = "0.36"
 rfd = "0.15"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
+# Randomizer option types and the flag-string codec (std + serde only).
+z2-rando = { path = "../z2-rando" }
+# Only for the enhancement option types (`z2_core::enh`), so the launcher and
+# the game share one JSON shape for `--enh-json` / `--display-enh-json`. The
+# launcher never runs the core.
+z2-core = { path = "../z2-core" }
+# The enhancement widgets, shared with the game's in-game options overlay.
+z2-enh-ui = { path = "../z2-enh-ui" }

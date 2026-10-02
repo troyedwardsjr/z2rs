@@ -71,10 +71,10 @@ pub use state::{
     SPRITE0_HIT_LATENCY, VBLANK_LINE,
 };
 pub use wide::{
-    chr_row, chr_sub, edge_fill, left_sprite_fill, margin_sprite_on_line, margin_sprite_paints,
-    margin_sprite_rows, preset_tiles, render_wide_indexed, right_edge_masked, wide_bg_tile,
-    wide_width, window_sprite_opaque, EdgeFill, MarginFill, MarginLine, MarginSpriteRow, Margins,
-    WideFrame, MARGIN_SLOTS, MAX_MARGIN_TILES,
+    chr_row, chr_sub, edge_drops_window_sprite, edge_fill, left_sprite_fill, margin_sprite_on_line,
+    margin_sprite_paints, margin_sprite_rows, preset_tiles, render_wide_indexed, right_edge_masked,
+    wide_bg_tile, wide_width, window_sprite_opaque, window_sprite_pixel, EdgeFill, MarginFill,
+    MarginLine, MarginSpriteRow, Margins, WideFrame, MARGIN_SLOTS, MAX_MARGIN_TILES,
 };
 
 /// Visible frame width in pixels.

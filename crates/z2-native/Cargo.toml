@@ -26,6 +26,8 @@ z2-core = { path = "../z2-core" }
 # Lockstep protocol core: no dependencies unless the `matchbox` feature is on.
 z2-net = { path = "../z2-net" }
 z2-ppu = { path = "../z2-ppu" }
+# Randomizer: patches the verified vanilla body before the emulator is built.
+z2-rando = { path = "../z2-rando" }
 # HD graphics packs + the shared present/compose path (widescreen, scaling).
 z2-render = { path = "../z2-render" }
 z2-verify = { path = "../z2-verify" }
@@ -38,15 +40,36 @@ pixels = "0.15"
 # `libc++_shared.so` next to `libz2rs_android.so`; a build that skips that
 # copy fails at load time with `library "libc++_shared.so" not found`.
 cpal = "0.15"
+# In-game options overlay (`O`, see src/overlay.rs): the launcher's egui 0.36
+# and the shared enhancement widgets. egui-winit 0.36 is built on winit 0.30;
+# the overlay paints with its own wgpu 0.19 renderer because no egui-wgpu
+# release pairs winit 0.30 with pixels' wgpu 0.19. No default features: no
+# clipboard or URL-opening crates.
+egui = { version = "0.36", default-features = false, features = ["default_fonts"] }
+egui-winit = { version = "0.36", default-features = false }
+z2-enh-ui = { path = "../z2-enh-ui" }
 
 # gilrs 0.11 has no Android backend (the Android app reports hardware pads over
 # JNI instead, see `external_pad`), so it is desktop-only.
+#
+# Windows gamepads go through XInput, not gilrs' default Windows.Gaming.Input
+# (WGI) backend. The WGI backend polls WinRT RawGameController objects from its
+# own thread every few milliseconds and has a history of Windows-only crashes
+# (gilrs issues 132, 135, 170, 175, 177, 206); SDL ships WGI off by default and
+# works around a WGI access violation in GameController's destructor. XInput
+# covers every Xbox-family pad (and anything Steam Input presents as one). The
+# two backends are mutually exclusive; the feature only changes Windows.
 [target.'cfg(not(target_os = "android"))'.dependencies]
-gilrs = "0.11"
+gilrs = { version = "0.11", default-features = false, features = ["xinput"] }
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSArray", "NSDate", "NSRunLoop"] }
 objc2-game-controller = { version = "0.3", features = ["GCController", "GCExtendedGamepad", "GCControllerElement", "GCControllerButtonInput", "GCControllerDirectionPad", "GCControllerAxisInput", "GCPhysicalInputProfile"] }
+
+[lints.rust]
+# `--cfg z2_check_win_seh` type-checks the Windows crash handler
+# (`diag::win`) on a non-Windows host with `cargo check`; never link with it.
+unexpected_cfgs = { level = "warn", check-cfg = ["cfg(z2_check_win_seh)"] }
 
 [dev-dependencies]
 # Validates the viewport blit shader with the naga that pixels' wgpu 0.19 uses.

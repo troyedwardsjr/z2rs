@@ -29,6 +29,10 @@ fn game() -> Game {
     let mut g = Game::new();
     register_bank7_traps(&mut g);
     register_title_traps(&mut g);
+    // `tt_lives3` reads its lives count from the `LDA #$03` operand at
+    // `$C359` (fixed bank), as the original code does.
+    let fixed = g.prg.len() - 0x4000;
+    g.prg[fixed + 0x0359] = 0x03;
     g.cpu.cycles = 0;
     g
 }

@@ -32,6 +32,8 @@ z2-core = { path = "../z2-core" }
 z2-assets = { path = "../z2-assets" }
 z2-ppu = { path = "../z2-ppu" }
 z2-apu = { path = "../z2-apu" }
+# Randomizer (std + serde, wasm-clean): `set_rando` patches the verified body.
+z2-rando = { path = "../z2-rando" }
 z2-net = { path = "../z2-net", optional = true }
 z2-render = { path = "../z2-render", optional = true }
 

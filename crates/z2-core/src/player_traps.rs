@@ -514,20 +514,26 @@ pub fn pl_link_hit(game: &mut Game) {
         let steal = abs_y(game, 0x6DD5, y0) & 0x10;
         set_nz(&mut p, steal);
         cy += 4 + 2;
+        // The three immediates (`LDA #$0A` at `$E2FD`, `CPY #$06` at
+        // `$E2FF`, `LDA #$14` at `$E303`) are read from the ROM so patched
+        // drain amounts are honoured; vanilla bytes give the values above.
         let loss = if steal == 0 {
             cy += 4;
             steal
         } else {
-            set_nz(&mut p, 0x0A);
-            cmp_val(&mut p, y0, 0x06);
+            let small = bus_read(game, 0xE2FE);
+            let big_id = bus_read(game, 0xE300);
+            set_nz(&mut p, small);
+            cmp_val(&mut p, y0, big_id);
             cy += 2 + 2 + 2;
-            if y0 == 0x06 {
-                set_nz(&mut p, 0x14);
+            if y0 == big_id {
+                let big = bus_read(game, 0xE304);
+                set_nz(&mut p, big);
                 cy += 2 + 2;
-                0x14
+                big
             } else {
                 cy += 3;
-                0x0A
+                small
             }
         };
         w(&mut game.ram, 0x05E8, loss);
@@ -1320,7 +1326,10 @@ pub fn pl_sword_box(game: &mut Game) {
     p &= !FLAG_C;
     let x0 = adc_val(&mut p, sx, dx);
     w(&mut game.ram, 0x0000, x0);
-    w(&mut game.ram, 0x0002, 0x0E);
+    // The `#$0E` operand is read from PRG so a patched width (the
+    // `sword_reach_px` enhancement) reaches the port too.
+    let width = bus_read(game, 0xE9B5);
+    w(&mut game.ram, 0x0002, width);
     // $E9B8 LDY #$00 ; LDA $80 : CMP #$08 : BEQ : CMP #$09 : BNE : INY.
     let anim = r(&game.ram, 0x0080);
     let stab = match anim {

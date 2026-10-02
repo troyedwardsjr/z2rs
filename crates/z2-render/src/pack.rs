@@ -1307,7 +1307,7 @@ pub fn normalize_rel_path(p: &str) -> Option<String> {
 }
 
 fn threshold_alpha(img: &mut RgbaImage, threshold: u8) {
-    for px in img.rgba.chunks_exact_mut(4) {
+    for px in img.rgba.as_chunks_mut::<4>().0 {
         px[3] = if px[3] >= threshold { 0xFF } else { 0 };
     }
 }
@@ -1318,7 +1318,10 @@ fn scan_cell(img: &RgbaImage, x0: u32, y0: u32, cell: u32) -> (bool, bool) {
     let w = img.width as usize;
     for y in y0..y0 + cell {
         let start = (y as usize * w + x0 as usize) * 4;
-        for px in img.rgba[start..start + cell as usize * 4].chunks_exact(4) {
+        for px in img.rgba[start..start + cell as usize * 4]
+            .as_chunks::<4>()
+            .0
+        {
             if px[3] == 0 {
                 solid = false;
             } else {

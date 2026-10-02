@@ -82,8 +82,8 @@
 
 use z2_ppu::record::{BgTileId, FrameRecord, LineRecord, NO_PAGE, RECORD_TILES_PER_LINE};
 use z2_ppu::wide::{
-    chr_sub, edge_fill, left_sprite_fill, margin_sprite_paints, margin_sprite_rows, wide_bg_tile,
-    wide_width, EdgeFill, Margins, WideFrame, MARGIN_SLOTS,
+    chr_sub, edge_drops_window_sprite, edge_fill, left_sprite_fill, margin_sprite_paints,
+    margin_sprite_rows, wide_bg_tile, wide_width, EdgeFill, Margins, WideFrame, MARGIN_SLOTS,
 };
 use z2_ppu::{
     IndexedFrame, SpriteRef, HEIGHT, PPUMASK_GRAYSCALE, PPUMASK_SHOW_BG, PPUMASK_SHOW_LEFT_BG,
@@ -450,7 +450,7 @@ impl Compositor {
         let row0 = &mut head[first * row_bytes..];
         for (x, &idx) in src.iter().enumerate() {
             let rgba = input.palette.rgba(idx);
-            for px in row0[x * n * 4..(x * n + n) * 4].chunks_exact_mut(4) {
+            for px in row0[x * n * 4..(x * n + n) * 4].as_chunks_mut::<4>().0 {
                 px.copy_from_slice(&rgba);
             }
         }
@@ -538,7 +538,7 @@ impl Compositor {
     /// The edge strips line `y` repaints: [`z2_ppu::wide::edge_fill`], the
     /// same gate `render_wide_indexed` uses, or none without margins.
     fn line_edge_fill(input: &ComposeInput<'_>, y: usize) -> EdgeFill {
-        input.margins.map_or(EdgeFill::default(), |m| {
+        input.margins.map_or(EdgeFill::NONE, |m| {
             edge_fill(input.record, m, y, input.chr_rom)
         })
     }
@@ -653,7 +653,7 @@ impl Compositor {
         // frame already shows the background there, so the replay must not
         // put the mask (or anything else) back over those columns. Same gate
         // as `z2_ppu::wide::render_wide_indexed`, via the same helper.
-        let right_fill = Self::line_edge_fill(input, y).right;
+        let fill = Self::line_edge_fill(input, y);
         let hd_of = |s: &SpriteRef| {
             (s.page != NO_PAGE)
                 .then(|| pack.lookup(s.page, s.tile, sprite_colors(rec, s.pal)))
@@ -675,9 +675,12 @@ impl Compositor {
         for c in self.claimed[..self.src_width].iter_mut() {
             *c = false;
         }
-        // Window sprites (real OAM) first, then the margin sprites.
+        // Window sprites (real OAM) first, then the margin sprites. Where the
+        // right strip is recovered the edge-mask column is gone, exactly as in
+        // `z2_ppu::wide::render_wide_indexed`.
         let rows = sprites
             .iter()
+            .filter(|s| !edge_drops_window_sprite(fill, s, sprites, input.chr_rom))
             .map(|s| (*s, i32::from(s.x), true))
             .chain(margin_rows().map(|r| (r.sprite, r.x, false)));
         for (s, left, window) in rows {
@@ -690,13 +693,10 @@ impl Compositor {
                     if x >= WIDTH {
                         break;
                     }
-                    if x < 8 && !show_left_spr {
+                    if x < 8 && !show_left_spr && !fill.left {
                         continue;
                     }
-                    if right_fill && x >= WIDTH - 8 {
-                        continue; // recovered background owns these columns
-                    }
-                } else if !margin_sprite_paints(wx, left, margin_px as i32, left_fill) {
+                } else if !margin_sprite_paints(wx, left, margin_px as i32, left_fill, fill.right) {
                     continue;
                 }
                 let sx = (wx + margin_px as i32) as usize;
@@ -797,14 +797,22 @@ impl Compositor {
     fn resolve_background_layer(&mut self, rec: &LineRecord, input: &ComposeInput<'_>, y: usize) {
         let show_bg = rec.mask & PPUMASK_SHOW_BG != 0;
         let show_left_bg = rec.mask & PPUMASK_SHOW_LEFT_BG != 0;
+        // Repainted edge pixels take the recovered background's opacity.
+        let fill = Self::line_edge_fill(input, y);
+        let ml = input.margins.map(|m| &m.lines[y]);
         for x in 0..WIDTH {
             let (idx, opaque) = if !show_bg {
                 (rec.backdrop, false)
             } else {
-                let (id, sub_x) = Self::window_tile(rec, x as i32);
+                let repainted = fill.repaints(x as i32);
+                let (id, sub_x) = if repainted {
+                    wide_bg_tile(rec, ml, fill, x as i32)
+                } else {
+                    Self::window_tile(rec, x as i32)
+                };
                 match chr_sub(input.chr_rom, id, sub_x) {
                     None | Some(0) => (rec.backdrop, false),
-                    Some(sub) if x < 8 && !show_left_bg => {
+                    Some(sub) if x < 8 && !show_left_bg && !repainted => {
                         let _ = sub;
                         (rec.backdrop, false)
                     }
@@ -817,7 +825,6 @@ impl Compositor {
             self.bg_index[x] = idx;
             self.bg_opaque[x] = opaque;
         }
-        let _ = y;
     }
 
     /// Background slot, pattern column and NES opacity of every source
@@ -1107,11 +1114,10 @@ impl Compositor {
         let ps = pack.scale();
         let margin_px = self.src_width.saturating_sub(WIDTH) / 2;
         let show_left_spr = rec.mask & PPUMASK_SHOW_LEFT_SPRITES != 0;
-        let right_fill = Self::line_edge_fill(input, y).right;
+        let fill = Self::line_edge_fill(input, y);
         // Columns a sprite may reach on this line: inside the window, not in a
-        // clipped left edge, not in a right edge the margins recovered.
-        let drawable =
-            |x: usize| x < WIDTH && (x >= 8 || show_left_spr) && !(right_fill && x >= WIDTH - 8);
+        // left edge the game clipped and the margins did not recover.
+        let drawable = |x: usize| x < WIDTH && (x >= 8 || show_left_spr || fill.left);
         // Source column of pixel `dx` of a sprite row whose left column is at
         // window x `left`: window sprites keep to `drawable`, margin sprites to
         // `margin_sprite_paints`.
@@ -1121,7 +1127,7 @@ impl Compositor {
             let ok = if window {
                 drawable(wx as usize)
             } else {
-                margin_sprite_paints(wx, left, margin_px as i32, left_fill)
+                margin_sprite_paints(wx, left, margin_px as i32, left_fill, fill.right)
             };
             ok.then_some((wx + margin_px as i32) as usize)
         };
@@ -1129,6 +1135,7 @@ impl Compositor {
         let rows = || {
             sprites
                 .iter()
+                .filter(|s| !edge_drops_window_sprite(fill, s, sprites, input.chr_rom))
                 .map(|s| (*s, i32::from(s.x), true))
                 .chain(margin_rows().map(|r| (r.sprite, r.x, false)))
         };

@@ -201,6 +201,9 @@ fn enemy_shims_run_on_synthetic_states() {
     game.wram[0x0DF9 + 0x05] = 0x42;
     game.ram[0x05DF] = 0x05;
     game.ram[0x051B] = 0x03;
+    // Kills per drop: the port reads the `CMP #$06` operand from the ROM.
+    let freq = game.mmc1.map_prg(0xE8A0, game.prg.len());
+    game.prg[freq] = 0x06;
     en_death(&mut game);
     assert_eq!(game.ram[0x0414], 0x81, "rank 3 with the drop bit rolled in");
     assert_eq!(game.ram[0x05DF], 0x00, "6th kill resets the group counter");

@@ -6,7 +6,10 @@
 //! the frame IRQ on the last step unless inhibited; mode 1 (5-step) never
 //! interrupts.
 
-/// CPU cycles per NTSC video frame (`1789773 / 60`, rounded).
+/// CPU cycles in one 4-step APU frame-sequencer period (29830). Close to,
+/// but not, one NTSC video frame (29780.5 cycles, see
+/// [`crate::apu::VIDEO_FRAME_HALF_CYCLES`]); the sequencer runs on CPU
+/// cycles independently of video frames.
 pub const FRAME_CPU_CYCLES: u64 = 29_830;
 
 /// Step boundaries (cumulative CPU cycles) for 4-step mode.

@@ -136,14 +136,15 @@ function setStatus(extra = '') {
     `${audioStatus()} · ${paused ? 'PAUSED' : 'running'}${statusNote}${extra}`;
 }
 
-// `audio off` until the button is pressed; then the context state, the
+// `audio off` until the first click or key press (or `audio muted`); then the context state, the
 // worklet's queue depth (the delay behind the picture) and how often it ran
-// dry.
+// dry. The fuller line under the Mute box is `audioDiagLine()`.
 function audioStatus() {
+  if (!soundWanted) return 'audio muted';
+  if (audioError) return 'audio failed';
   if (!actx) return 'audio off';
   if (actx.state !== 'running') return `audio ${actx.state}`;
-  const ms = Math.round((audioReport.queued * 1000) / actx.sampleRate);
-  return `audio on (${ms} ms buffered, ${audioReport.underruns} underruns)`;
+  return `audio on (${audioQueuedMs()} ms buffered, ${audioReport.underruns} underruns)`;
 }
 
 // --- wasm boot ------------------------------------------------------------
@@ -338,11 +339,11 @@ function publishZ2() {
       // audio: what the AudioWorklet last reported, for QA (`peak` > 0 means
       // non-silent samples actually reached the output; `queued` over `rate`
       // is how far the sound trails the picture).
-      audio: () => ({
-        state: actx ? actx.state : 'off',
-        rate: actx ? actx.sampleRate : emu.audio_rate(),
-        ...audioReport,
-      }),
+      // `rate` is the context's (output) rate, `synthRate` what the emulator
+      // renders at (equal unless `resampling`); `produced` counts samples the
+      // page handed over, `consumed` (from the ring) samples it played, so
+      // their growth per second can be compared against 60.0988 fps.
+      audio: () => audioDiag(),
       coopEnable: (on) => { setCoop(!!on); return emu.coop_enabled(); },
       coopEnabled: () => emu.coop_enabled(),
       coopStatus: () => emu.coop_status(),
@@ -537,8 +538,40 @@ function gamepadMask(player = 0) {
   return gp ? padBits(gp) : 0;
 }
 
-const pollInput = () => keyboardMask() | gamepadMask(0) | touchMask();
-const pollInputP2 = () => keyboardMaskP2() | gamepadMask(1);
+// Opposing-direction filter ("last pressed wins"), one per player. A real NES
+// d-pad cannot hold Left+Right or Up+Down, and Zelda II's walk code treats
+// Left+Right as a third direction that throws Link backwards at several times
+// walking speed (issue #7). Keyboard rollover — pressing Left before Right is
+// released — does exactly that for a frame or two, so while both directions
+// of a pair are held only the one pressed most recently passes; releasing it
+// hands the axis back to the other. Both pressed on the same poll: neither,
+// until one lets go. Live input only: movie replay never goes through here,
+// and netplay sends the already-filtered pad, so peers stay in lockstep.
+// Mirrors z2-native's `input::OpposingFilter`.
+const PAD_UP = 1 << 4, PAD_DOWN = 1 << 5, PAD_LEFT = 1 << 6, PAD_RIGHT = 1 << 7;
+function opposingFilter() {
+  let prev = 0, horiz = 0, vert = 0;
+  const axis = (winner, raw, newly, a, b) => {
+    const both = a | b, held = raw & both;
+    if (held !== both) return held;
+    const n = newly & both;
+    if (n === a || n === b) return n;
+    if (n === both) return 0;
+    return winner;
+  };
+  return (raw) => {
+    const newly = raw & ~prev;
+    prev = raw;
+    horiz = axis(horiz, raw, newly, PAD_LEFT, PAD_RIGHT);
+    vert = axis(vert, raw, newly, PAD_UP, PAD_DOWN);
+    return (raw & ~(PAD_LEFT | PAD_RIGHT | PAD_UP | PAD_DOWN)) | horiz | vert;
+  };
+}
+const filterP1 = opposingFilter();
+const filterP2 = opposingFilter();
+
+const pollInput = () => filterP1(keyboardMask() | gamepadMask(0) | touchMask());
+const pollInputP2 = () => filterP2(keyboardMaskP2() | gamepadMask(1));
 
 // --- touch gamepad (on-screen controller, player 1) ---------------------------
 // #touchpad is a d-pad, Select/Start and B/A floating over the bottom of the
@@ -611,9 +644,8 @@ for (const type of ['pointerup', 'pointercancel']) {
   touchPad.addEventListener(type, (e) => {
     if (!touchPointers.delete(e.pointerId)) return;
     touchPaint();
-    // Lifting a finger is a user gesture (pressing one down is not, for touch),
-    // so this is where a phone gets its sound without hunting for the button.
-    if (type === 'pointerup' && !actx && !$('audioBtn').disabled) $('audioBtn').click();
+    // Lifting a finger is a user gesture (pressing one down is not, for touch):
+    // the window-level unlock in the audio section turns the sound on from it.
   });
 }
 touchPad.addEventListener('contextmenu', (e) => e.preventDefault());
@@ -666,6 +698,7 @@ function stepLocal(n) {
 
 function loop(t) {
   requestAnimationFrame(loop);
+  syncSoundHint();
   if (!running || paused || !emu.rom_loaded()) return;
   if (!lastT) lastT = t;
   let dt = (t - lastT) / 1000;
@@ -719,7 +752,11 @@ function loop(t) {
       if (n <= 0) return;
       if (emu.net_step(pollInput(), n) === 0) return; // stalled: nothing new to show
     } else if (ns.started && (ns.state === 'running' || ns.state === 'stalled')) {
-      const stepped = emu.net_step(pollInput(), Math.max(n, 1));
+      // Lockstep: the same pacing. This used to step at least one frame on
+      // every rAF tick (`max(n, 1)`), so on 120/144/240 Hz screens both
+      // peers ran the game, and its music, at the display rate.
+      if (n <= 0) return;
+      const stepped = emu.net_step(pollInput(), n);
       if (stepped === 0) return; // waiting for the peer: nothing new to show
     } else if (!ns.started) {
       if (n <= 0) return;
@@ -746,45 +783,186 @@ function loop(t) {
 
 // --- audio (AudioWorklet ring buffer) --------------------------------------
 let actx = null;
-let worklet = null;
-// Last report from the worklet: `{underruns, queued, peak, dropped}` (see
-// worklet.js).
+let worklet = null;      // AudioWorkletNode, or the ScriptProcessorNode fallback
+let fallbackRing = null; // the Ring the ScriptProcessor fallback plays from
+let audioMode = '';      // 'worklet' | 'script processor' once an output path is up
+let audioFallbackWhy = ''; // why the AudioWorklet path was not used
+let audioError = '';     // why sound could not start (shown in the diagnostics)
+let audioProduced = 0;   // samples handed to the output path since it started
+// Last report from the ring: `{underruns, queued, peak, dropped, received,
+// consumed, rendered, target, srcRate, outRate, resampling}` (see worklet.js).
 let audioReport = { underruns: 0, queued: 0, peak: 0, dropped: 0 };
 
-$('audioBtn').addEventListener('click', async () => {
+// Sound is on unless the player mutes it (remembered per browser). A browser
+// only lets an AudioContext start inside a user activation — a click, a tap
+// or a key press — and a gamepad button is NOT one, so a player on a
+// controller alone would otherwise never hear anything. Every activation
+// anywhere on the page therefore tries to create or resume the context, and
+// while it is not running a hint on the screen asks for one click or key.
+let soundWanted = true;
+try { soundWanted = localStorage.getItem('z2rs.sound') !== '0'; } catch { /* no storage */ }
+let audioBusy = false; // setupAudioOutput in flight
+
+// Create the context (first call) or resume it. Called from gesture handlers:
+// the context is built and resume() is issued synchronously, before any await,
+// so browsers that only honour the gesture for synchronous calls (Safari)
+// still count it. Chrome's 'suspended', and Safari's 'interrupted' (a call,
+// Siri, another tab taking the output), both recover through resume().
+function ensureAudio() {
+  if (!emu || !soundWanted || paused) return;
+  if (actx && actx.state === 'closed' && !audioBusy) {
+    actx = null; worklet = null; fallbackRing = null; audioMode = ''; audioFallbackWhy = '';
+  }
+  if (actx) {
+    if (actx.state !== 'running') actx.resume().catch(() => { /* not a gesture yet: the hint stays */ });
+    return;
+  }
+  if (audioError) return; // a hard failure (no Web Audio, no output path): retrying cannot help
+  const Ctx = window.AudioContext || window.webkitAudioContext;
+  if (!Ctx) { audioFailed('this browser has no Web Audio'); return; }
   try {
-    const Ctx = window.AudioContext || window.webkitAudioContext;
     // Take the device's own rate and synthesise at it, rather than demanding
-    // 44100. Forcing a rate either buys a pointless resample (the browser's,
-    // on a 48 kHz device) or is quietly ignored — and a context running at a
-    // different rate from the synth drifts by 3900 samples/s, which is heard
-    // as a delay that grows by about a second every 11 seconds, or as a
-    // permanent underrun, depending on which way the mismatch goes.
+    // one. Forcing a rate either buys a pointless resample (the browser's)
+    // or is quietly ignored — and a context running at a different rate from
+    // the synth plays every sample at the wrong speed: music sharp and fast
+    // with constant dropouts, or flat with a delay that keeps growing. The
+    // synth renders any rate from 8 to 192 kHz, so the context is never
+    // rebuilt (a rebuilt context is born outside the click and stays
+    // suspended in Safari); the ring resamples anything outside that range.
     // 'interactive' asks for the smallest output buffer the device offers.
     actx = new Ctx({ latencyHint: 'interactive' });
-    let rate = emu.set_audio_rate(actx.sampleRate);
-    if (rate !== actx.sampleRate) {
-      // An exotic context rate the synth cannot render (it ships 44100 and
-      // 48000 only): rebuild the context at the rate it fell back to.
-      await actx.close();
-      actx = new Ctx({ sampleRate: rate, latencyHint: 'interactive' });
-      rate = actx.sampleRate;
-    }
-    // Resolve against this module, not the document: a host may serve the
-    // page at / and this file at /z2/app.js, so a document-relative
-    // './worklet.js' would miss.
-    await actx.audioWorklet.addModule(new URL('./worklet.js', import.meta.url));
-    worklet = new AudioWorkletNode(actx, 'z2-ring', { processorOptions: { rate } });
-    worklet.port.onmessage = (e) => { audioReport = e.data; };
-    worklet.connect(actx.destination);
-    await actx.resume();
-    $('audioBtn').disabled = true;
-    $('audioBtn').textContent = 'Audio on';
-  } catch (e) {
-    statusNote = `\naudio failed: ${e}`;
+  } catch {
+    try { actx = new Ctx(); } catch (e) { audioFailed(`AudioContext: ${e}`); return; }
   }
+  actx.onstatechange = onAudioState;
+  actx.resume().catch(() => { /* created outside a gesture: resumed on the next one */ });
+  audioBusy = true;
+  setupAudioOutput(actx)
+    .catch((e) => audioFailed(`${e && e.message ? e.message : e}`))
+    .finally(() => { audioBusy = false; syncAudioDiag(); });
+  syncSoundHint();
+}
+
+function audioFailed(why) {
+  audioError = why;
+  statusNote = `\naudio failed: ${why}`;
+  console.warn('[z2rs] audio failed:', why);
+  syncSoundHint();
   setStatus();
+  syncAudioDiag();
+}
+
+function onAudioState() { syncSoundHint(); syncAudioBtn(); setStatus(); syncAudioDiag(); }
+
+async function setupAudioOutput(ctx) {
+  const rate = emu.set_audio_rate(Math.round(ctx.sampleRate));
+  // Resolve against this module, not the document: a hosting page may serve
+  // the page and this file from different paths, so a document-relative
+  // './worklet.js' would miss.
+  const url = new URL('./worklet.js', import.meta.url);
+  let why = '';
+  if (ctx.audioWorklet && typeof AudioWorkletNode === 'function') {
+    try {
+      await ctx.audioWorklet.addModule(url);
+      const node = new AudioWorkletNode(ctx, 'z2-ring', {
+        numberOfInputs: 0,
+        numberOfOutputs: 1,
+        outputChannelCount: [1],
+        processorOptions: { srcRate: rate },
+      });
+      node.port.onmessage = (e) => { audioReport = e.data; };
+      node.onprocessorerror = () => audioFailed('the audio worklet stopped with an error');
+      node.connect(ctx.destination);
+      worklet = node;
+      audioMode = 'worklet';
+      audioProduced = 0;
+      onAudioState();
+      return;
+    } catch (e) {
+      // A failed module load (blocked, wrong MIME, offline) must not mean no
+      // sound: fall through to the main-thread path below.
+      why = `worklet: ${e && e.message ? e.message : e}`;
+      console.warn('[z2rs] AudioWorklet failed, using ScriptProcessor:', e);
+    }
+  } else {
+    why = window.isSecureContext === false ? 'not a secure context' : 'no AudioWorklet';
+  }
+  // Fallback: the same Ring, run on the main thread by a ScriptProcessorNode
+  // (deprecated, but present wherever AudioWorklet is not). 2048 frames is
+  // ~45 ms per callback at 44.1-48 kHz, so the target depth starts at 100 ms;
+  // the ring raises it on its own if that is not enough.
+  if (typeof ctx.createScriptProcessor !== 'function') throw new Error(`${why}, and no ScriptProcessor`);
+  const { Ring } = await import(url.href);
+  const ring = new Ring(rate, ctx.sampleRate);
+  ring.target = Math.max(ring.target, Math.round(rate * 0.1));
+  const node = ctx.createScriptProcessor(2048, 0, 1);
+  let calls = 0;
+  node.onaudioprocess = (e) => {
+    ring.render(e.outputBuffer.getChannelData(0));
+    if (++calls >= 5) { calls = 0; audioReport = ring.report(); }
+  };
+  node.connect(ctx.destination);
+  fallbackRing = ring;
+  worklet = node;
+  audioMode = 'script processor';
+  audioFallbackWhy = why;
+  audioProduced = 0;
+  onAudioState();
+}
+
+// The events a browser counts as a user activation (keydown, mousedown /
+// pointerdown, touchend / pointerup for touch). Capture phase on the window,
+// so no handler that stops propagation can swallow the unlock.
+for (const type of ['pointerdown', 'pointerup', 'mousedown', 'keydown', 'touchend', 'click']) {
+  addEventListener(type, (e) => {
+    if (type === 'keydown' && e.key === 'Escape') return; // not an activation
+    // VOL toggles on what it saw before this gesture; unlocking here first
+    // would make its first press switch the sound on and straight off again.
+    if (e.target && e.target.closest && e.target.closest('#volBtn')) return;
+    ensureAudio();
+  }, { capture: true, passive: true });
+}
+
+function setSoundWanted(on) {
+  soundWanted = on;
+  try { localStorage.setItem('z2rs.sound', on ? '1' : '0'); } catch { /* no storage */ }
+  $('muteChk').checked = !on;
+  if (on) ensureAudio();
+  else if (actx) actx.suspend().catch(() => {});
+  syncSoundHint();
+  syncAudioBtn();
+  setStatus();
+  syncAudioDiag();
+}
+
+// "Enable audio" stays a plain, idempotent switch-on that is never disabled
+// once a ROM runs (QA's smoke.mjs presses it after the ROM load may already
+// have started the sound, and waits for 'running'); it reads "Audio on" while
+// sound plays. Muting is the checkbox beside it, or the TV's VOL button.
+function syncAudioBtn() {
+  const on = soundWanted && !!actx && actx.state === 'running';
+  $('audioBtn').textContent = on ? 'Audio on' : 'Enable audio';
+}
+$('audioBtn').addEventListener('click', () => setSoundWanted(true));
+$('muteChk').checked = !soundWanted;
+$('muteChk').addEventListener('change', () => setSoundWanted(!$('muteChk').checked));
+$('volBtn').addEventListener('click', () => {
+  setSoundWanted(!(soundWanted && actx && actx.state === 'running'));
 });
+
+// "Click or press any key for sound" over the bottom of the picture, while a
+// game runs, sound is wanted and the context is not running. Checked every
+// animation frame (cheap: it only touches the DOM on a change), so a context
+// suspended or interrupted behind the page's back brings the hint back.
+let hintShown = false;
+function syncSoundHint() {
+  const want = running && !paused && soundWanted && !!emu && !audioError && (!actx || actx.state !== 'running');
+  if (want === hintShown) return;
+  hintShown = want;
+  $('soundHint').hidden = !want;
+  syncAudioBtn();
+}
+$('soundHint').addEventListener('click', () => ensureAudio());
 
 function pushAudio() {
   if (emu.audio_queued() === 0) return;
@@ -792,8 +970,66 @@ function pushAudio() {
   // Audio off or suspended: the samples are dropped, so switching it on at
   // any point starts from the live frame rather than seconds of backlog.
   if (!worklet || !actx || actx.state !== 'running') return;
-  worklet.port.postMessage(pcm);
+  audioProduced += pcm.length;
+  if (fallbackRing) fallbackRing.push(pcm);
+  else worklet.port.postMessage(pcm, [pcm.buffer]);
 }
+
+// --- audio diagnostics -------------------------------------------------------
+// One object for QA (`z2.ext.audio()`) and one line under the Mute box for
+// players' bug reports. Every way the sound can be missing or wrong shows up
+// here: muted (saved per browser), never unlocked, the context's state, the
+// output path, the context rate against the synth rate, the delay behind the
+// picture, and the underrun / drop counters (either one climbing steadily
+// means production and playback disagree).
+function audioQueuedMs() {
+  const r = audioReport.srcRate || (emu ? emu.audio_rate() : 44100);
+  return Math.round((audioReport.queued * 1000) / r);
+}
+
+function audioDiag() {
+  return {
+    state: actx ? actx.state : 'off',
+    rate: actx ? actx.sampleRate : (emu ? emu.audio_rate() : 0),
+    synthRate: emu ? emu.audio_rate() : 0,
+    mode: audioMode,
+    fallbackWhy: audioFallbackWhy,
+    error: audioError,
+    wanted: soundWanted,
+    hint: hintShown, // the "click or press any key for sound" hint is up
+    baseLatencyMs: actx && actx.baseLatency ? Math.round(actx.baseLatency * 1000) : null,
+    outputLatencyMs: actx && actx.outputLatency ? Math.round(actx.outputLatency * 1000) : null,
+    queuedMs: audioQueuedMs(),
+    produced: audioProduced,
+    secure: window.isSecureContext,
+    ...audioReport,
+  };
+}
+
+function audioDiagLine() {
+  const d = audioDiag();
+  if (!d.wanted) return 'sound: muted (saved in this browser; untick Mute or press VOL)';
+  if (d.error) return `sound: failed (${d.error})`;
+  if (!actx) return emu && running ? 'sound: waiting for a click or key press' : 'sound: off';
+  const parts = [`sound: ${d.state}`, `${d.rate} Hz`];
+  if (d.synthRate && d.synthRate !== d.rate) parts.push(`synth ${d.synthRate} Hz, resampled`);
+  parts.push(d.mode ? (d.fallbackWhy ? `${d.mode} (${d.fallbackWhy.slice(0, 48)})` : d.mode) : 'starting');
+  if (d.state === 'running' && d.mode) {
+    const dev = d.outputLatencyMs || d.baseLatencyMs;
+    parts.push(`${d.queuedMs} ms queued${dev ? ` + ${dev} ms device` : ''}`);
+    parts.push(`${d.underruns} underruns`, `${d.dropped || 0} dropped`);
+  }
+  return parts.join(' · ');
+}
+
+let lastDiag = '';
+function syncAudioDiag() {
+  const line = audioDiagLine();
+  if (line === lastDiag) return;
+  lastDiag = line;
+  $('audioDiag').textContent = line;
+}
+setInterval(syncAudioDiag, 500);
 
 // --- pause -----------------------------------------------------------------
 // `autoPaused` marks a pause the page took by itself (tab hidden). Only that
@@ -806,7 +1042,11 @@ function setPaused(p, auto = false) {
   paused = p;
   autoPaused = p && auto;
   $('pauseBtn').textContent = paused ? 'Resume' : 'Pause';
-  if (actx) { paused ? actx.suspend() : actx.resume(); }
+  if (actx) {
+    if (paused) actx.suspend().catch(() => {});
+  }
+  if (!paused) ensureAudio(); // unpausing from a click is a gesture: resume (or create) here
+  syncSoundHint();
   setStatus();
 }
 $('pauseBtn').addEventListener('click', () => setPaused(!paused));
@@ -829,11 +1069,23 @@ document.addEventListener('visibilitychange', () => {
 function loadRomBytes(buf) {
   romLoadT0 = performance.now();
   firstFrameLogged = false;
+  // Randomizer: applied inside `load_rom`, after the hash gate.
+  try {
+    emu.set_rando($('randoSeed').value, $('randoFlags').value);
+  } catch (e) {
+    statusEl.textContent = `Randomizer flags rejected: ${e}`;
+    $('randoInfo').textContent = `Flags rejected: ${e}`;
+    return;
+  }
   try {
     emu.load_rom(buf);
   } catch (e) {
     statusEl.textContent = `ROM rejected: ${e}`;
     return;
+  }
+  {
+    const hash = emu.rando_hash();
+    $('randoInfo').textContent = hash ? `Randomized game, hash code ${hash}` : 'Original game';
   }
   // Re-apply the UI's feature state to the freshly built game. `load_rom`
   // constructs a new `Game` (and re-arms the render record from the settings
@@ -861,7 +1113,11 @@ function loadRomBytes(buf) {
     $(id).disabled = false;
   }
   syncNetButtons();
+  // setPaused(false) also builds or resumes the audio context: the file
+  // picker's click was a gesture (a drop is not); if the browser still holds
+  // the context, the on-screen hint asks for one click or key.
   setPaused(false);
+  syncAudioBtn();
   setStatus();
   $('drop').classList.add('has-rom'); // hides the "insert cartridge" screen
   // On a phone the picture is the page: bring it under the thumbs' controller.
@@ -1077,6 +1333,31 @@ for (const b of document.querySelectorAll('.tv-btn[data-channel]')) {
     const n = sel.options.length;
     sel.selectedIndex = (sel.selectedIndex + Number(b.dataset.channel) + n) % n;
     sel.dispatchEvent(new Event('change'));
+  });
+}
+// Randomizer seed and flag string, remembered per browser like the other
+// settings. They take effect on the next ROM load.
+{
+  const seed = $('randoSeed');
+  const flags = $('randoFlags');
+  try {
+    seed.value = localStorage.getItem('z2rs.randoSeed') || '';
+    flags.value = localStorage.getItem('z2rs.randoFlags') || '';
+  } catch { /* no storage */ }
+  const save = () => {
+    try {
+      localStorage.setItem('z2rs.randoSeed', seed.value);
+      localStorage.setItem('z2rs.randoFlags', flags.value);
+    } catch { /* no storage */ }
+    $('randoInfo').textContent = 'Load the ROM again to apply.';
+  };
+  seed.addEventListener('change', save);
+  flags.addEventListener('change', save);
+  $('randoDice').addEventListener('click', () => {
+    const n = new Uint32Array(1);
+    crypto.getRandomValues(n);
+    seed.value = String(n[0] % 1000000000);
+    save();
   });
 }
 // Scanlines over the picture; the choice is remembered per browser.

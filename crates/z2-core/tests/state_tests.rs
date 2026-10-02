@@ -455,3 +455,41 @@ fn rom_state_perf_report() {
         bytes.len()
     );
 }
+
+/// The enhancement runtime counters ride in the snapshot (version 3), and a
+/// version-2 image (no enhancement block) still decodes, with the default.
+#[test]
+fn enh_state_round_trips_and_version_2_images_still_load() {
+    let mut a = synth_game();
+    for &p in &synth_inputs(10, 5) {
+        a.step2(p.0, p.1);
+    }
+    let plain = a.save_state().to_bytes();
+    a.enh_state.frames = 0x0102_0304;
+    a.enh_state.timers[2] = 99;
+    let st = a.save_state();
+    let bytes = st.to_bytes();
+    assert_eq!(&bytes[4..6], &z2_core::state::STATE_VERSION.to_le_bytes());
+    let mut b = synth_game();
+    b.load_state(&GameState::from_bytes(&bytes).expect("decode"));
+    assert_eq!(b.enh_state, a.enh_state);
+
+    // Rebuild the same image as version 2 wrote it: cut the length-prefixed
+    // enhancement blob (it starts with `frames`, the first byte that differs
+    // from the plain image) and patch the version.
+    let first = plain
+        .iter()
+        .zip(&bytes)
+        .position(|(x, y)| x != y)
+        .expect("enh state changes the image");
+    let at = first - 2;
+    let len = usize::from(u16::from_le_bytes([bytes[at], bytes[at + 1]]));
+    let mut v2 = bytes.clone();
+    v2.drain(at..at + 2 + len);
+    v2[4..6].copy_from_slice(&2u16.to_le_bytes());
+    let old = GameState::from_bytes(&v2).expect("version 2 still decodes");
+    let mut c = synth_game();
+    c.enh_state.frames = 7;
+    c.load_state(&old);
+    assert_eq!(c.enh_state, z2_core::enh::EnhState::default());
+}

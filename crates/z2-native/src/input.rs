@@ -47,6 +47,77 @@ pub fn combine_inputs(keyboard: u8, gamepad: u8) -> u8 {
     keyboard | gamepad
 }
 
+/// Opposing-direction filter ("last pressed wins" SOCD cleaning).
+///
+/// A real NES d-pad cannot press Left+Right or Up+Down, and Zelda II
+/// misbehaves when it sees them: with Left+Right held the side-view walk
+/// code reads facing `3` and adds a fixed step to `$70` every frame, so
+/// Link's X speed swings from `+$18` to `$D8` (-40) in four frames and he
+/// slides backwards far faster than he can walk (issue #7). Keyboard
+/// rollover — pressing Right before Left is released — and gamepad
+/// rocking produce exactly that for a frame or two.
+///
+/// Per axis: while both opposing bits are held, only the one pressed most
+/// recently passes; releasing it hands the axis back to the other (still
+/// held) direction. Both pressed on the same frame → neither passes until
+/// one is released (neutral, like a hitbox SOCD). Non-d-pad bits pass
+/// through untouched.
+///
+/// Live input only, one per player, fed once per stepped frame *before*
+/// the pad reaches the game or a netplay session, so recordings and remote
+/// peers see the already-filtered byte. Movie playback and verification
+/// never go through it (TAS movies use Left+Right on purpose).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct OpposingFilter {
+    /// Raw (unfiltered) pad from the previous call.
+    prev: u8,
+    /// Current winner of the Left/Right pair (`0`, `BTN_LEFT` or `BTN_RIGHT`).
+    horizontal: u8,
+    /// Current winner of the Up/Down pair (`0`, `BTN_UP` or `BTN_DOWN`).
+    vertical: u8,
+}
+
+impl OpposingFilter {
+    /// Fresh filter (nothing held).
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Filter one frame's raw pad byte.
+    #[must_use]
+    pub fn apply(&mut self, raw: u8) -> u8 {
+        let newly = raw & !self.prev;
+        self.prev = raw;
+        let h = Self::axis(&mut self.horizontal, raw, newly, BTN_LEFT, BTN_RIGHT);
+        let v = Self::axis(&mut self.vertical, raw, newly, BTN_UP, BTN_DOWN);
+        (raw & !(BTN_LEFT | BTN_RIGHT | BTN_UP | BTN_DOWN)) | h | v
+    }
+
+    /// Forget held state (focus loss, session restart).
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+
+    fn axis(winner: &mut u8, raw: u8, newly: u8, a: u8, b: u8) -> u8 {
+        let both = a | b;
+        let held = raw & both;
+        if held != both {
+            // Zero or one direction held: pass it and remember it.
+            *winner = held;
+            return held;
+        }
+        match newly & both {
+            // Exactly one just went down: it is the most recent press.
+            n if n == a || n == b => *winner = n,
+            // Both at once: no order to go by — neutral.
+            n if n == both => *winner = 0,
+            // Neither is new: keep the standing winner.
+            _ => {}
+        }
+        *winner
+    }
+}
+
 /// Set (`pressed=true`) or clear a button bit.
 #[must_use]
 pub fn with_button(mut pad: u8, bit: u8, pressed: bool) -> u8 {
@@ -409,5 +480,80 @@ mod tests {
         assert_eq!(axis_to_bits(0.0, 0.9, 0.5), BTN_UP);
         assert_eq!(axis_to_bits(0.0, -0.9, 0.5), BTN_DOWN);
         assert_eq!(axis_to_bits(0.1, 0.1, 0.5), 0);
+    }
+
+    #[test]
+    fn opposing_filter_last_pressed_wins_and_release_hands_back() {
+        let mut f = OpposingFilter::new();
+        assert_eq!(f.apply(BTN_RIGHT), BTN_RIGHT);
+        // Rollover: Left goes down while Right is still held.
+        assert_eq!(f.apply(BTN_RIGHT | BTN_LEFT), BTN_LEFT);
+        assert_eq!(f.apply(BTN_RIGHT | BTN_LEFT), BTN_LEFT, "winner is sticky");
+        // Releasing the winner returns the axis to the still-held key.
+        assert_eq!(f.apply(BTN_RIGHT), BTN_RIGHT);
+        // And the other order.
+        assert_eq!(f.apply(BTN_RIGHT | BTN_LEFT), BTN_LEFT);
+        assert_eq!(f.apply(BTN_LEFT), BTN_LEFT);
+        assert_eq!(f.apply(BTN_LEFT | BTN_RIGHT), BTN_RIGHT);
+        assert_eq!(f.apply(0), 0);
+    }
+
+    #[test]
+    fn opposing_filter_vertical_axis_and_other_bits_independent() {
+        let mut f = OpposingFilter::new();
+        assert_eq!(f.apply(BTN_UP | BTN_A), BTN_UP | BTN_A);
+        assert_eq!(
+            f.apply(BTN_UP | BTN_DOWN | BTN_A | BTN_RIGHT),
+            BTN_DOWN | BTN_A | BTN_RIGHT,
+            "Down is newest; A and Right pass untouched"
+        );
+        // Horizontal rollover does not disturb the vertical winner.
+        assert_eq!(
+            f.apply(BTN_UP | BTN_DOWN | BTN_RIGHT | BTN_LEFT | BTN_B),
+            BTN_DOWN | BTN_LEFT | BTN_B
+        );
+        assert_eq!(f.apply(BTN_UP | BTN_RIGHT), BTN_UP | BTN_RIGHT);
+        // Non-d-pad bits are never touched.
+        assert_eq!(f.apply(BTN_A | BTN_B | BTN_SELECT | BTN_START), 0x0F);
+    }
+
+    #[test]
+    fn opposing_filter_simultaneous_press_is_neutral_until_one_releases() {
+        let mut f = OpposingFilter::new();
+        assert_eq!(f.apply(BTN_LEFT | BTN_RIGHT), 0);
+        assert_eq!(f.apply(BTN_LEFT | BTN_RIGHT), 0);
+        assert_eq!(f.apply(BTN_LEFT), BTN_LEFT);
+        f.reset();
+        assert_eq!(f.apply(BTN_UP | BTN_DOWN), 0);
+    }
+
+    #[test]
+    fn opposing_filter_never_emits_opposites() {
+        // Exhaustive over a pseudo-random walk of all 256 pad values.
+        let mut f = OpposingFilter::new();
+        let mut x: u32 = 0x1234_5678;
+        for _ in 0..10_000 {
+            x ^= x << 13;
+            x ^= x >> 17;
+            x ^= x << 5;
+            let raw = (x & 0xFF) as u8;
+            let out = f.apply(raw);
+            assert_ne!(out & (BTN_LEFT | BTN_RIGHT), BTN_LEFT | BTN_RIGHT);
+            assert_ne!(out & (BTN_UP | BTN_DOWN), BTN_UP | BTN_DOWN);
+            assert_eq!(out & !raw, 0, "filter only ever removes bits");
+            assert_eq!(out & 0x0F, raw & 0x0F);
+        }
+    }
+
+    #[test]
+    fn opposing_filters_are_per_player() {
+        let (mut p1, mut p2) = (OpposingFilter::new(), OpposingFilter::new());
+        assert_eq!(p1.apply(BTN_RIGHT), BTN_RIGHT);
+        assert_eq!(p2.apply(BTN_LEFT), BTN_LEFT);
+        // Each pad resolves its own rollover from its own history.
+        assert_eq!(p1.apply(BTN_RIGHT | BTN_LEFT), BTN_LEFT);
+        assert_eq!(p2.apply(BTN_LEFT | BTN_RIGHT), BTN_RIGHT);
+        assert_eq!(p1.apply(BTN_RIGHT), BTN_RIGHT);
+        assert_eq!(p2.apply(BTN_RIGHT | BTN_LEFT), BTN_RIGHT);
     }
 }

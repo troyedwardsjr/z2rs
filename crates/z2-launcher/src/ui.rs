@@ -32,6 +32,28 @@ pub enum Action {
     OpenPacksFolder,
     /// Read the pack list again after packs were added.
     RescanPacks,
+    /// Pick the randomizer sprite IPS patch.
+    BrowseSpriteIps,
+    /// Pick where the randomizer spoiler log goes.
+    BrowseSpoiler,
+}
+
+/// Top-level tab.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Tab {
+    /// ROM, display, packs and players.
+    #[default]
+    Play,
+    /// ZALiA-inspired enhancements (runtime options, including the light
+    /// "Randomizer & start" group).
+    Enhancements,
+    /// The ROM randomizer: seed and flags (`z2-rando`).
+    Randomizer,
+}
+
+impl Tab {
+    /// Every tab, in strip order.
+    pub const ALL: [Tab; 3] = [Tab::Play, Tab::Enhancements, Tab::Randomizer];
 }
 
 /// Launcher state: settings plus the running game, if any.
@@ -50,8 +72,24 @@ pub struct LauncherState {
     pub last_exit: Option<GameExit>,
     /// Latest error from the launcher itself (spawn failure, save failure…).
     pub error: Option<String>,
+    /// What the game's graphics-backend crash guard says
+    /// ([`game::gpu_guard_notice`]), read at start and after each run.
+    pub gpu_notice: Option<String>,
     /// Give Play keyboard focus the first time it is enabled, so Enter starts.
     focus_play: bool,
+    /// Selected top-level tab.
+    pub tab: Tab,
+    /// The flag-string text box (may hold a string being typed).
+    pub flag_text: String,
+    /// Why [`Self::flag_text`] does not parse, if it does not.
+    pub flag_error: Option<String>,
+    /// Flag string the widgets produced last frame, to notice widget edits.
+    last_flags: String,
+    /// Open every randomizer section the first time they are drawn (tests).
+    pub rando_expand: bool,
+    /// Open every enhancement group (the headless render test uses it so
+    /// every control is drawn).
+    pub(crate) enh_force_open: bool,
 }
 
 impl LauncherState {
@@ -60,7 +98,7 @@ impl LauncherState {
         let packs = scan_packs(&data_dir.join("packs"));
         let hd = settings.hd_pack.trim();
         let hd_custom = !hd.is_empty() && !packs.iter().any(|p| p.path.as_path() == Path::new(hd));
-        LauncherState {
+        let mut state = LauncherState {
             settings,
             data_dir,
             packs,
@@ -68,8 +106,24 @@ impl LauncherState {
             game: None,
             last_exit: None,
             error: None,
+            gpu_notice: None,
             focus_play: true,
-        }
+            tab: Tab::Play,
+            flag_text: String::new(),
+            flag_error: None,
+            last_flags: String::new(),
+            rando_expand: false,
+            enh_force_open: false,
+        };
+        state.refresh_gpu_notice();
+        state
+    }
+
+    /// Read the game's graphics-backend guard file again.
+    pub fn refresh_gpu_notice(&mut self) {
+        self.gpu_notice = std::fs::read_to_string(self.data_dir.join(game::GPU_GUARD_FILE_NAME))
+            .ok()
+            .and_then(|t| game::gpu_guard_notice(&t));
     }
 
     /// Read `<data-dir>/packs/` again (after the player unzipped a pack).
@@ -106,6 +160,7 @@ impl LauncherState {
             if let Some(exit) = g.poll() {
                 self.game = None;
                 self.last_exit = Some(exit);
+                self.refresh_gpu_notice();
             }
         }
     }
@@ -155,21 +210,228 @@ pub fn launcher_ui(ui: &mut egui::Ui, state: &mut LauncherState) -> Option<Actio
         .show(ui, |ui| play_bar(ui, state, &mut action));
 
     egui::CentralPanel::default_margins().show(ui, |ui| {
+        ui.horizontal(|ui| {
+            ui.selectable_value(&mut state.tab, Tab::Play, RichText::new("Play").size(16.0));
+            let label = if state.settings.enhancements.any_gameplay_active() {
+                "Enhancements (on)"
+            } else {
+                "Enhancements"
+            };
+            ui.selectable_value(
+                &mut state.tab,
+                Tab::Enhancements,
+                RichText::new(label).size(16.0),
+            );
+            let label = if state.settings.rando.enabled {
+                "ROM randomizer (on)"
+            } else {
+                "ROM randomizer"
+            };
+            ui.selectable_value(
+                &mut state.tab,
+                Tab::Randomizer,
+                RichText::new(label).size(16.0),
+            );
+        });
+        ui.separator();
         egui::ScrollArea::vertical()
             .auto_shrink([false, false])
-            .show(ui, |ui| {
-                rom_section(ui, state, &mut action);
-                display_section(ui, &mut state.settings);
-                hd_section(ui, state, &mut action);
-                players_section(ui, &mut state.settings);
-                ui.add_space(6.0);
-                command_section(ui, state);
-                controls_section(ui, state, &mut action);
-                advanced_section(ui, state, &mut action);
-                ui.add_space(8.0);
+            .show(ui, |ui| match state.tab {
+                Tab::Play => {
+                    rom_section(ui, state, &mut action);
+                    display_section(ui, &mut state.settings);
+                    hd_section(ui, state, &mut action);
+                    players_section(ui, &mut state.settings);
+                    ui.add_space(6.0);
+                    command_section(ui, state);
+                    controls_section(ui, state, &mut action);
+                    advanced_section(ui, state, &mut action);
+                    ui.add_space(8.0);
+                }
+                Tab::Enhancements => {
+                    crate::enh_ui::enhancements_section(
+                        ui,
+                        &mut state.settings,
+                        state.enh_force_open,
+                    );
+                    ui.add_space(8.0);
+                }
+                Tab::Randomizer => {
+                    randomizer_tab(ui, state, &mut action);
+                    ui.add_space(8.0);
+                }
             });
     });
     action
+}
+
+/// Keep the flag-string box in step with the widgets: when the options
+/// changed since the last frame (a widget or a preset), show their string.
+fn sync_flag_text(state: &mut LauncherState) {
+    let current = state.settings.rando.flags.to_flag_string();
+    if current != state.last_flags {
+        state.flag_text = current.clone();
+        state.flag_error = None;
+        state.last_flags = current;
+    }
+}
+
+fn randomizer_tab(ui: &mut egui::Ui, state: &mut LauncherState, action: &mut Option<Action>) {
+    use z2_rando::flags::{Flags, Preset};
+    sync_flag_text(state);
+    section(ui, "ROM randomizer", |ui| {
+        ui.checkbox(
+            &mut state.settings.rando.enabled,
+            "Play a randomized game (generated from your ROM each time you start)",
+        );
+        hint(
+            ui,
+            "Rebuilds the world (map, palaces, items, enemies) from a seed. The Enhancements \
+             tab's \"Randomizer & start\" group is a lighter runtime option: its start loadout, \
+             scaling and palettes apply on top of a randomized game, but its item shuffle is \
+             turned off while this is on.",
+        );
+        egui::Grid::new("rando-head")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Seed");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.settings.rando.seed)
+                            .hint_text("any text")
+                            .desired_width(200.0),
+                    )
+                    .on_hover_text("The same seed and options always give the same game.");
+                    if ui.button("Random seed").clicked() {
+                        state.settings.rando.seed = crate::settings::random_seed();
+                    }
+                });
+                ui.end_row();
+
+                ui.label("Preset");
+                let r = &mut state.settings.rando;
+                let current = Preset::detect(&r.flags);
+                egui::ComboBox::from_id_salt("rando-preset")
+                    .selected_text(current.map_or("Custom", Preset::label))
+                    .width(220.0)
+                    .show_ui(ui, |ui| {
+                        for p in Preset::ALL {
+                            if ui
+                                .selectable_label(current == Some(*p), p.label())
+                                .on_hover_text(p.description())
+                                .clicked()
+                            {
+                                r.flags = p.flags();
+                                r.preset = Some(*p);
+                            }
+                        }
+                    });
+                ui.end_row();
+
+                ui.label("Flags");
+                let resp = ui.add(
+                    egui::TextEdit::singleline(&mut state.flag_text)
+                        .font(egui::TextStyle::Monospace)
+                        .desired_width(f32::INFINITY),
+                );
+                if resp.changed() {
+                    match Flags::from_flag_string(&state.flag_text) {
+                        Ok(f) => {
+                            state.last_flags = f.to_flag_string();
+                            state.settings.rando.flags = f;
+                            state.flag_error = None;
+                        }
+                        Err(e) => state.flag_error = Some(e.to_string()),
+                    }
+                }
+                ui.end_row();
+            });
+        if let Some(err) = &state.flag_error {
+            ui.label(
+                RichText::new(format!("Flag string not applied: {err}"))
+                    .color(ui.visuals().error_fg_color),
+            );
+        }
+        if ui.button("Copy flag string").clicked() {
+            ui.ctx()
+                .copy_text(state.settings.rando.flags.to_flag_string());
+        }
+        hint(
+            ui,
+            "Paste a flag string to load someone's options, or change the options below and share the string. Racers need the same seed, flags and z2rs version.",
+        );
+        ui.add_space(4.0);
+        egui::Grid::new("rando-files")
+            .num_columns(2)
+            .spacing([12.0, 8.0])
+            .show(ui, |ui| {
+                ui.label("Spoiler log");
+                ui.horizontal(|ui| {
+                    ui.add(
+                        egui::TextEdit::singleline(&mut state.settings.rando.spoiler_path)
+                            .hint_text("none")
+                            .desired_width(260.0),
+                    );
+                    if ui.button("Choose…").clicked() {
+                        *action = Some(Action::BrowseSpoiler);
+                    }
+                });
+                ui.end_row();
+            });
+    });
+    ui.add_space(6.0);
+    let open = state.rando_expand;
+    let sprite = &mut state.settings.rando.sprite_ips;
+    let f = &mut state.settings.rando.flags;
+    let titles = crate::rando_ui::MODULE_TITLES;
+    let header = |ui: &mut egui::Ui, i: usize, body: &mut dyn FnMut(&mut egui::Ui)| {
+        egui::CollapsingHeader::new(titles[i])
+            .id_salt(("rando-module", i))
+            .default_open(open)
+            .show(ui, |ui| body(ui));
+    };
+    header(ui, 0, &mut |ui| {
+        crate::rando_ui::start::ui(ui, &mut f.start)
+    });
+    header(ui, 1, &mut |ui| {
+        crate::rando_ui::overworld::ui(ui, &mut f.overworld)
+    });
+    header(ui, 2, &mut |ui| {
+        crate::rando_ui::palaces::ui(ui, &mut f.palaces)
+    });
+    header(ui, 3, &mut |ui| {
+        crate::rando_ui::items::ui(ui, &mut f.items)
+    });
+    header(ui, 4, &mut |ui| {
+        crate::rando_ui::enemies::ui(ui, &mut f.enemies)
+    });
+    header(ui, 5, &mut |ui| {
+        crate::rando_ui::stats::ui(ui, &mut f.stats)
+    });
+    header(ui, 6, &mut |ui| {
+        crate::rando_ui::spells::ui(ui, &mut f.spells)
+    });
+    header(ui, 7, &mut |ui| {
+        crate::rando_ui::drops::ui(ui, &mut f.drops)
+    });
+    header(ui, 8, &mut |ui| {
+        crate::rando_ui::hints::ui(ui, &mut f.hints)
+    });
+    header(ui, 9, &mut |ui| {
+        crate::rando_ui::towns::ui(ui, &mut f.towns)
+    });
+    header(ui, 10, &mut |ui| crate::rando_ui::qol::ui(ui, &mut f.qol));
+    header(ui, 11, &mut |ui| {
+        if crate::rando_ui::cosmetic::sprite_patch(ui, sprite) {
+            *action = Some(Action::BrowseSpriteIps);
+        }
+        crate::rando_ui::cosmetic::ui(ui, &mut f.cosmetic)
+    });
+    hint(
+        ui,
+        "A few options are kept in flag strings but have no effect yet (their tooltips say so); README.md lists what each option does.",
+    );
 }
 
 fn rom_section(ui: &mut egui::Ui, state: &mut LauncherState, action: &mut Option<Action>) {
@@ -396,7 +658,8 @@ fn online_fields(ui: &mut egui::Ui, s: &mut Settings) {
     hint(
         ui,
         "Both players pick the same room name and use the same ROM, with matching \
-         widescreen and \"Enemies use the wide screen\" settings. The host is player 1.",
+         widescreen, \"Enemies use the wide screen\" and gameplay enhancement settings. \
+         The host is player 1.",
     );
     egui::CollapsingHeader::new("Advanced online settings")
         .id_salt("online-advanced")
@@ -546,6 +809,23 @@ fn play_bar(ui: &mut egui::Ui, state: &mut LauncherState, action: &mut Option<Ac
     }
     if let Some(exit) = state.last_exit.as_ref().filter(|e| !e.success) {
         ui.label(RichText::new(format!("The game stopped ({}).", exit.status)).color(error_color));
+        if let Some(gpu) = &exit.gpu_hint {
+            ui.label(RichText::new(gpu).color(error_color));
+        }
+        if let Some(why) = exit.explanation {
+            ui.label(RichText::new(why).color(error_color));
+            hint(
+                ui,
+                &format!(
+                    "Please attach {} and {} to a bug report.",
+                    state
+                        .data_dir
+                        .join(game::GAME_CRASH_LOG_FILE_NAME)
+                        .display(),
+                    state.data_dir.join(game::GAME_LOG_FILE_NAME).display()
+                ),
+            );
+        }
         if !exit.tail.is_empty() {
             egui::ScrollArea::vertical()
                 .max_height(150.0)
@@ -561,6 +841,9 @@ fn play_bar(ui: &mut egui::Ui, state: &mut LauncherState, action: &mut Option<Ac
         }
     }
     if !state.game_running() {
+        if let Some(n) = &state.gpu_notice {
+            ui.label(RichText::new(n).color(ui.visuals().warn_fg_color));
+        }
         for p in &problems {
             ui.label(RichText::new(format!("• {p}")).color(ui.visuals().warn_fg_color));
         }
@@ -616,24 +899,71 @@ mod tests {
             Multiplayer::Host,
             Multiplayer::Join,
         ] {
-            for ws in [Widescreen::Off, Widescreen::W16x9, Widescreen::W21x9] {
-                let settings = Settings {
+            for (ws, zalia) in [
+                (Widescreen::Off, false),
+                (Widescreen::W16x9, true),
+                (Widescreen::W21x9, false),
+            ] {
+                let mut settings = Settings {
                     multiplayer: mp,
                     widescreen: ws,
                     hd_pack: "/no/such/pack".into(),
                     ..Settings::default()
                 };
-                let mut state = LauncherState::new(settings, dir.clone());
-                assert!(state.hd_custom, "unknown pack path shows as custom");
-                for _ in 0..2 {
-                    let mut action = None;
-                    let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
-                        action = launcher_ui(ui, &mut state);
-                    });
-                    out.textures_delta.clear();
-                    assert_eq!(action, None);
+                if zalia {
+                    settings.enhancements = z2_core::enh::Enhancements::zalia_preset();
+                    settings.display_enh = z2_core::enh::DisplayEnh::zalia_preset();
+                    settings.display_enh.effects_enabled = true;
                 }
+                let before = settings.clone();
+                let mut state = LauncherState::new(settings, dir.clone());
+                // Every enhancement group open, so every control renders.
+                state.enh_force_open = zalia || mp == Multiplayer::Single;
+                assert!(state.hd_custom, "unknown pack path shows as custom");
+                for tab in Tab::ALL {
+                    state.tab = tab;
+                    for _ in 0..2 {
+                        let mut action = None;
+                        let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                            action = launcher_ui(ui, &mut state);
+                        });
+                        out.textures_delta.clear();
+                        assert_eq!(action, None);
+                    }
+                }
+                assert_eq!(
+                    state.settings, before,
+                    "an idle frame leaves the settings alone"
+                );
             }
+        }
+    }
+
+    /// The Randomizer tab renders headless with every section open, for each
+    /// preset, and the flag box follows the widgets.
+    #[test]
+    fn randomizer_tab_renders_headless() {
+        use z2_rando::flags::Preset;
+        let dir = std::env::temp_dir().join(format!("z2-launcher-rando-{}", std::process::id()));
+        let ctx = egui::Context::default();
+        crate::app::apply_style(&ctx);
+        for p in Preset::ALL {
+            let mut settings = Settings::default();
+            settings.rando.enabled = true;
+            settings.rando.flags = p.flags();
+            let mut state = LauncherState::new(settings, dir.clone());
+            state.tab = Tab::Randomizer;
+            state.rando_expand = true;
+            for _ in 0..2 {
+                let mut action = None;
+                let mut out = ctx.run_ui(egui::RawInput::default(), |ui| {
+                    action = launcher_ui(ui, &mut state);
+                });
+                out.textures_delta.clear();
+                assert_eq!(action, None);
+            }
+            assert_eq!(state.flag_text, p.flags().to_flag_string());
+            assert!(state.flag_error.is_none());
         }
     }
 

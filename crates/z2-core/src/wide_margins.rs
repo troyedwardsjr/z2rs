@@ -223,7 +223,8 @@ impl<'a> SideviewSource<'a> {
 /// Overworld decoder over the WRAM RLE map.
 #[derive(Debug, Clone, Copy)]
 pub struct OverworldSource<'a> {
-    /// RLE blob (`wram[$7C00..$8000]`).
+    /// RLE window: `wram[$7000..$8000]` when the game's row table is used,
+    /// else `wram[$7C00..$8000]`.
     pub blob: &'a [u8],
     /// Row start offsets into `blob`.
     pub rows: [u16; overworld_map::ROW_COUNT],
@@ -233,15 +234,40 @@ pub struct OverworldSource<'a> {
 
 impl<'a> OverworldSource<'a> {
     /// Build from post-frame RAM/WRAM.
+    ///
+    /// The rows come from the game's own row-start table at `$6000` (75
+    /// little-endian addresses) when every entry points into `$7000-$7FFF`,
+    /// so a map copied somewhere else in battery RAM (the randomizer's
+    /// larger overworlds start at `$7A00`) is still drawn right. Otherwise
+    /// they are rebuilt from the vanilla `$7C00` window, as the game would.
     #[must_use]
     pub fn from_state(ram: &[u8], wram: &'a [u8]) -> Self {
+        let region_index = ram.get(usize::from(ADDR_OW_REGION)).copied().unwrap_or(0);
+        const TABLE_LO: usize = 0x7000;
+        let mut rows = [0u16; overworld_map::ROW_COUNT];
+        let table_ok = wram.len() >= 0x2000
+            && (0..overworld_map::ROW_COUNT).all(|r| {
+                let a = usize::from(wram[2 * r]) | (usize::from(wram[2 * r + 1]) << 8);
+                (TABLE_LO..0x8000).contains(&a)
+            });
+        if table_ok {
+            for (r, row) in rows.iter_mut().enumerate() {
+                let a = usize::from(wram[2 * r]) | (usize::from(wram[2 * r + 1]) << 8);
+                *row = (a - TABLE_LO) as u16;
+            }
+            return Self {
+                blob: &wram[TABLE_LO - 0x6000..0x2000],
+                rows,
+                region_index,
+            };
+        }
         let lo = overworld_map::WRAM_RLE_BASE - 0x6000;
         let hi = (overworld_map::WRAM_RLE_END - 0x6000).min(wram.len());
         let blob = wram.get(lo..hi).unwrap_or(&[]);
         Self {
             blob,
             rows: overworld_map::build_row_offsets(blob),
-            region_index: ram.get(usize::from(ADDR_OW_REGION)).copied().unwrap_or(0),
+            region_index,
         }
     }
 

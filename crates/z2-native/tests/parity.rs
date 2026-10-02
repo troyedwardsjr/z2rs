@@ -20,8 +20,8 @@ fn headless_and_windowed_step_the_same_game_frames() {
     assert_eq!(n, 30);
     assert_eq!(emu.game.frame_count(), frames);
     assert_eq!(ring.depth(), depth);
-    // 30 frames ≈ 30*735 ±30 jitter samples of PCM.
-    assert!((ring.depth() as u64).abs_diff(30 * 735) <= 30);
+    // 30 frames at 60.0988 Hz: 30 * 44100 / 60.0988 ≈ 22013.8 samples.
+    assert!((ring.depth() as u64).abs_diff(22_014) <= 2);
 }
 
 #[test]

@@ -9,10 +9,12 @@ members = [
     "crates/z2-native",
     "crates/z2-android",
     "crates/z2-launcher",
+    "crates/z2-enh-ui",
     "crates/z2-web",
     "crates/z2-net",
     "crates/z2-debug",
     "crates/z2-render",
+    "crates/z2-rando",
     "tools/xtask",
     "tools/z2-signal",
 ]

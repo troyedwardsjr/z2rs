@@ -57,6 +57,9 @@ fn build(body: &[u8]) -> Emu {
             wide_gameplay: None,
             record: false,
             margin_sprites: false,
+            rando: None,
+            no_traps: false,
+            enhancements: Default::default(),
         },
     )
     .expect("emulator builds from the verified ROM")

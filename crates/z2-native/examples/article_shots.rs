@@ -348,6 +348,7 @@ impl Displays {
                     None
                 },
                 margin_sprites: false,
+                display_enh: Default::default(),
             })?;
             self.map.insert(variant.to_string(), d);
         }
@@ -624,6 +625,9 @@ fn run() -> Result<(), String> {
             wide_gameplay: None,
             record: true,
             margin_sprites: false,
+            rando: None,
+            no_traps: false,
+            enhancements: Default::default(),
         },
     )?;
     // Graft target: co-op registered before reset, as the frontends do.
@@ -635,6 +639,9 @@ fn run() -> Result<(), String> {
             wide_gameplay: None,
             record: true,
             margin_sprites: false,
+            rando: None,
+            no_traps: false,
+            enhancements: Default::default(),
         },
     )?;
     if chrbug {

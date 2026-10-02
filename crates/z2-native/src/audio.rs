@@ -534,11 +534,24 @@ pub fn open_output_stream(shared: &SharedAudio) -> Result<(cpal::Stream, u32), S
         eprintln!("z2 audio: {m} (running silent; check the OS output device)");
         m
     })?;
+    crate::diag::breadcrumb(format_args!(
+        "audio: host {:?}, device '{}'",
+        host.id(),
+        device
+            .name()
+            .unwrap_or_else(|e| format!("<name unavailable: {e}>"))
+    ));
     let default_supported = device.default_output_config().map_err(|e| {
         let m = format!("default output config: {e}");
         eprintln!("z2 audio: {m}");
         m
     })?;
+    crate::diag::breadcrumb(format_args!(
+        "audio: device default {} Hz, {} ch, {:?}",
+        default_supported.sample_rate().0,
+        default_supported.channels(),
+        default_supported.sample_format()
+    ));
     let want_rate = shared.rate();
     let default_config = default_supported.config();
     let default_rate = default_config.sample_rate.0;
@@ -605,6 +618,9 @@ pub fn open_output_stream(shared: &SharedAudio) -> Result<(cpal::Stream, u32), S
         eprintln!("z2 audio: resampling game {want_rate} Hz -> device {device_rate} Hz");
     }
     shared.prime_silence();
+    crate::diag::breadcrumb(format_args!(
+        "audio: stream built at {device_rate} Hz; starting"
+    ));
     stream.play().map_err(|e| {
         let m = format!("start output stream: {e}");
         eprintln!("z2 audio: {m}");
@@ -629,9 +645,14 @@ fn build_stream(
         let err_shared = shared.clone();
         move |e| {
             err_shared.note_stream_error();
-            eprintln!("z2 audio stream error: {e}");
+            crate::diag::breadcrumb(format_args!("audio stream error: {e}"));
         }
     };
+    crate::diag::breadcrumb(format_args!(
+        "audio: building a {device_rate} Hz, {} ch, {:?} stream",
+        config.channels,
+        supported.sample_format()
+    ));
     let built = match supported.sample_format() {
         cpal::SampleFormat::F32 => {
             let shared_cb = shared.clone();

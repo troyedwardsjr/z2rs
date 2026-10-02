@@ -482,3 +482,336 @@ fn overworld_edge_strips_follow_the_map() {
         "the recorded strip tiles were expected to be the stale ones"
     );
 }
+
+/// Overworld frames of the any% movie replayed by the seam tests.
+const SEAM_FRAMES: usize = 20_000;
+
+/// Window-x boxes `[a, b)` of every sprite row on line `y`, recorded or
+/// margin.
+fn sprite_boxes(rec: &FrameRecord, margins: &Margins, y: usize) -> Vec<(i32, i32)> {
+    let line = rec.line(y);
+    let mut boxes: Vec<(i32, i32)> = rec
+        .sprites_on(y)
+        .iter()
+        .map(|s| (i32::from(s.x), i32::from(s.x) + 8))
+        .collect();
+    boxes.extend(
+        margins
+            .sprites
+            .iter()
+            .filter(|s| z2_ppu::margin_sprite_on_line(line, y, s).is_some())
+            .map(|s| (i32::from(s.x), i32::from(s.x) + 8)),
+    );
+    boxes
+}
+
+/// The flashing "sticks" of the Discord report: with `fine_x != 0`, part of
+/// the half-written edge slot 31 (or slot 1) lies *outside* the hidden 8
+/// columns, and the NES draws it there in the wrong tiles or palette. On a
+/// TV that is a sliver beside the black bar; next to a painted margin it is
+/// a column of wrong scenery flashing in the middle of the picture.
+///
+/// Every background pixel the wide image shows in the bands around both
+/// seams (window x -16..24 and 232..272) is compared with the colour the
+/// NES draws at the same world pixel once it has scrolled into the settled
+/// interior (window x 24..232). The wide image must agree; the raw frame in
+/// the in-window part of those bands is tallied alongside and is expected
+/// to disagree measurably (the root cause).
+#[test]
+fn overworld_seam_columns_are_stable_across_a_scroll() {
+    let Some((mut g, pads)) = setup() else {
+        return;
+    };
+    g.set_record(true);
+    let mut margins = Margins::new(11);
+    margins.fill_left_clip = true;
+    margins.fill_right_clip = true;
+    let mut wide = WideFrame::new(11);
+    let mp = 88i32;
+    // (world x, map row, parity, fine y) -> [(frame, wide colour, raw colour
+    // or 0xFF where the raw frame has no pixel)]
+    type Shown = (usize, u8, u8);
+    let mut preds: HashMap<(i32, i32, u8, u8), Vec<Shown>> = HashMap::new();
+    let mut prev_map: Vec<u8> = Vec::new();
+    let (mut compared, mut wide_ok, mut raw_compared, mut raw_ok) = (0u64, 0u64, 0u64, 0u64);
+    let mut first_miss: Vec<String> = Vec::new();
+    for (t, &pad) in pads.iter().enumerate().take(pads.len().min(SEAM_FRAMES)) {
+        g.step(pad);
+        if g.ram[usize::from(ADDR_GAME_MODE)] != MODE_OVERWORLD {
+            preds.clear();
+            continue;
+        }
+        if g.wram[0x1C00..] != prev_map[..] {
+            preds.clear();
+            prev_map = g.wram[0x1C00..].to_vec();
+        }
+        if !g.compose_wide(11, &mut margins, &mut wide) {
+            continue;
+        }
+        let rec: FrameRecord = g.frame_record().expect("record on").clone();
+        let frame = g.frame_indexed();
+        for y in 0..240 {
+            let line = rec.line(y);
+            if margins.lines[y].fill != MarginFill::Tiles || line.split {
+                continue;
+            }
+            let wl = overworld_world_left(&g.ram, line);
+            let (r, parity) = overworld_row(&g.ram, line, y);
+            let fy = FrameRecord::fine_y(line);
+            let boxes = sprite_boxes(&rec, &margins, y);
+            let covered = |wx: i32| boxes.iter().any(|&(a, b)| (a..b).contains(&wx));
+            // Settled interior: check what the seams showed earlier.
+            for wx in 24..232 {
+                if covered(wx) {
+                    continue;
+                }
+                let Some(shown) = preds.get_mut(&(wl + wx, r, parity, fy)) else {
+                    continue;
+                };
+                let actual = frame[y * WIDTH + wx as usize];
+                for &(f, wc, rc) in shown.iter() {
+                    if f == t || f + MAX_AGE < t {
+                        continue;
+                    }
+                    compared += 1;
+                    if wc == actual {
+                        wide_ok += 1;
+                    } else if first_miss.len() < 8 {
+                        first_miss.push(format!(
+                            "frame {t} (seam at {f}) y {y} world x {} wide {wc:02X} settled {actual:02X}",
+                            wl + wx
+                        ));
+                    }
+                    if rc != 0xFF {
+                        raw_compared += 1;
+                        raw_ok += u64::from(rc == actual);
+                    }
+                }
+                shown.retain(|&(f, ..)| f == t);
+            }
+            // Seam bands shown this frame.
+            for wx in (-16..24).chain(232..272) {
+                if covered(wx) {
+                    continue;
+                }
+                let wc = wide.pixels[y * wide.width + (wx + mp) as usize];
+                let rc = if (8..24).contains(&wx) || (232..248).contains(&wx) {
+                    frame[y * WIDTH + wx as usize]
+                } else {
+                    0xFF
+                };
+                preds
+                    .entry((wl + wx, r, parity, fy))
+                    .or_default()
+                    .push((t, wc, rc));
+            }
+        }
+    }
+    let rate = |ok: u64, n: u64| ok as f64 / n.max(1) as f64;
+    eprintln!(
+        "overworld seams vs settled interior: wide {wide_ok}/{compared} = {:.5}, raw frame (in-window bands) {raw_ok}/{raw_compared} = {:.5}",
+        rate(wide_ok, compared),
+        rate(raw_ok, raw_compared)
+    );
+    for m in &first_miss {
+        eprintln!("  miss: {m}");
+    }
+    assert!(compared > 100_000, "too few seam comparisons ({compared})");
+    assert!(
+        rate(wide_ok, compared) >= 0.9995,
+        "seam/world match rate {:.5}",
+        rate(wide_ok, compared)
+    );
+    assert!(
+        raw_compared - raw_ok > 1_000,
+        "the raw frame was expected to show stale edge-slot columns ({} misses)",
+        raw_compared - raw_ok
+    );
+}
+
+/// One 8x16 blob half on screen: window x of its left column, its top line,
+/// and whether the PPU drew it (`oam`) or it is a margin sprite.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+struct Half {
+    x: i32,
+    top: usize,
+    oam: bool,
+}
+
+/// Expected opaque pixels `(window x, colour)` of one sprite row whose left
+/// column is at `x`.
+fn row_pixels(
+    chr: &[u8],
+    line: &z2_ppu::LineRecord,
+    s: &z2_ppu::SpriteRef,
+    x: i32,
+) -> Vec<(i32, u8)> {
+    let id = z2_ppu::BgTileId {
+        page: s.page,
+        tile: s.tile,
+        fine_y: s.fine_row & 7,
+        fetched: true,
+        ..z2_ppu::BgTileId::NONE
+    };
+    (0..8u8)
+        .filter_map(|dx| {
+            let col = if s.flip_h { 7 - dx } else { dx };
+            z2_ppu::chr_sub(chr, id, col).filter(|&v| v != 0).map(|v| {
+                let c = line.palette_entry(0x10 + usize::from(s.pal & 3) * 4 + usize::from(v));
+                (x + i32::from(dx), c)
+            })
+        })
+        .collect()
+}
+
+/// Overworld encounter blobs crossing the original picture edges must stay
+/// whole in the wide image. Before the fix they vanished there: the edge
+/// fills repainted x 0-7 and 248-255 with background only (a blob's OAM
+/// half there was clipped or under the mask), wide gameplay hid a blob's
+/// whole OAM entry once it passed the edge (so the half still inside the
+/// window was drawn by nobody), and its margin half was latched one frame
+/// ahead of its OAM half after lag frames (the blob split in two).
+///
+/// Every opaque pixel of every blob half the frame shows (PPU halves from
+/// the record, OAM 32-63, and margin halves) must be painted in its sprite
+/// colour, and every half must sit next to its partner. Runs with wide
+/// gameplay off (the ROM's own despawn) and on (the interactive default).
+#[test]
+fn overworld_blobs_stay_whole_across_the_picture_edges() {
+    for wide_gameplay in [None, Some(11u8)] {
+        let Some((_, pads)) = setup() else {
+            return;
+        };
+        let raw = common::rom_bytes("wide_margins_rom").expect("ROM checked by setup");
+        let mut g = Game::from_ines(&raw).expect("ROM");
+        register_all_groups(&mut g);
+        g.set_wide_gameplay(wide_gameplay);
+        g.reset();
+        g.set_record(true);
+        let chr = g.chr.clone();
+        let mut margins = Margins::new(11);
+        margins.fill_left_clip = true;
+        margins.fill_right_clip = true;
+        margins.fill_left_sprites = true;
+        let mut wide = WideFrame::new(11);
+        let mp = 88i32;
+        let (mut edge_n, mut edge_ok, mut mid_n, mut mid_ok) = (0u64, 0u64, 0u64, 0u64);
+        let (mut halves_n, mut unpaired) = (0u64, 0u64);
+        let mut first_miss: Vec<String> = Vec::new();
+        for (t, &pad) in pads.iter().enumerate().take(pads.len().min(SEAM_FRAMES)) {
+            g.step(pad);
+            if g.ram[usize::from(ADDR_GAME_MODE)] != MODE_OVERWORLD {
+                continue;
+            }
+            if !g.compose_wide(11, &mut margins, &mut wide) {
+                continue;
+            }
+            let rec = g.frame_record().expect("record on");
+            let mut halves: Vec<Half> = Vec::new();
+            for y in 0..240 {
+                let line = rec.line(y);
+                if margins.lines[y].fill != MarginFill::Tiles {
+                    continue;
+                }
+                let fill = edge_fill(rec, &margins, y, &chr);
+                // Expected blob pixels in priority order: PPU halves first.
+                let mut want: Vec<(i32, u8)> = Vec::new();
+                let line_sprites = rec.sprites_on(y);
+                for s in line_sprites.iter().filter(|s| s.oam_index >= 32) {
+                    if s.row_in_sprite == 0 {
+                        halves.push(Half {
+                            x: i32::from(s.x),
+                            top: y,
+                            oam: true,
+                        });
+                    }
+                    if z2_ppu::edge_drops_window_sprite(fill, s, line_sprites, &chr) {
+                        continue; // dropped by design (the ROM's wrapped despawn ghost)
+                    }
+                    // The PPU stops at x 255; a straddling half's margin
+                    // part is the provider's margin sprite.
+                    want.extend(
+                        row_pixels(&chr, line, s, i32::from(s.x))
+                            .into_iter()
+                            .filter(|&(wx, _)| wx < WIDTH as i32),
+                    );
+                }
+                for ms in g.overworld_margin_sprites() {
+                    let Some(s) = z2_ppu::margin_sprite_on_line(line, y, ms) else {
+                        continue;
+                    };
+                    if s.row_in_sprite == 0 {
+                        halves.push(Half {
+                            x: i32::from(ms.x),
+                            top: y,
+                            oam: false,
+                        });
+                    }
+                    want.extend(row_pixels(&chr, line, &s, i32::from(ms.x)));
+                }
+                let mut seen: Vec<i32> = Vec::new();
+                for (wx, c) in want {
+                    if !(-mp..256 + mp).contains(&wx) || seen.contains(&wx) {
+                        continue; // outside the image, or a lower-priority pixel
+                    }
+                    seen.push(wx);
+                    let got = wide.pixels[y * wide.width + (wx + mp) as usize];
+                    let edge = (-16..16).contains(&wx) || (240..272).contains(&wx);
+                    let ok = got == c;
+                    if edge {
+                        edge_n += 1;
+                        edge_ok += u64::from(ok);
+                    } else {
+                        mid_n += 1;
+                        mid_ok += u64::from(ok);
+                    }
+                    if !ok && edge && first_miss.len() < 8 {
+                        first_miss.push(format!(
+                            "frame {t} y {y} x {wx}: want {c:02X} got {got:02X}"
+                        ));
+                    }
+                }
+            }
+            // Pairing: each half has a partner 8 px to one side on the same
+            // top line (PPU halves pair modulo 256: OAM X wraps).
+            halves.dedup();
+            for h in &halves {
+                halves_n += 1;
+                let paired = halves.iter().any(|o| {
+                    let d = o.x - h.x;
+                    o.top == h.top
+                        && (d.abs() == 8
+                            || (h.oam && o.oam && matches!(d.rem_euclid(256), 8 | 248)))
+                });
+                if !paired {
+                    unpaired += 1;
+                    if first_miss.len() < 16 {
+                        first_miss.push(format!("frame {t}: unpaired blob half {h:?}"));
+                    }
+                }
+            }
+        }
+        let rate = |ok: u64, n: u64| ok as f64 / n.max(1) as f64;
+        eprintln!(
+            "wide gameplay {wide_gameplay:?}: blob pixels at the edges {edge_ok}/{edge_n} = {:.5}, elsewhere {mid_ok}/{mid_n} = {:.5}; halves {halves_n}, unpaired {unpaired}",
+            rate(edge_ok, edge_n),
+            rate(mid_ok, mid_n)
+        );
+        for m in &first_miss {
+            eprintln!("  {m}");
+        }
+        assert!(
+            edge_n > 1_000,
+            "too few blob pixels at the edges ({edge_n})"
+        );
+        assert!(
+            rate(edge_ok, edge_n) >= 0.99,
+            "blob pixels at the picture edges drawn {:.5}",
+            rate(edge_ok, edge_n)
+        );
+        assert!(
+            unpaired * 1000 <= halves_n,
+            "{unpaired} of {halves_n} blob halves without a partner"
+        );
+    }
+}

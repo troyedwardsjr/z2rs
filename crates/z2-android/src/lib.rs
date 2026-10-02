@@ -12,8 +12,11 @@
 //!   teardown, SRAM save, audio pause) is handled inside that loop.
 //! * `Java_com_z2rs_game_NativeBridge_*` — JNI exports for the Kotlin
 //!   `object com.z2rs.game.NativeBridge` (`@JvmStatic external fun`, hence the
-//!   `JClass` second parameter). They run on the UI thread and only store into
-//!   [`z2_native::external_pad`]'s atomics; the loop reads them.
+//!   `JClass` second parameter). The pad and pause ones run on the UI thread
+//!   and only store into [`z2_native::external_pad`]'s atomics; the loop reads
+//!   them. `checkHdPack` is the exception: the launcher (its own process, no
+//!   game loop) calls it on a background thread to validate an imported HD
+//!   pack with the game's own loader.
 //!
 //! Pad bytes use the shared NES contract, LSB-first: A=0, B=1, Select=2,
 //! Start=3, Up=4, Down=5, Left=6, Right=7.
@@ -27,8 +30,8 @@ use std::io::{BufRead, BufReader};
 use std::os::fd::FromRawFd;
 use std::path::Path;
 
-use jni::objects::JClass;
-use jni::sys::{jboolean, jint, JNI_FALSE};
+use jni::objects::{JClass, JString};
+use jni::sys::{jboolean, jint, jstring, JNI_FALSE};
 use jni::JNIEnv;
 use winit::event_loop::EventLoop;
 use winit::platform::android::activity::AndroidApp;
@@ -41,6 +44,10 @@ const LOG_TAG: &str = "z2rs";
 const LAUNCH_ARGS_FILE: &str = "launch_args.json";
 /// argv[0] used when the launch file is missing or unreadable.
 const DEFAULT_ARGV0: &str = "z2-native";
+/// Why the last game could not start (one line), for the launcher to show:
+/// the game process just ends on such an error, and logcat is out of sight.
+/// The launcher reads and deletes it when it comes back to the front.
+const LAST_ERROR_FILE: &str = "last_game_error.txt";
 
 /// GameActivity entry point (called by android-activity on its own thread).
 ///
@@ -75,6 +82,7 @@ fn android_main(app: AndroidApp) {
     // land in `<internal>/z2rs/`. Set once, before any other thread in this
     // library reads the environment.
     std::env::set_var("XDG_DATA_HOME", &data);
+    let _ = std::fs::remove_file(data.join(LAST_ERROR_FILE));
 
     let argv = read_launch_args(&data.join(LAUNCH_ARGS_FILE));
     log::info!("launch args: {argv:?}");
@@ -107,7 +115,12 @@ fn android_main(app: AndroidApp) {
     log::info!("windowed loop starting");
     match z2_native::app::run_windowed_with(&args, event_loop) {
         Ok(()) => log::info!("windowed loop exited"),
-        Err(e) => log::error!("windowed loop failed: {e}"),
+        Err(e) => {
+            log::error!("windowed loop failed: {e}");
+            if let Err(w) = std::fs::write(data.join(LAST_ERROR_FILE), e.to_string()) {
+                log::warn!("{LAST_ERROR_FILE}: {w}");
+            }
+        }
     }
     std::process::exit(0);
 }
@@ -240,5 +253,31 @@ pub extern "system" fn Java_com_z2rs_game_NativeBridge_requestLoadState(
     match slot(slot_index) {
         Some(s) => external_pad::request_load_state(s),
         None => log::warn!("requestLoadState: slot {slot_index} out of range"),
+    }
+}
+
+/// `NativeBridge.checkHdPack(dir: String): String`: load the HD pack in `dir`
+/// with the game's loader and answer in [`z2_native::hd_check::check_reply`]'s
+/// one-line format (`ok\t<name>\t<scale>\t<tiles>\t<layers>` or
+/// `error\t<message>`). Blocking (it decodes every sheet): the launcher calls
+/// it off the UI thread. Returns null only if the reply string cannot be
+/// created, which the Kotlin side treats as "could not check".
+#[no_mangle]
+pub extern "system" fn Java_com_z2rs_game_NativeBridge_checkHdPack<'local>(
+    mut env: JNIEnv<'local>,
+    _class: JClass<'local>,
+    dir: JString<'local>,
+) -> jstring {
+    let reply = match env.get_string(&dir) {
+        Ok(s) => {
+            let dir: String = s.into();
+            std::panic::catch_unwind(|| z2_native::hd_check::check_reply(Path::new(&dir)))
+                .unwrap_or_else(|_| "error\tthe pack check failed unexpectedly".to_string())
+        }
+        Err(e) => format!("error\tunreadable path: {e}"),
+    };
+    match env.new_string(reply) {
+        Ok(s) => s.into_raw(),
+        Err(_) => std::ptr::null_mut(),
     }
 }

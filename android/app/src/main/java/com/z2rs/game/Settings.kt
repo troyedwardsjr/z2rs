@@ -63,6 +63,33 @@ class Settings(context: Context) {
         get() = prefs.getString(K_ROM_NAME, null)
         set(v) = put { putString(K_ROM_NAME, v) }
 
+    /**
+     * The imported HD pack: its pack.json folder relative to filesDir/hd_pack
+     * (`""` or ending in `/`), or null for none.
+     */
+    val hdPackRoot: String?
+        get() = prefs.getString(K_HD_ROOT, null)
+
+    /** The pack's name, for the launcher status line. */
+    val hdPackName: String?
+        get() = prefs.getString(K_HD_NAME, null)
+
+    /** Tiles the pack replaces, or -1 when it was not checked at import. */
+    val hdPackTiles: Int
+        get() = prefs.getInt(K_HD_TILES, -1)
+
+    fun setHdPack(root: String, name: String, tiles: Int) = put {
+        putString(K_HD_ROOT, root)
+        putString(K_HD_NAME, name)
+        putInt(K_HD_TILES, tiles)
+    }
+
+    fun clearHdPack() = put {
+        remove(K_HD_ROOT)
+        remove(K_HD_NAME)
+        remove(K_HD_TILES)
+    }
+
     private inline fun put(block: SharedPreferences.Editor.() -> Unit) {
         prefs.edit().apply(block).commit()
     }
@@ -82,5 +109,8 @@ class Settings(context: Context) {
         private const val K_SCALE_MODE = "scale_mode"
         private const val K_COOP = "coop_local"
         private const val K_ROM_NAME = "rom_name"
+        private const val K_HD_ROOT = "hd_pack_root"
+        private const val K_HD_NAME = "hd_pack_name"
+        private const val K_HD_TILES = "hd_pack_tiles"
     }
 }
