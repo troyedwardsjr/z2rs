@@ -10,8 +10,8 @@
 //! * `screen_shake`: shake the picture on boss explosions and similar events
 //!   (ZALiA `ScreenShake_user_pref`, default on there).
 //! * `flash_color` ([`FlashColor`]): the colour the background flashes on
-//!   spell casts and boss explosions; `None` turns flashing off
-//!   (photosensitivity). ZALiA default red.
+//!   spell casts, boss explosions and Link's death; `None` turns flashing
+//!   off (photosensitivity). ZALiA default red.
 //! * `effects_enabled` + `brightness`, `saturation`, `scanlines`, `bloom`,
 //!   `blur`: ZALiA's Graphics Effects Editor post-process chain (off by
 //!   default there; its values when on are 0.05, -0.075, 0.5, 0.16, 0.85).

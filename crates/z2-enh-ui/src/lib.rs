@@ -849,9 +849,9 @@ fn graphics_group(ui: &mut egui::Ui, d: &mut DisplayEnh, o: Opts) {
                 "Shake the picture on boss explosions and big hits. ZALiA: Options > Other > \
              Screen shake (on there).",
             );
-            let tip = "Colour the background flashes on spell casts and explosions. None turns \
-                   the flashing off (easier on the eyes). ZALiA: Background flashing color \
-                   (red there).";
+            let tip = "Colour the background flashes on spell casts, explosions and Link's \
+                   death. None turns the flashing off (easier on the eyes). ZALiA: Background \
+                   flashing color (red there).";
             ui.horizontal(|ui| {
                 ui.label("Flash colour").on_hover_text(tip);
                 egui::ComboBox::from_id_salt("enh-flash")

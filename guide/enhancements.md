@@ -107,7 +107,7 @@ These change only what you see and hear, so they are never part of the online co
 - camera zoom that follows Link, from 1x (off) to 4x
 - a quest timer
 - screen shake when a boss dies or Thunder is cast
-- the colour of the background flash, including no flash or a slow pulse
+- the colour of the background flash on spell casts, explosions and Link's death, including no flash or a slow pulse
 - brightness, saturation, bloom, blur and scanlines
 - separate music and sound effect volumes (`M` mutes music and `N` mutes sound effects)
 - fewer low health beeps
