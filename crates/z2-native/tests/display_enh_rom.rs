@@ -5,7 +5,7 @@
 mod common;
 
 use z2_native::app::{self, Display, DisplaySettings, Emu};
-use z2_native::display_enh::{self, AudioFx, DisplayEnh, FlashColor};
+use z2_native::display_enh::{self, AudioFx, DisplayEnh, DisplayFx, FlashColor};
 use z2_native::headless::{self, ParseOutcome};
 
 fn settings(enh: DisplayEnh) -> DisplaySettings {
@@ -35,6 +35,36 @@ fn diff_rows(a: &[u8], b: &[u8], w: usize) -> Vec<usize> {
         .collect();
     rows.dedup();
     rows
+}
+
+/// Fresh cartridge -> named save slot -> side-view gameplay in the North
+/// Castle (the menu flow from `rando_qol` / `player_magic_rom`).
+fn to_sideview(emu: &mut Emu) {
+    const START: u8 = 0x08;
+    const A: u8 = 0x01;
+    const SELECT: u8 = 0x04;
+    let run = |emu: &mut Emu, frames: usize, pad: u8| {
+        app::step_frames(emu, &vec![pad; frames], None);
+    };
+    run(emu, 30, 0);
+    run(emu, 5, START);
+    run(emu, 20, 0);
+    run(emu, 5, START);
+    run(emu, 20, 0);
+    for _ in 0..8 {
+        run(emu, 2, A);
+        run(emu, 8, 0);
+    }
+    for _ in 0..3 {
+        run(emu, 2, SELECT);
+        run(emu, 8, 0);
+    }
+    run(emu, 5, START);
+    run(emu, 30, 0);
+    run(emu, 5, START);
+    run(emu, 60, 0);
+    run(emu, 1100, 0);
+    assert_eq!(emu.game.ram[0x0736], 0x0B, "side-view gameplay mode");
 }
 
 #[test]
@@ -134,6 +164,50 @@ fn overlays_and_effects_only_change_the_frame_when_on() {
         "the overlay reaches the dump"
     );
     let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// Link's death flash is a separate path (`$0736 == 3`, timer `$050E`) that
+/// leaves `$074B` at zero. `None` must recolour it too, and the final black
+/// frame must survive.
+#[test]
+fn flash_colour_covers_link_death() {
+    let test = "flash_colour_covers_link_death";
+    let Some(rom) = common::rom_path(test) else {
+        return;
+    };
+    let mut emu = app::emu_from_rom_file(&rom, 44_100).expect("rom loads");
+    to_sideview(&mut emu);
+
+    let none = DisplayEnh {
+        flash_color: FlashColor::None,
+        ..DisplayEnh::default()
+    };
+    let mut fx = DisplayFx::default();
+    fx.observe(&emu.game, &none);
+    let steady = emu.game.palette()[0];
+    emu.game.ram[0x0494] = 1; // kill Link
+
+    let (mut flash_frames, mut finished) = (0, false);
+    for _ in 0..300 {
+        app::step_frames(&mut emu, &[0], None);
+        fx.observe(&emu.game, &none);
+        let mode = emu.game.ram[display_enh::RAM_MODE];
+        let pal = emu.game.palette()[0];
+        if mode == display_enh::MODE_DEATH
+            && emu.game.ram[display_enh::RAM_DEATH_FLASH] != 0
+            && pal != steady
+        {
+            assert_eq!(fx.active_flash(), Some((pal, steady)));
+            flash_frames += 1;
+        }
+        if mode == 0x04 && emu.game.ram[display_enh::RAM_DEATH_FLASH] == 0 {
+            assert_eq!(fx.active_flash(), None, "the final frame is left alone");
+            finished = true;
+            break;
+        }
+    }
+    assert!(flash_frames >= 30, "the death flash was recoloured");
+    assert!(finished, "the death sequence ended");
 }
 
 /// The anypct movie casts a flashing spell at frame 9020 (backdrop cycles

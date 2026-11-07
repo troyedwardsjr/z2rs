@@ -29,6 +29,7 @@
 //! | Address | Use |
 //! |---------|-----|
 //! | `$074B` | spell / event flash counter (`$20`, `$A0` after a cast; `$E8` on the boss-death path `bank7_code29`; `$C0` wise men). While nonzero, the NMI cycles the backdrop colour (palette `$3F00`). |
+//! | `$050E` | Link's death-flash timer while `$0736 == 3`: the death handler cycles the backdrop through its own table (`$12, $16, $2A, $16`), then black, and leaves `$074B` at zero. |
 //! | `$074A` | last-cast spell (`selector + 1`; `8` = Thunder) |
 //! | `$0700`, `$076C` | lives, game state (`0`/`0` before the quest starts) |
 //! | `$07FF`, `$07FE`, `$07FD` | id of the sound effect that owns pulse 1, pulse 2, noise (0 = music owns it); set by the bank 6 SFX buses `$EF`, `$EE`, `$ED` |
@@ -50,6 +51,12 @@ use z2_ppu::FrameRecord;
 
 /// Spell / event flash counter.
 pub const RAM_FLASH: usize = 0x074B;
+/// Link's death-flash timer (`$050E`, counting down in `bank7_code15`).
+///
+/// The death handler cycles the backdrop through its own four-colour table
+/// while this is nonzero; unlike the spell/boss flashes it never touches
+/// [`RAM_FLASH`].
+pub const RAM_DEATH_FLASH: usize = 0x050E;
 /// Last-cast spell (`selector + 1`, written with the cast flash by the
 /// post-cast bookkeeping `$8DF5-$8E1D`, see `z2_core::player_magic`).
 pub const RAM_LAST_CAST: usize = 0x074A;
@@ -59,6 +66,8 @@ pub const RAM_LIVES: usize = 0x0700;
 pub const RAM_GAME_STATE: usize = 0x076C;
 /// Game mode.
 pub const RAM_MODE: usize = 0x0736;
+/// Game mode of Link's death animation (`$0736 = 3`).
+pub const MODE_DEATH: u8 = 0x03;
 /// Sound effect owning pulse 1 (bus `$EF`); the low-HP beep plays here.
 pub const RAM_SFX_PULSE1: usize = 0x07FF;
 /// Sound effect owning pulse 2 (bus `$EE`).
@@ -302,6 +311,15 @@ pub fn flash_nes_color(c: FlashColor) -> Option<u8> {
 /// (3 Hz, the photosensitivity guideline limit), instead of the game's
 /// colour change every frame.
 pub const FLASH_HALF_PERIOD: u32 = 10;
+
+/// Whether the game is flashing the backdrop this frame: a spell / event
+/// flash ([`RAM_FLASH`]) or Link's death animation (mode [`MODE_DEATH`]
+/// while its timer [`RAM_DEATH_FLASH`] runs). The death flash is separate
+/// and leaves `$074B` at zero.
+#[must_use]
+pub const fn flash_active(mode: u8, flash: u8, death_timer: u8) -> bool {
+    flash != 0 || (mode == MODE_DEATH && death_timer != 0)
+}
 
 /// Replacement backdrop for flash frame number `n` (0 = first flash frame):
 /// `None` (no flashing) keeps the steady backdrop; a colour pulses at 3 Hz
@@ -948,6 +966,7 @@ impl DisplayFx {
         let ram = game.ram();
         let pal = game.palette();
         let f = ram[RAM_FLASH];
+        let flashing = flash_active(ram[RAM_MODE], f, ram[RAM_DEATH_FLASH]);
         // Shake.
         if enh.screen_shake && shake_trigger(self.prev_flash, f, ram[RAM_LAST_CAST]) {
             self.shake_left = SHAKE_FRAMES;
@@ -961,7 +980,7 @@ impl DisplayFx {
         // Flash.
         self.flash = None;
         if enh.flash_color != FlashColor::Og {
-            if f == 0 {
+            if !flashing {
                 self.steady_valid = true;
                 self.steady_backdrop = pal[0];
                 self.flash_frames = 0;
@@ -1426,6 +1445,52 @@ mod tests {
         );
         assert_eq!(flash_nes_color(FlashColor::Gray), Some(0x00));
         assert_eq!(flash_nes_color(FlashColor::Violet), Some(0x13));
+    }
+
+    #[test]
+    fn death_flash_is_flashing() {
+        assert!(!flash_active(MODE_SIDEVIEW, 0, 0));
+        assert!(flash_active(MODE_SIDEVIEW, 0x20, 0), "spell flash");
+        assert!(flash_active(MODE_DEATH, 0, 6), "death flash timer");
+        assert!(!flash_active(MODE_DEATH, 0, 0), "death timer expired");
+        assert!(!flash_active(0x04, 0, 6), "some other mode");
+    }
+
+    #[test]
+    fn death_flash_is_recoloured() {
+        let mut g = Game::new();
+        let mut fx = DisplayFx::default();
+        let none = DisplayEnh {
+            flash_color: FlashColor::None,
+            ..DisplayEnh::default()
+        };
+        // A steady side-view frame whose backdrop is the normal $16.
+        g.ram[RAM_MODE] = MODE_SIDEVIEW;
+        g.palette[0] = 0x16;
+        g.frame.fill(0x16);
+        fx.observe(&g, &none);
+        assert_eq!(fx.active_flash(), None);
+        // Link dies: mode 3, the death timer runs, the handler shows $12.
+        g.ram[RAM_MODE] = MODE_DEATH;
+        g.ram[RAM_DEATH_FLASH] = 6;
+        g.palette[0] = 0x12;
+        g.frame.fill(0x12);
+        fx.observe(&g, &none);
+        assert_eq!(fx.active_flash(), Some((0x12, 0x16)));
+        let record = FrameRecord::default();
+        let (frame, _) = fx.frame_inputs(&g, &record);
+        assert_eq!(frame[0], 0x16, "None holds the steady backdrop");
+        // The same with Original leaves the death flash alone.
+        let mut og = DisplayFx::default();
+        og.observe(&g, &DisplayEnh::default());
+        assert_eq!(og.active_flash(), None);
+        // The timer expires; the final black frame is not recoloured.
+        g.ram[RAM_MODE] = 0x04;
+        g.ram[RAM_DEATH_FLASH] = 0;
+        g.palette[0] = 0x0F;
+        g.frame.fill(0x0F);
+        fx.observe(&g, &none);
+        assert_eq!(fx.active_flash(), None);
     }
 
     #[test]
